@@ -5,10 +5,28 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
-### Planned (next bite)
-- **HTTPS**: `tls_native` wrap over the taar socket (transport-agnostic `tls_native_set_transport`).
-- POST (`-d`), arbitrary methods (`-X`), custom headers (`-H`) — 0.3.x.
-- The AGNOS socket backend (taar's socket is Linux-only today).
+## [0.3.0] — 2026-06-18 — HTTPS + redirect UX
+
+### Added
+- **HTTPS** (`src/transport.cyr` `transport_fetch_tls`): TLS session over taar's TCP
+  socket via the stdlib `tls_connect`/`tls_read`/`tls_write`/`tls_close`. The
+  `tls_native` engine verifies the cert chain + hostname **fail-closed** (CVE-18) —
+  `https://expired.badssl.com` is rejected. Sovereign: tls_native's default raw
+  read/write on the fd is used; the libssl/`fdlopen` fallback is DCE'd out.
+- `main.cyr` routes `https://` (and https redirect targets, with `-L`) to the TLS path.
+- **Opt-in deps** (vendored via `cyrius lib sync`, wired into CI): `chrono` / `ct` /
+  `keccak` / `random` / `bayan` / `sigil` / `tls_native` / `tls`.
+- **Redirect UX**: a bare 3xx without `-L` now prints `whirl: <code> redirect -> <loc>
+  (use -L to follow)` to stderr (stdout stays clean) instead of a silent empty body.
+
+### Validated
+- `whirl https://example.com` fetches end-to-end (handshake + cert verify + GET);
+  `-o FILE` works. Bad-cert host fails closed.
+
+### Still ahead
+- POST (`-d`), arbitrary methods (`-X`), custom headers (`-H`).
+- AGNOS socket backend (taar's socket is Linux-only; tls_native's `set_transport`
+  wires over taar's agnos socket there).
 
 ## [0.2.0] — 2026-06-18 — HTTP/1.1 GET MVP (over taar)
 

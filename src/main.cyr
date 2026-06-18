@@ -13,6 +13,12 @@ var WHIRL_RBUF_SZ = 262144;   # 256 KB response cap (MVP)
 
 fn _puts(s): i64  { syscall(1, 1, s, strlen(s)); return 0; }
 fn _eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
+fn _eput_int(n): i64 {
+    var b = alloc(24);
+    var len = fmt_int_buf(n, b);
+    syscall(1, 2, b, len);
+    return 0;
+}
 
 fn _materialize_argv(ac): i64 {
     var av = alloc(ac * 8);
@@ -76,12 +82,7 @@ fn main() {
         _eputs("whirl: bad URL (need http://... or https://...)\n");
         return 2;
     }
-    if (url_is_https(u) == 1) {
-        # https/TLS support is the 0.2.x tail — see docs/development/roadmap.md
-        _eputs("whirl: https is unsupported in this build — use an http:// URL\n");
-        return 3;
-    }
-
+    var is_https = url_is_https(u);
     var host = url_host(u);
     var port = url_port(u);
     var path = url_path(u);
@@ -95,7 +96,12 @@ fn main() {
 
         var req = alloc(2048);
         var reqlen = http_build_get(host, path, req, 2048);
-        var total = transport_fetch(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);
+        var total = 0;
+        if (is_https == 1) {
+            total = transport_fetch_tls(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);
+        } else {
+            total = transport_fetch(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);
+        }
         if (total < 0) { _eputs("whirl: connection failed\n"); return 9; }
 
         var status = http_status_code(rbuf, total);
@@ -107,11 +113,7 @@ fn main() {
                 var loc = _dup_location(rbuf, total, lv);
                 var u2 = url_new();
                 if (url_parse(loc, u2) == URL_PARSE_OK) {
-                    if (url_is_https(u2) == 1) {
-                        # https redirect target — TLS support tracked in roadmap § 0.2.x
-                        _eputs("whirl: redirect target is https — unsupported in this build\n");
-                        return 3;
-                    }
+                    is_https = url_is_https(u2);
                     host = url_host(u2);
                     port = url_port(u2);
                     path = url_path(u2);
@@ -122,6 +124,18 @@ fn main() {
         }
 
         if (redirect == 0) {
+            # Unfollowed 3xx (no -L / non-http target / hop limit): name the
+            # redirect on stderr so a bare empty body isn't a silent dead end.
+            if ((status >= 300) && (status < 400)) {
+                var lvh = http_header_value(rbuf, total, "location");
+                if (lvh >= 0) {
+                    _eputs("whirl: ");
+                    _eput_int(status);
+                    _eputs(" redirect -> ");
+                    _eputs(_dup_location(rbuf, total, lvh));
+                    _eputs("  (use -L to follow)\n");
+                }
+            }
             ret = _emit_body(rbuf, total, cli_outfile());
         }
     }

@@ -29,16 +29,20 @@ platform split: taar's `socket` + `dns` modules (driven by this work) abstract i
 - [x] `[deps.taar]` 0.2.0 (socket + dns). *(No whirl platform split; stdlib `net` dropped; `tls_native`/`sigil` arrive with HTTPS.)*
 - [x] `tests/whirl.tcyr` — URL + HTTP framing (**31 asserts**). Live fetch validated against neverssl.com.
 
-### 0.2.x tail — HTTPS (next)
-- [ ] `tls_native` wrap over the taar socket for `https://` (transport-agnostic `tls_native_set_transport(read, write, now)` over `taar_tcp_send`/`taar_tcp_recv`). Adds stdlib `tls_native` + `sigil`.
+### 0.3.0 — HTTPS + redirect UX ✅ (2026-06-18)
+- [x] HTTPS via stdlib `tls_connect`/`tls_read`/`tls_write`/`tls_close` over taar's TCP socket (`transport_fetch_tls`). tls_native's default raw read/write on the fd — no callback wiring on Linux. Cert chain + hostname verified **fail-closed** (CVE-18; `expired.badssl.com` rejected).
+- [x] `main.cyr` routes `https://` + https redirect targets (`-L`).
+- [x] **Opt-in** crypto/TLS libs (`chrono`/`ct`/`keccak`/`random`/`bayan`/`sigil`/`tls_native`/`tls`) via `cyrius lib sync` — wired into CI. *(The libssl/`fdlopen` fallback DCE's out → sovereign tls_native path.)*
+- [x] Redirect UX: bare 3xx without `-L` prints `whirl: <code> redirect -> <loc> (use -L to follow)` to stderr; stdout stays clean.
+- [ ] *Follow-up:* AGNOS socket backend (taar `#ifdef`) + tls_native `set_transport(read, write, now)` over taar's agnos socket — tracked in CHANGELOG "Still ahead".
 
-### 0.3.x — methods + bodies
+### 0.4.x — methods + bodies
 - [ ] `-d DATA` (POST, `Content-Type` default `application/x-www-form-urlencoded`), `-X METHOD` (arbitrary), `-H 'Header: val'` (custom headers), `--data-binary`, stdin body (`-d @-`).
 
-### 0.4.x — the wget side
+### 0.5.x — the wget side
 - [ ] `-r` recursive fetch (link extraction, same-host bound, depth limit), `-O`/auto filename-from-URL, resume (`-C`), retry/backoff.
 
-### 0.5.x — iron validation + parity
+### 0.6.x — iron validation + parity
 - [ ] First AGNOS run on archaemenid: `whirl https://example.com` over the sovereign backend. Parity benchmark vs `curl` (latency / RSS / binary size).
 
 ## v1.0 criteria

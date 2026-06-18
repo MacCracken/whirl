@@ -13,8 +13,10 @@ output = "whirl"
 
 [deps]
 # `io` carries file_write_all for `-o`. Transport (TCP + DNS) comes from taar
-# below — sovereign raw-syscall, no stdlib net.
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags"]
+# below — sovereign raw-syscall, no stdlib net. HTTPS opts in to the crypto/TLS
+# libs (vendored via `cyrius lib sync`): tls_native is transport-agnostic, wired
+# over taar's socket. ct/keccak/random/bayan are sigil's crypto deps.
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags", "chrono", "ct", "keccak", "random", "bayan", "sigil", "tls_native", "tls"]
 
 # Network-probe substrate — whirl is the third consumer (after yo + dig). taar's
 # socket (taar_tcp_*) + dns (taar_resolve_ipv4) modules back whirl's transport.
