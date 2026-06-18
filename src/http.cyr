@@ -1,0 +1,192 @@
+# whirl — HTTP/1.1 request build + response parse.
+#
+# Pure buffer logic — no I/O. The transport layer feeds it bytes; this module
+# frames requests and parses status / headers / body / chunked. Testable against
+# canned response buffers.
+#
+# Stdlib auto-included via cyrius.cyml.
+
+# --- request ---
+
+# Append cstr `s` into buf at pos (bounded by bufmax). Returns the new pos.
+fn _http_puts(buf, pos, bufmax, s): i64 {
+    var i = 0;
+    while (load8(s + i) != 0) {
+        if (pos >= bufmax) { return pos; }
+        store8(buf + pos, load8(s + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+    return pos;
+}
+
+# Build a GET request for host+path into buf. Returns the request length.
+fn http_build_get(host, path, buf, bufmax): i64 {
+    var p = 0;
+    p = _http_puts(buf, p, bufmax, "GET ");
+    p = _http_puts(buf, p, bufmax, path);
+    p = _http_puts(buf, p, bufmax, " HTTP/1.1\r\nHost: ");
+    p = _http_puts(buf, p, bufmax, host);
+    p = _http_puts(buf, p, bufmax, "\r\nUser-Agent: whirl/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    return p;
+}
+
+# --- response ---
+
+# Parse the status code from "HTTP/1.x <code> ...". Returns 100..599 or -1.
+fn http_status_code(resp, len): i64 {
+    var i = 0;
+    while ((i < len) && (load8(resp + i) != 32)) { i = i + 1; }
+    if (i >= len) { return 0 - 1; }
+    i = i + 1;
+    var code = 0;
+    var d = 0;
+    while ((i < len) && (d < 3)) {
+        var c = load8(resp + i);
+        if ((c < 48) || (c > 57)) { return 0 - 1; }
+        code = code * 10 + (c - 48);
+        i = i + 1;
+        d = d + 1;
+    }
+    if (d != 3) { return 0 - 1; }
+    return code;
+}
+
+# Offset of the body (just past the CRLFCRLF header terminator), or -1.
+fn http_body_offset(resp, len): i64 {
+    var i = 0;
+    while (i + 3 < len) {
+        if (load8(resp + i) == 13) {
+            if (load8(resp + i + 1) == 10) {
+                if (load8(resp + i + 2) == 13) {
+                    if (load8(resp + i + 3) == 10) {
+                        return i + 4;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _http_lc(c): i64 {
+    if ((c >= 65) && (c <= 90)) { return c + 32; }
+    return c;
+}
+
+# Case-insensitive: does lowercase literal `lit` match resp at `off` (bounded)?
+fn _http_match_ci(resp, off, len, lit): i64 {
+    var j = 0;
+    while (load8(lit + j) != 0) {
+        if (off + j >= len) { return 0; }
+        if (_http_lc(load8(resp + off + j)) != load8(lit + j)) { return 0; }
+        j = j + 1;
+    }
+    return 1;
+}
+
+# Advance `off` past the current line's CRLF. Returns the next-line offset.
+fn _http_next_line(resp, off, end): i64 {
+    var found = 0;
+    while ((off + 1 < end) && (found == 0)) {
+        if ((load8(resp + off) == 13) && (load8(resp + off + 1) == 10)) { found = 1; }
+        else { off = off + 1; }
+    }
+    return off + 2;
+}
+
+# Find header `name` (lowercase, no colon). Returns the offset of its value
+# (after ':' + spaces), bounded to the header block, or -1.
+fn http_header_value(resp, len, name): i64 {
+    var hdr_end = http_body_offset(resp, len);
+    if (hdr_end < 0) { hdr_end = len; }
+
+    var off = _http_next_line(resp, 0, hdr_end);   # skip the status line
+    while (off < hdr_end) {
+        if (_http_match_ci(resp, off, hdr_end, name) == 1) {
+            var nl = 0;
+            while (load8(name + nl) != 0) { nl = nl + 1; }
+            var k = off + nl;
+            if ((k < hdr_end) && (load8(resp + k) == 58)) {   # ':'
+                k = k + 1;
+                while ((k < hdr_end) && (load8(resp + k) == 32)) { k = k + 1; }
+                return k;
+            }
+        }
+        off = _http_next_line(resp, off, hdr_end);
+    }
+    return 0 - 1;
+}
+
+# Content-Length value, or -1 if absent/malformed.
+fn http_content_length(resp, len): i64 {
+    var v = http_header_value(resp, len, "content-length");
+    if (v < 0) { return 0 - 1; }
+    var n = 0;
+    var any = 0;
+    var i = v;
+    while (i < len) {
+        var c = load8(resp + i);
+        if ((c < 48) || (c > 57)) { break; }
+        n = n * 10 + (c - 48);
+        any = 1;
+        i = i + 1;
+    }
+    if (any == 0) { return 0 - 1; }
+    return n;
+}
+
+# 1 if Transfer-Encoding contains "chunked", else 0.
+fn http_is_chunked(resp, len): i64 {
+    var v = http_header_value(resp, len, "transfer-encoding");
+    if (v < 0) { return 0; }
+    var i = v;
+    while (i < len) {
+        if (load8(resp + i) == 13) { break; }
+        if (_http_match_ci(resp, i, len, "chunked") == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _http_hexval(c): i64 {
+    if ((c >= 48) && (c <= 57))  { return c - 48; }   # 0-9
+    if ((c >= 97) && (c <= 102)) { return c - 87; }   # a-f
+    if ((c >= 65) && (c <= 70))  { return c - 55; }   # A-F
+    return 0 - 1;
+}
+
+# Decode chunked transfer-encoding from `body` into `out`. Returns the decoded
+# length, or -1 on malformed input / output overflow.
+fn http_dechunk(body, blen, out, outmax): i64 {
+    var i = 0;
+    var o = 0;
+    while (i < blen) {
+        var sz = 0;
+        var got = 0;
+        while (i < blen) {
+            var h = _http_hexval(load8(body + i));
+            if (h < 0) { break; }
+            sz = sz * 16 + h;
+            got = 1;
+            i = i + 1;
+        }
+        if (got == 0) { return 0 - 1; }
+        # skip to LF (past any chunk extensions + CR)
+        while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
+        i = i + 1;
+        if (sz == 0) { return o; }   # terminating chunk
+        var k = 0;
+        while (k < sz) {
+            if (i >= blen)   { return 0 - 1; }
+            if (o >= outmax) { return 0 - 1; }
+            store8(out + o, load8(body + i));
+            o = o + 1; i = i + 1; k = k + 1;
+        }
+        # skip the trailing CRLF after chunk data
+        while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
+        i = i + 1;
+    }
+    return o;
+}

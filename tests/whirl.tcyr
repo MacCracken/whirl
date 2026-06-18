@@ -1,19 +1,106 @@
-# whirl test suite — placeholder until the transport bite (0.2.x) lands the real
-# coverage (URL parse, HTTP/1.1 response + status/header parse, chunked decode,
-# redirect-Location parse). One trivial group so `cyrius test` has a .tcyr to
-# discover and CI stays green from the scaffold onward.
+# whirl test suite. Pure-logic coverage (no network — the transport layer is
+# exercised by the real binary). URL parsing + HTTP/1.1 request build / response
+# parse / chunked decode.
 #
 # Stdlib auto-included via cyrius.cyml.
 
-fn test_scaffold() {
-    test_group("scaffold");
-    assert_eq(1 + 1, 2, "arithmetic sanity");
-    assert_eq(strlen("whirl"), 5, "strlen baseline");
+include "src/url.cyr"
+include "src/http.cyr"
+
+# === URL ===
+
+fn test_url_basic() {
+    test_group("url-basic");
+    var u = url_new();
+    assert_eq(url_parse("http://example.com", u), URL_PARSE_OK, "parse http ok");
+    assert_eq(url_is_https(u), 0, "http not https");
+    assert_eq(url_port(u), 80, "default port 80");
+    assert_eq(streq(url_host(u), "example.com"), 1, "host example.com");
+    assert_eq(streq(url_path(u), "/"), 1, "default path /");
+}
+
+fn test_url_https_port_path() {
+    test_group("url-https");
+    var u = url_new();
+    assert_eq(url_parse("https://a.b.c:8443/x/y?z=1", u), URL_PARSE_OK, "parse https ok");
+    assert_eq(url_is_https(u), 1, "is https");
+    assert_eq(url_port(u), 8443, "explicit port 8443");
+    assert_eq(streq(url_host(u), "a.b.c"), 1, "host a.b.c");
+    assert_eq(streq(url_path(u), "/x/y?z=1"), 1, "path with query preserved");
+}
+
+fn test_url_https_default_port() {
+    test_group("url-https-default");
+    var u = url_new();
+    assert_eq(url_parse("https://example.com/", u), URL_PARSE_OK, "ok");
+    assert_eq(url_port(u), 443, "default https port 443");
+    assert_eq(streq(url_path(u), "/"), 1, "path /");
+}
+
+fn test_url_rejects() {
+    test_group("url-reject");
+    var u = url_new();
+    assert_eq(url_parse("ftp://x", u),         URL_PARSE_FAIL, "reject ftp scheme");
+    assert_eq(url_parse("http://", u),         URL_PARSE_FAIL, "reject empty host");
+    assert_eq(url_parse("http://h:99999/", u), URL_PARSE_FAIL, "reject port > 65535");
+    assert_eq(url_parse("notaurl", u),         URL_PARSE_FAIL, "reject missing scheme");
+}
+
+# === HTTP ===
+
+fn test_http_build() {
+    test_group("http-build");
+    var buf = alloc(256);
+    var n = http_build_get("example.com", "/", buf, 256);
+    assert_eq(_http_match_ci(buf, 0, n, "get / http/1.1"), 1, "request line");
+    assert_eq(http_body_offset(buf, n), n, "request ends with CRLFCRLF");
+}
+
+fn test_http_status() {
+    test_group("http-status");
+    var r1 = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    assert_eq(http_status_code(r1, strlen(r1)), 200, "status 200");
+    var r2 = "HTTP/1.0 404 Not Found\r\n\r\n";
+    assert_eq(http_status_code(r2, strlen(r2)), 404, "status 404");
+    var r3 = "HTTP/1.1 301 Moved Permanently\r\nLocation: https://x/\r\n\r\n";
+    assert_eq(http_status_code(r3, strlen(r3)), 301, "status 301");
+}
+
+fn test_http_headers() {
+    test_group("http-headers");
+    var r = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 11\r\n\r\nhello world";
+    assert_eq(http_content_length(r, strlen(r)), 11, "content-length 11");
+    var bo = http_body_offset(r, strlen(r));
+    assert_eq(load8(r + bo), 104, "body starts at 'h'");
+    var r2 = "HTTP/1.1 301 X\r\nLocation: http://dst/path\r\n\r\n";
+    var lv = http_header_value(r2, strlen(r2), "location");
+    assert_eq(_http_match_ci(r2, lv, strlen(r2), "http://dst/path"), 1, "case-insensitive header name");
+    assert_eq(http_content_length(r2, strlen(r2)), 0 - 1, "no content-length -> -1");
+}
+
+fn test_http_chunked() {
+    test_group("http-chunked");
+    var r = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    assert_eq(http_is_chunked(r, strlen(r)), 1, "is chunked");
+    var bo = http_body_offset(r, strlen(r));
+    var out = alloc(64);
+    var n = http_dechunk(r + bo, strlen(r) - bo, out, 64);
+    assert_eq(n, 11, "dechunk len 11 (hello world)");
+    assert_eq(load8(out + 0), 104, "out[0] = h");
+    assert_eq(load8(out + 5), 32, "out[5] = space");
+    assert_eq(load8(out + 6), 119, "out[6] = w");
 }
 
 fn main() {
     alloc_init();
-    test_scaffold();
+    test_url_basic();
+    test_url_https_port_path();
+    test_url_https_default_port();
+    test_url_rejects();
+    test_http_build();
+    test_http_status();
+    test_http_headers();
+    test_http_chunked();
     return assert_summary();
 }
 
