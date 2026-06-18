@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-06-18 (0.3.0 — HTTP **+ HTTPS** working over taar).
+> **Last refresh**: 2026-06-18 (0.4.0 — HTTP + HTTPS + methods/bodies over taar).
 
 ---
 
@@ -10,8 +10,8 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.3.0** (HTTP/1.1 + **HTTPS** GET — fetches real http:// **and https://** end-to-end over the taar transport) |
-| Status | Working. `whirl http(s)://…` resolves + connects (+ TLS) + GETs + emits body to stdout / `-o FILE`; redirects (`-L`, incl. http→https); cert chain + hostname verified fail-closed. |
+| Current version | **0.4.0** (HTTP/1.1 + HTTPS; GET / POST / arbitrary methods; custom headers — over the taar transport) |
+| Status | Working. `whirl [-X M] [-d DATA] [-H 'H: v'] [-o FILE] [-L] http(s)://…` — resolve + connect (+ TLS) + request + emit body; redirects (`-L`, incl. http→https, followed as GET); cert chain + hostname verified fail-closed. |
 | Module footprint | `src/{url,http,cli,transport,output,main}.cyr` (+ `test.cyr`). url/http pure-tested; transport rides taar (TCP+DNS) + stdlib tls for https. |
 | Cyrius pin | 6.2.6 (family-aligned with yo / dig / taar) |
 | Backends | Linux (raw-syscall TCP via taar; tls_native's default raw read/write on the fd for TLS). AGNOS socket backend (taar `#ifdef` + tls_native `set_transport`) is the follow-up. **No `lib/net.cyr`** — sovereign. |

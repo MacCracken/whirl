@@ -5,7 +5,9 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
-### Added — methods + bodies
+## [0.4.0] — 2026-06-18 — methods + bodies
+
+### Added
 - **`-X METHOD`** — arbitrary request method (default GET, or POST when `-d` is given).
 - **`-d DATA`** — request body → POST + `Content-Length` + default `Content-Type: application/x-www-form-urlencoded`.
 - **`-H 'Header: value'`** — repeatable custom headers; a caller `Content-Type` overrides the default.
