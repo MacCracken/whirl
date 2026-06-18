@@ -36,8 +36,9 @@ platform split: taar's `socket` + `dns` modules (driven by this work) abstract i
 - [x] Redirect UX: bare 3xx without `-L` prints `whirl: <code> redirect -> <loc> (use -L to follow)` to stderr; stdout stays clean.
 - [ ] *Follow-up:* AGNOS socket backend (taar `#ifdef`) + tls_native `set_transport(read, write, now)` over taar's agnos socket — tracked in CHANGELOG "Still ahead".
 
-### 0.4.x — methods + bodies
-- [ ] `-d DATA` (POST, `Content-Type` default `application/x-www-form-urlencoded`), `-X METHOD` (arbitrary), `-H 'Header: val'` (custom headers), `--data-binary`, stdin body (`-d @-`).
+### 0.4.0 — methods + bodies ✅ (2026-06-18)
+- [x] `-d DATA` (POST, `Content-Type` default `application/x-www-form-urlencoded` + `Content-Length`), `-X METHOD` (arbitrary), `-H 'Header: val'` (repeatable; caller `Content-Type` overrides). Live-validated over HTTPS (postman-echo). Redirects follow as GET (body dropped).
+- [ ] *Later:* `--data-binary` (raw, no form default), stdin body (`-d @-`).
 
 ### 0.5.x — the wget side
 - [ ] `-r` recursive fetch (link extraction, same-host bound, depth limit), `-O`/auto filename-from-URL, resume (`-C`), retry/backoff.

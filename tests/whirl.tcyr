@@ -91,6 +91,32 @@ fn test_http_chunked() {
     assert_eq(load8(out + 6), 119, "out[6] = w");
 }
 
+fn test_http_request_post() {
+    test_group("http-request-post");
+    var buf = alloc(512);
+    var body = "a=1&b=2";
+    var n = http_build_request("POST", "x.org", "/p", 0, 0, body, 7, buf, 512);
+    assert_eq(_http_match_ci(buf, 0, n, "post /p http/1.1"), 1, "request line = POST /p");
+    assert_eq(http_content_length(buf, n), 7, "content-length 7");
+    var bo = http_body_offset(buf, n);
+    assert_eq(_http_match_ci(buf, bo, n, "a=1&b=2"), 1, "body follows the blank line");
+    var ctv = http_header_value(buf, n, "content-type");
+    assert_eq(_http_match_ci(buf, ctv, n, "application/x-www-form-urlencoded"), 1, "default content-type");
+}
+
+fn test_http_custom_headers() {
+    test_group("http-headers-custom");
+    var buf = alloc(512);
+    var hdrs = alloc(16);
+    store64(hdrs + 0, "X-Foo: bar");
+    store64(hdrs + 8, "Content-Type: application/json");
+    var n = http_build_request("POST", "x.org", "/", hdrs, 2, "{}", 2, buf, 512);
+    var xv = http_header_value(buf, n, "x-foo");
+    assert_eq(_http_match_ci(buf, xv, n, "bar"), 1, "custom header X-Foo present");
+    var ctv = http_header_value(buf, n, "content-type");
+    assert_eq(_http_match_ci(buf, ctv, n, "application/json"), 1, "caller Content-Type wins over default");
+}
+
 fn main() {
     alloc_init();
     test_url_basic();
@@ -101,6 +127,8 @@ fn main() {
     test_http_status();
     test_http_headers();
     test_http_chunked();
+    test_http_request_post();
+    test_http_custom_headers();
     return assert_summary();
 }
 

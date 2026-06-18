@@ -29,10 +29,14 @@ fn _materialize_argv(ac): i64 {
 
 fn _print_help(): i64 {
     _puts("whirl — curl + wget unified, in sovereign Cyrius.\n\n");
-    _puts("usage: whirl [-o FILE] [-L] <url>\n");
-    _puts("  -o FILE   write the response body to FILE (default: stdout)\n");
-    _puts("  -L        follow redirects (3xx Location)\n");
-    _puts("  -h        this help\n");
+    _puts("usage: whirl [-X METHOD] [-d DATA] [-H 'H: v'] [-o FILE] [-L] <url>\n");
+    _puts("  -X METHOD   request method (default GET, or POST when -d is given)\n");
+    _puts("  -d DATA     request body (sets POST + Content-Length; default\n");
+    _puts("              Content-Type application/x-www-form-urlencoded)\n");
+    _puts("  -H 'H: v'   add a request header (repeatable)\n");
+    _puts("  -o FILE     write the response body to FILE (default: stdout)\n");
+    _puts("  -L          follow redirects (3xx Location)\n");
+    _puts("  -h          this help\n");
     return 0;
 }
 
@@ -94,8 +98,15 @@ fn main() {
     while (redirect == 1) {
         redirect = 0;
 
-        var req = alloc(2048);
-        var reqlen = http_build_get(host, path, req, 2048);
+        # First hop uses the caller's method/body; redirects are followed as GET
+        # with the body dropped (the 301/302/303 norm). Custom headers persist.
+        var meth = cli_method();
+        var bdy = cli_body();
+        var blen = cli_bodylen();
+        if (hops > 0) { meth = "GET"; bdy = 0; blen = 0; }
+        var reqsz = 4096 + blen;
+        var req = alloc(reqsz);
+        var reqlen = http_build_request(meth, host, path, cli_hdrs(), cli_nhdrs(), bdy, blen, req, reqsz);
         var total = 0;
         if (is_https == 1) {
             total = transport_fetch_tls(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);

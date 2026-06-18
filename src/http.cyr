@@ -20,15 +20,87 @@ fn _http_puts(buf, pos, bufmax, s): i64 {
     return pos;
 }
 
-# Build a GET request for host+path into buf. Returns the request length.
-fn http_build_get(host, path, buf, bufmax): i64 {
+# Append one byte. Returns the new pos.
+fn _http_putc(buf, pos, bufmax, c): i64 {
+    if (pos >= bufmax) { return pos; }
+    store8(buf + pos, c);
+    return pos + 1;
+}
+
+# Append a non-negative integer (decimal). Returns the new pos.
+fn _http_put_int(buf, pos, bufmax, n): i64 {
+    var tmp[24];
+    var len = fmt_int_buf(n, &tmp);
+    var i = 0;
+    while (i < len) {
+        if (pos >= bufmax) { return pos; }
+        store8(buf + pos, load8(&tmp + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+    return pos;
+}
+
+# Does header line `h` start with "content-type:" (case-insensitive)?
+fn _http_hdr_is_content_type(h): i64 {
+    var ct = "content-type:";
+    var i = 0;
+    while (load8(ct + i) != 0) {
+        var c = load8(h + i);
+        if ((c >= 65) && (c <= 90)) { c = c + 32; }   # lowercase
+        if (c != load8(ct + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Build an HTTP/1.1 request: "<method> <path>" + Host/UA/Accept/Connection, then
+# any caller headers (`hdrs` = array of `nhdrs` cstr ptrs), then — for a body —
+# Content-Length + a default Content-Type (unless the caller supplied one). Body
+# bytes follow the blank line. Returns total bytes written.
+fn http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, buf, bufmax): i64 {
     var p = 0;
-    p = _http_puts(buf, p, bufmax, "GET ");
+    p = _http_puts(buf, p, bufmax, method);
+    p = _http_putc(buf, p, bufmax, 32);
     p = _http_puts(buf, p, bufmax, path);
     p = _http_puts(buf, p, bufmax, " HTTP/1.1\r\nHost: ");
     p = _http_puts(buf, p, bufmax, host);
-    p = _http_puts(buf, p, bufmax, "\r\nUser-Agent: whirl/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    p = _http_puts(buf, p, bufmax, "\r\nUser-Agent: whirl/0.3\r\nAccept: */*\r\nConnection: close\r\n");
+
+    var has_ct = 0;
+    var i = 0;
+    while (i < nhdrs) {
+        var h = load64(hdrs + i * 8);
+        if (_http_hdr_is_content_type(h) == 1) { has_ct = 1; }
+        p = _http_puts(buf, p, bufmax, h);
+        p = _http_puts(buf, p, bufmax, "\r\n");
+        i = i + 1;
+    }
+
+    if (bodylen > 0) {
+        p = _http_puts(buf, p, bufmax, "Content-Length: ");
+        p = _http_put_int(buf, p, bufmax, bodylen);
+        p = _http_puts(buf, p, bufmax, "\r\n");
+        if (has_ct == 0) {
+            p = _http_puts(buf, p, bufmax, "Content-Type: application/x-www-form-urlencoded\r\n");
+        }
+    }
+
+    p = _http_puts(buf, p, bufmax, "\r\n");   # end of headers
+
+    var j = 0;
+    while (j < bodylen) {
+        if (p >= bufmax) { return p; }
+        store8(buf + p, load8(body + j));
+        p = p + 1;
+        j = j + 1;
+    }
     return p;
+}
+
+# Back-compat: a plain GET (no body, no extra headers).
+fn http_build_get(host, path, buf, bufmax): i64 {
+    return http_build_request("GET", host, path, 0, 0, 0, 0, buf, bufmax);
 }
 
 # --- response ---

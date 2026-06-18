@@ -5,6 +5,13 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+### Added — methods + bodies
+- **`-X METHOD`** — arbitrary request method (default GET, or POST when `-d` is given).
+- **`-d DATA`** — request body → POST + `Content-Length` + default `Content-Type: application/x-www-form-urlencoded`.
+- **`-H 'Header: value'`** — repeatable custom headers; a caller `Content-Type` overrides the default.
+- `http.cyr` generalized to `http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, …)`; `http_build_get` is now a thin wrapper. Redirects (`-L`) follow as **GET with the body dropped** (the 301/302/303 norm); custom headers persist across hops.
+- **Validated live over HTTPS** (postman-echo): `-d` POST echoed as form data, `-H` header echoed back, `-X DELETE` reached the delete endpoint. **37** unit assertions (6 new for request build + custom headers).
+
 ## [0.3.0] — 2026-06-18 — HTTPS + redirect UX
 
 ### Added
