@@ -1,0 +1,21 @@
+# whirl test suite — placeholder until the transport bite (0.2.x) lands the real
+# coverage (URL parse, HTTP/1.1 response + status/header parse, chunked decode,
+# redirect-Location parse). One trivial group so `cyrius test` has a .tcyr to
+# discover and CI stays green from the scaffold onward.
+#
+# Stdlib auto-included via cyrius.cyml.
+
+fn test_scaffold() {
+    test_group("scaffold");
+    assert_eq(1 + 1, 2, "arithmetic sanity");
+    assert_eq(strlen("whirl"), 5, "strlen baseline");
+}
+
+fn main() {
+    alloc_init();
+    test_scaffold();
+    return assert_summary();
+}
+
+var exit_code = main();
+syscall(60, exit_code);
