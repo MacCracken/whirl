@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        run: |
+          set -e
+          # The cyrius.cyml `[package].cyrius` pin is the single source of truth
+          # for the toolchain version — no version hardcoded here. Use the
+          # upstream installer (NOT a hand-rolled curl+cp): it lays out
+          # $HOME/.cyrius/versions/<v>/ which `cyrius deps` pin-checks.
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve deps
+        run: cyrius deps
+
+      - name: Lint
+        # Hard gate: any `warn` line fails CI (matches dig / patra / sigil).
+        run: |
+          fail=0
+          for f in src/*.cyr; do
+            out=$(cyrius lint "$f" 2>&1 || true)
+            echo "$out"
+            if echo "$out" | grep -qE '^[[:space:]]*warn '; then
+              echo "lint: warnings in $f"; fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
+
+      - name: Build
+        run: |
+          mkdir -p build
+          CYRIUS_DCE=1 cyrius build src/main.cyr build/whirl
+          echo "whirl: $(wc -c < build/whirl) bytes"
+
+      - name: Verify ELF
+        run: xxd -l 4 build/whirl | grep -q "7f45 4c46"
+
+      - name: Test
+        # bare `cyrius test` runs the [build].test entry AND auto-discovers
+        # tests/*.tcyr (the unit suite lands with the transport bite).
+        run: cyrius test
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required docs
+        run: |
+          MISSING=0
+          for doc in README.md CHANGELOG.md VERSION LICENSE cyrius.cyml; do
+            if [ -f "$doc" ]; then echo "  OK: $doc"; else echo "  MISSING: $doc"; MISSING=1; fi
+          done
+          exit $MISSING
+      - name: Verify version consistency
+        run: |
+          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          CYML_RAW=$(grep '^version = ' cyrius.cyml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$CYML_RAW" = "\${file:VERSION}" ]; then
+              CYML_VERSION="$FILE_VERSION"
+          else
+              CYML_VERSION="$CYML_RAW"
+          fi
+          [ "$FILE_VERSION" = "$CYML_VERSION" ] || { echo "VERSION ($FILE_VERSION) != cyrius.cyml ($CYML_RAW)"; exit 1; }
+          grep -q "$FILE_VERSION" CHANGELOG.md || { echo "version not in changelog"; exit 1; }
+          echo "Version consistent: $FILE_VERSION (cyml: $CYML_RAW)"

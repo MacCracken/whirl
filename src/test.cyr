@@ -1,0 +1,10 @@
+# whirl — top-level test entry (referenced by cyrius.cyml [build].test).
+# Real unit tests (URL parse, HTTP/1.1 response parse, chunked decode) live in
+# tests/whirl.tcyr — added with the transport bite.
+
+fn main() {
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

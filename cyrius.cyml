@@ -1,0 +1,30 @@
+[package]
+name = "whirl"
+version = "${file:VERSION}"
+description = "whirl — curl + wget unified: HTTP / HTTPS transfer in one verb (sovereign Cyrius)"
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.2.6"
+
+[build]
+entry = "src/main.cyr"
+test = "src/test.cyr"
+output = "whirl"
+
+[deps]
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags"]
+
+# --- Transport deps land with the HTTP/TLS bite (next) ---
+# whirl is the THIRD taar consumer (after yo + dig); it adds tcp / tls / http
+# modules to taar. When the transport src lands, this manifest gains:
+#
+#   [deps.taar]
+#   git = "https://github.com/MacCracken/taar.git"
+#   path = "../taar"
+#   tag = "0.1.0"            # bump as taar grows the socket/dns/tcp modules
+#   modules = ["dist/taar.cyr"]
+#
+# plus stdlib "net" + "tls_native" + "sigil" — the HTTPS client stack.
+# tls_native is transport-agnostic (tls_native_set_transport(read,write,now)),
+# so the AGNOS backend wires it over sock_send#48 / sock_recv#49 (see
+# docs/development/roadmap.md § AGNOS call surface).

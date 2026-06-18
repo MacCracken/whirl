@@ -1,0 +1,35 @@
+# whirl — main entry point
+#
+# SCAFFOLD (0.1.0): the repo skeleton, manifest, CI/release, and docs are in
+# place; the HTTP/1.1 + TLS transport (cli / url / http / transport /
+# platform_linux / platform_agnos) lands in the next bite. This stub compiles +
+# runs on host and prints usage so CI is green from day one. See the MVP scope
+# and the AGNOS call surface in docs/development/roadmap.md.
+#
+# Stdlib auto-included via cyrius.cyml.
+
+fn _puts(s): i64  { syscall(1, 1, s, strlen(s)); return 0; }
+fn _eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
+
+fn main() {
+    alloc_init();
+    args_init();
+
+    var ac = argc();
+    if (ac < 2) {
+        _puts("whirl — curl + wget unified, in sovereign Cyrius.\n");
+        _puts("\n");
+        _puts("usage: whirl <url>            HTTP/HTTPS GET -> stdout\n");
+        _puts("       whirl -o FILE <url>    save the response body to FILE\n");
+        _puts("\n");
+        _puts("scaffold: HTTP/1.1 + TLS transport lands in the next bite\n");
+        _puts("          (see docs/development/roadmap.md).\n");
+        return 0;
+    }
+
+    _eputs("whirl: transport not yet implemented (scaffold) — see docs/development/roadmap.md\n");
+    return 69;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);
