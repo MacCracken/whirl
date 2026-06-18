@@ -1,0 +1,15 @@
+# whirl — write the response body to stdout or a file.
+#
+# Stdlib auto-included via cyrius.cyml (syscalls: sys_write; io: file_write_all).
+
+# Write `len` bytes to stdout (outfile == 0) or to `outfile` (created/truncated).
+# Returns 0 on success, < 0 on a file error.
+fn output_write(buf, len, outfile): i64 {
+    if (outfile == 0) {
+        sys_write(1, buf, len);
+        return 0;
+    }
+    var r = file_write_all(outfile, buf, len);
+    if (r < 0) { return r; }
+    return 0;
+}

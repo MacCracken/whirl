@@ -1,0 +1,42 @@
+# whirl — transport: resolve + TCP connect + send + recv (plain HTTP).
+#
+# Composes the taar substrate: taar_resolve_ipv4 (DNS over UDP-53) + taar's TCP
+# socket primitives (taar_tcp_open / connect / send / recv / close). Sovereign,
+# raw-syscall — no lib/net.cyr. HTTPS (the tls_native wrap over this socket) is
+# the next bite.
+#
+# taar is included via lib/taar.cyr (the [deps.taar] dist bundle).
+
+var TRANSPORT_ERR_RESOLVE = 0 - 2;
+var TRANSPORT_ERR_SOCKET  = 0 - 3;
+var TRANSPORT_ERR_CONNECT = 0 - 4;
+
+# Resolve `host` (cstr), open a TCP connection to host:port, send `req`, and read
+# the full response into rbuf (bounded by rbufmax). Returns total bytes read
+# (>= 0), or a TRANSPORT_ERR_* (< 0). Plain HTTP only.
+fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
+    var ip = taar_resolve_ipv4(host);
+    if (ip < 0) { return TRANSPORT_ERR_RESOLVE; }
+
+    var fd = taar_tcp_open();
+    if (fd < 0) { return TRANSPORT_ERR_SOCKET; }
+    taar_tcp_set_timeout_ms(fd, 10000);   # bound a stalled/keep-alive recv
+
+    var cr = taar_tcp_connect(fd, ip, port);
+    if (cr < 0) { taar_sock_close(fd); return TRANSPORT_ERR_CONNECT; }
+
+    taar_tcp_send(fd, req, reqlen);
+
+    var total = 0;
+    var go = 1;
+    while (go == 1) {
+        var n = taar_tcp_recv(fd, rbuf + total, rbufmax - total);
+        if (n <= 0) { go = 0; }                      # 0 = peer closed; <0 = error
+        else {
+            total = total + n;
+            if (total >= rbufmax) { go = 0; }
+        }
+    }
+    taar_sock_close(fd);
+    return total;
+}

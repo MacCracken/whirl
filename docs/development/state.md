@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-06-18 (0.1.0 scaffold cut).
+> **Last refresh**: 2026-06-18 (0.2.0 — HTTP/1.1 GET MVP working over taar).
 
 ---
 
@@ -10,14 +10,14 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.1.0** (scaffold — skeleton + manifest + CI/release + docs; transport WIP) |
-| Status | Scaffold. `src/main.cyr` is a usage stub that compiles + runs; HTTP/1.1 + TLS transport is the next bite. |
-| Module footprint | `src/main.cyr` (stub) + `src/test.cyr`. Transport modules (url / cli / http / transport / output / platform_linux / platform_agnos) land in 0.2.x. |
+| Current version | **0.2.0** (HTTP/1.1 GET MVP — fetches real http:// end-to-end over the taar transport) |
+| Status | Working. `whirl http://…` resolves + connects + GETs + emits body to stdout / `-o FILE`; redirects (`-L`). HTTPS (TLS) is the next bite. |
+| Module footprint | `src/{url,http,cli,transport,output,main}.cyr` (+ `test.cyr`). url/http are pure-tested; transport rides taar. |
 | Cyrius pin | 6.2.6 (family-aligned with yo / dig / taar) |
-| Backends | none functional yet. Per-backend split (Linux POSIX / AGNOS sovereign) lands with the transport bite. |
-| Tests | `src/test.cyr` entry only; `tests/whirl.tcyr` unit suite lands with the transport bite. |
-| Family position | Third entry in the network-tools family (after yo + dig). Third `taar` consumer — adds taar's `tcp` / `tls` / `http` modules. |
-| Deps | stdlib base only at 0.1.0; `[deps.taar]` + `net` / `tls_native` / `sigil` added with the transport bite (see roadmap § AGNOS call surface). |
+| Backends | Linux (raw-syscall TCP via taar). AGNOS socket backend (taar `#ifdef`) is a follow-up. **No `lib/net.cyr`** — sovereign per-backend posture. |
+| Tests | `tests/whirl.tcyr` → **31 assertions** (URL parse + HTTP framing); live fetch validated against neverssl.com. |
+| Family position | Third entry in the network-tools family (after yo + dig). Third `taar` consumer — drove taar's `socket` + `dns` modules (0.2.0); `tcp`/`tls`/`http` growth continues. |
+| Deps | stdlib base + **`[deps.taar]` 0.2.0** (socket + dns). HTTPS adds `tls_native` + `sigil` next. No stdlib `net`/`sandhi` (the lean per-backend choice). |
 
 ## AGNOS readiness
 

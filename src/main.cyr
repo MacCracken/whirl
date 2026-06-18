@@ -1,34 +1,131 @@
-# whirl — main entry point
+# whirl — main entry point. Wires CLI → URL → transport → HTTP parse → output.
 #
-# SCAFFOLD (0.1.0): the repo skeleton, manifest, CI/release, and docs are in
-# place; the HTTP/1.1 + TLS transport (cli / url / http / transport /
-# platform_linux / platform_agnos) lands in the next bite. This stub compiles +
-# runs on host and prints usage so CI is green from day one. See the MVP scope
-# and the AGNOS call surface in docs/development/roadmap.md.
-#
-# Stdlib auto-included via cyrius.cyml.
+# Plain HTTP GET (the HTTPS/TLS wrap is the next bite). Stdlib auto-included.
+
+include "lib/taar.cyr"
+include "src/url.cyr"
+include "src/http.cyr"
+include "src/cli.cyr"
+include "src/transport.cyr"
+include "src/output.cyr"
+
+var WHIRL_RBUF_SZ = 262144;   # 256 KB response cap (MVP)
 
 fn _puts(s): i64  { syscall(1, 1, s, strlen(s)); return 0; }
 fn _eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
+
+fn _materialize_argv(ac): i64 {
+    var av = alloc(ac * 8);
+    var i = 0;
+    while (i < ac) { store64(av + i * 8, argv(i)); i = i + 1; }
+    return av;
+}
+
+fn _print_help(): i64 {
+    _puts("whirl — curl + wget unified, in sovereign Cyrius.\n\n");
+    _puts("usage: whirl [-o FILE] [-L] <url>\n");
+    _puts("  -o FILE   write the response body to FILE (default: stdout)\n");
+    _puts("  -L        follow redirects (3xx Location)\n");
+    _puts("  -h        this help\n");
+    return 0;
+}
+
+# Copy the Location header value (from `lv` up to CR) into a fresh cstr.
+fn _dup_location(resp, total, lv): i64 {
+    var n = 0;
+    while ((lv + n < total) && (load8(resp + lv + n) != 13)) { n = n + 1; }
+    var d = alloc(n + 1);
+    var i = 0;
+    while (i < n) { store8(d + i, load8(resp + lv + i)); i = i + 1; }
+    store8(d + n, 0);
+    return d;
+}
+
+# Emit the body of a parsed response (dechunk if needed; honor Content-Length).
+fn _emit_body(rbuf, total, outfile): i64 {
+    var bo = http_body_offset(rbuf, total);
+    if (bo < 0) { _eputs("whirl: no response body\n"); return 9; }
+    var blen = total - bo;
+    if (http_is_chunked(rbuf, total) == 1) {
+        var out = alloc(WHIRL_RBUF_SZ);
+        var dn = http_dechunk(rbuf + bo, blen, out, WHIRL_RBUF_SZ);
+        if (dn < 0) { _eputs("whirl: malformed chunked body\n"); return 9; }
+        output_write(out, dn, outfile);
+    } else {
+        var cl = http_content_length(rbuf, total);
+        if (cl >= 0) {
+            if (cl < blen) { blen = cl; }
+        }
+        output_write(rbuf + bo, blen, outfile);
+    }
+    return 0;
+}
 
 fn main() {
     alloc_init();
     args_init();
 
     var ac = argc();
-    if (ac < 2) {
-        _puts("whirl — curl + wget unified, in sovereign Cyrius.\n");
-        _puts("\n");
-        _puts("usage: whirl <url>            HTTP/HTTPS GET -> stdout\n");
-        _puts("       whirl -o FILE <url>    save the response body to FILE\n");
-        _puts("\n");
-        _puts("scaffold: HTTP/1.1 + TLS transport lands in the next bite\n");
-        _puts("          (see docs/development/roadmap.md).\n");
-        return 0;
+    var av = _materialize_argv(ac);
+    var rc = cli_parse(ac, av);
+    if (rc == CLI_HELP) { _print_help(); return 0; }
+    if (rc == CLI_ERR)  { _eputs("whirl: usage: whirl [-o FILE] [-L] <url>\n"); return 2; }
+
+    var u = url_new();
+    if (url_parse(cli_url(), u) != URL_PARSE_OK) {
+        _eputs("whirl: bad URL (need http://... or https://...)\n");
+        return 2;
+    }
+    if (url_is_https(u) == 1) {
+        # https/TLS support is the 0.2.x tail — see docs/development/roadmap.md
+        _eputs("whirl: https is unsupported in this build — use an http:// URL\n");
+        return 3;
     }
 
-    _eputs("whirl: transport not yet implemented (scaffold) — see docs/development/roadmap.md\n");
-    return 69;
+    var host = url_host(u);
+    var port = url_port(u);
+    var path = url_path(u);
+    var hops = 0;
+    var rbuf = alloc(WHIRL_RBUF_SZ);
+
+    var ret = 0;
+    var redirect = 1;
+    while (redirect == 1) {
+        redirect = 0;
+
+        var req = alloc(2048);
+        var reqlen = http_build_get(host, path, req, 2048);
+        var total = transport_fetch(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);
+        if (total < 0) { _eputs("whirl: connection failed\n"); return 9; }
+
+        var status = http_status_code(rbuf, total);
+        if (status < 0) { _eputs("whirl: malformed response\n"); return 9; }
+
+        if ((cli_follow() == 1) && (status >= 300) && (status < 400) && (hops < 10)) {
+            var lv = http_header_value(rbuf, total, "location");
+            if (lv >= 0) {
+                var loc = _dup_location(rbuf, total, lv);
+                var u2 = url_new();
+                if (url_parse(loc, u2) == URL_PARSE_OK) {
+                    if (url_is_https(u2) == 1) {
+                        # https redirect target — TLS support tracked in roadmap § 0.2.x
+                        _eputs("whirl: redirect target is https — unsupported in this build\n");
+                        return 3;
+                    }
+                    host = url_host(u2);
+                    port = url_port(u2);
+                    path = url_path(u2);
+                    hops = hops + 1;
+                    redirect = 1;
+                }
+            }
+        }
+
+        if (redirect == 0) {
+            ret = _emit_body(rbuf, total, cli_outfile());
+        }
+    }
+    return ret;
 }
 
 var r = main();

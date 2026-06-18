@@ -15,16 +15,22 @@
 
 Ordered by dependency.
 
-### 0.2.x — HTTP/1.1 GET MVP (the next bite)
+### 0.2.0 — HTTP/1.1 GET MVP ✅ (2026-06-18, over taar)
 
-- [ ] `src/url.cyr` — URL parse: scheme (`http`/`https`) / host / port (default 80/443) / path. Reuse `taar.ipv4` for literal-IP hosts.
-- [ ] `src/cli.cyr` — arg parse: `<url>`, `-o FILE`, `-L` (follow redirects), `-v` (verbose), `-h`/`--help`. (POST `-d`, method `-X`, recursive `-r` → 0.3.x+.)
-- [ ] `src/http.cyr` — HTTP/1.1 request build (GET, Host, User-Agent, Connection: close) + response parse (status line, headers, body; `Content-Length` and `Transfer-Encoding: chunked`).
-- [ ] `src/transport.cyr` — TCP connect + (for `https`) TLS wrap via `tls_native`. DNS hostname → IP via the UDP-53 path (taar.dns / dig-style resolver).
-- [ ] `src/platform.cyr` + `src/platform_linux.cyr` (POSIX) + `src/platform_agnos.cyr` (sovereign — see call surface below).
-- [ ] `src/output.cyr` — body → stdout (text) or `-o FILE`; smart text/binary stdout default.
-- [ ] `[deps.taar]` + stdlib `net` / `tls_native` / `sigil` wired in `cyrius.cyml`.
-- [ ] `tests/whirl.tcyr` — URL parse, HTTP response/status/header parse, chunked decode, redirect-Location parse.
+Transport went **raw-syscall over the taar substrate** — *not* stdlib `net`, which
+needs the heavy `agnosys`/`async`/`tls`/`ws` tree the lean family avoids. No whirl
+platform split: taar's `socket` + `dns` modules (driven by this work) abstract it.
+
+- [x] `src/url.cyr` — http/https URL parse (scheme / host / port / path; rejects bad scheme / empty host / port > 65535).
+- [x] `src/cli.cyr` — `<url>`, `-o FILE`, `-L` (follow redirects), `-h`/`--help`.
+- [x] `src/http.cyr` — request build + status / header (case-insensitive) / body-offset / Content-Length / chunked decode.
+- [x] `src/transport.cyr` — resolve (`taar_resolve_ipv4`) + TCP (`taar_tcp_*`) with a recv timeout. *(TLS wrap → the HTTPS tail below.)*
+- [x] `src/output.cyr` — body → stdout or `-o FILE` (`file_write_all`).
+- [x] `[deps.taar]` 0.2.0 (socket + dns). *(No whirl platform split; stdlib `net` dropped; `tls_native`/`sigil` arrive with HTTPS.)*
+- [x] `tests/whirl.tcyr` — URL + HTTP framing (**31 asserts**). Live fetch validated against neverssl.com.
+
+### 0.2.x tail — HTTPS (next)
+- [ ] `tls_native` wrap over the taar socket for `https://` (transport-agnostic `tls_native_set_transport(read, write, now)` over `taar_tcp_send`/`taar_tcp_recv`). Adds stdlib `tls_native` + `sigil`.
 
 ### 0.3.x — methods + bodies
 - [ ] `-d DATA` (POST, `Content-Type` default `application/x-www-form-urlencoded`), `-X METHOD` (arbitrary), `-H 'Header: val'` (custom headers), `--data-binary`, stdin body (`-d @-`).
