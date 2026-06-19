@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-06-18 (0.5.2 — resume `-C`; + `-r` niceties: tree mirroring, robots.txt, `../` normalize).
+> **Last refresh**: 2026-06-18 (0.5.3 — polish: `-A`/`-i`/`-I`/`-f`, `-d @file`/`@-` + `--data-binary`, robots `Allow:` precedence).
 
 ---
 
@@ -10,8 +10,8 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.5.2** (HTTP/1.1 + HTTPS; GET/POST/methods + headers; **`-r` recursive** w/ tree-mirroring + robots.txt, `-O`, `-C` **resume**, `--retry` — over the taar transport) |
-| Status | Working. `whirl [-X M] [-d DATA] [-H 'H: v'] [-r [-l N]] [-O|-o FILE] [-L] [--retry N] http(s)://…` — resolve + connect (+ TLS) + request + emit/save; redirects (`-L`); recursive same-host crawl (`-r`); cert chain + hostname verified fail-closed. |
+| Current version | **0.5.3** (HTTP/1.1 + HTTPS; GET/POST/methods + headers + `-A` UA; `-i`/`-I`/`-f`; **`-r` recursive** w/ tree-mirroring + robots.txt `Allow`/`Disallow` precedence, `-O`, `-C` **resume**, `--retry` — over the taar transport) |
+| Status | Working. `whirl [-X M] [-d DATA\|@file\|@-] [--data-binary D] [-H 'H: v'] [-A UA] [-i] [-I] [-f] [-r [-l N]] [-O\|-o FILE] [-C] [-L] [--retry N] http(s)://…` — resolve + connect (+ TLS) + request + emit/save; redirects (`-L`); recursive same-host crawl (`-r`); cert chain + hostname verified fail-closed. |
 | Module footprint | `src/{url,http,cli,transport,output,main}.cyr` (+ `test.cyr`). url/http pure-tested; transport rides taar (TCP+DNS) + stdlib tls for https. |
 | Cyrius pin | 6.2.6 (family-aligned with yo / dig / taar) |
 | Backends | Linux (raw-syscall TCP via taar; tls_native's default raw read/write on the fd for TLS). AGNOS socket backend (taar `#ifdef` + tls_native `set_transport`) is the follow-up. **No `lib/net.cyr`** — sovereign. |

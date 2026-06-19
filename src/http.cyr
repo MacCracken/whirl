@@ -8,6 +8,10 @@
 
 # --- request ---
 
+var _http_ua = 0;   # User-Agent override (0 = default whirl/<ver>)
+
+fn http_set_user_agent(ua): i64 { _http_ua = ua; return 0; }
+
 # Append cstr `s` into buf at pos (bounded by bufmax). Returns the new pos.
 fn _http_puts(buf, pos, bufmax, s): i64 {
     var i = 0;
@@ -65,7 +69,10 @@ fn http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, buf, bufma
     p = _http_puts(buf, p, bufmax, path);
     p = _http_puts(buf, p, bufmax, " HTTP/1.1\r\nHost: ");
     p = _http_puts(buf, p, bufmax, host);
-    p = _http_puts(buf, p, bufmax, "\r\nUser-Agent: whirl/0.3\r\nAccept: */*\r\nConnection: close\r\n");
+    p = _http_puts(buf, p, bufmax, "\r\nUser-Agent: ");
+    if (_http_ua != 0) { p = _http_puts(buf, p, bufmax, _http_ua); }
+    else { p = _http_puts(buf, p, bufmax, "whirl/0.5.3"); }
+    p = _http_puts(buf, p, bufmax, "\r\nAccept: */*\r\nConnection: close\r\n");
 
     var has_ct = 0;
     var i = 0;

@@ -20,6 +20,10 @@ var _cli_retries   = 0;   # --retry N: retry transient failures
 var _cli_recursive = 0;   # -r: recursive same-host fetch
 var _cli_depth     = 1;   # -l N: recursion depth (default 1)
 var _cli_resume    = 0;   # -C: resume a partial download (Range request + append)
+var _cli_useragent = 0;   # -A: User-Agent override (0 = default)
+var _cli_fail      = 0;   # -f: exit non-zero on HTTP >= 400
+var _cli_include   = 0;   # -i: include response headers in the output
+var _cli_head      = 0;   # -I: HEAD request
 
 var CLI_OK   = 0;
 var CLI_HELP = 1;
@@ -38,6 +42,40 @@ fn _cli_atoi(s): i64 {
     return v;
 }
 
+# Read all of fd into a fresh buffer (≤256 KB). Returns buf, sets _cli_bodylen.
+fn _cli_read_fd(fd): i64 {
+    var cap = 262144;
+    var buf = alloc(cap);
+    var total = 0;
+    var go = 1;
+    while (go == 1) {
+        var n = syscall(0, fd, buf + total, cap - total);   # read
+        if (n <= 0) { go = 0; }
+        else {
+            total = total + n;
+            if (total >= cap) { go = 0; }
+        }
+    }
+    _cli_bodylen = total;
+    return buf;
+}
+
+# Resolve a -d value: "@file" reads the file, "@-" reads stdin, else literal.
+# Returns the body cstr/buffer and sets _cli_bodylen.
+fn _cli_load_data(arg): i64 {
+    if (load8(arg) == 64) {   # '@'
+        var src = arg + 1;
+        if ((load8(src) == 45) && (load8(src + 1) == 0)) { return _cli_read_fd(0); }   # @-
+        var fd = syscall(2, src, 0, 0);   # open(src, O_RDONLY)
+        if (fd < 0) { _cli_bodylen = 0; return 0; }
+        var buf = _cli_read_fd(fd);
+        syscall(3, fd);                   # close
+        return buf;
+    }
+    _cli_bodylen = strlen(arg);
+    return arg;
+}
+
 # Parse argv (av = contiguous array of cstr ptrs, ac entries). Returns
 # CLI_OK / CLI_HELP / CLI_ERR.
 fn cli_parse(ac, av): i64 {
@@ -54,6 +92,10 @@ fn cli_parse(ac, av): i64 {
     _cli_recursive = 0;
     _cli_depth = 1;
     _cli_resume = 0;
+    _cli_useragent = 0;
+    _cli_fail = 0;
+    _cli_include = 0;
+    _cli_head = 0;
 
     var i = 1;
     while (i < ac) {
@@ -76,8 +118,13 @@ fn cli_parse(ac, av): i64 {
         elif (streq(arg, "-d") == 1) {
             i = i + 1;
             if (i >= ac) { return CLI_ERR; }
-            _cli_body = load64(av + i * 8);
-            _cli_bodylen = strlen(_cli_body);
+            _cli_body = _cli_load_data(load64(av + i * 8));   # literal / @file / @-
+            i = i + 1;
+        }
+        elif (streq(arg, "--data-binary") == 1) {
+            i = i + 1;
+            if (i >= ac) { return CLI_ERR; }
+            _cli_body = _cli_load_data(load64(av + i * 8));   # same loader (raw body)
             i = i + 1;
         }
         elif (streq(arg, "-H") == 1) {
@@ -97,6 +144,21 @@ fn cli_parse(ac, av): i64 {
         }
         elif (streq(arg, "-r") == 1) { _cli_recursive = 1; i = i + 1; }
         elif (streq(arg, "-C") == 1) { _cli_resume = 1; i = i + 1; }
+        elif (streq(arg, "-f") == 1) { _cli_fail = 1; i = i + 1; }
+        elif (streq(arg, "-i") == 1) { _cli_include = 1; i = i + 1; }
+        elif (streq(arg, "-I") == 1) { _cli_head = 1; i = i + 1; }
+        elif (streq(arg, "-A") == 1) {
+            i = i + 1;
+            if (i >= ac) { return CLI_ERR; }
+            _cli_useragent = load64(av + i * 8);
+            i = i + 1;
+        }
+        elif (streq(arg, "--user-agent") == 1) {
+            i = i + 1;
+            if (i >= ac) { return CLI_ERR; }
+            _cli_useragent = load64(av + i * 8);
+            i = i + 1;
+        }
         elif (streq(arg, "-l") == 1) {
             i = i + 1;
             if (i >= ac) { return CLI_ERR; }
@@ -124,10 +186,16 @@ fn cli_retries(): i64   { return _cli_retries; }
 fn cli_recursive(): i64 { return _cli_recursive; }
 fn cli_depth(): i64     { return _cli_depth; }
 fn cli_resume(): i64    { return _cli_resume; }
+fn cli_useragent(): i64 { return _cli_useragent; }
+fn cli_fail(): i64      { return _cli_fail; }
+fn cli_include(): i64   { return _cli_include; }
+fn cli_head(): i64      { return _cli_head; }
 
-# Effective method: explicit -X, else POST when a body was given, else GET.
+# Effective method: -I (HEAD) wins, then explicit -X, then POST when a body was
+# given, else GET.
 fn cli_method(): i64 {
+    if (_cli_head != 0)   { return "HEAD"; }
     if (_cli_method != 0) { return _cli_method; }
-    if (_cli_body != 0) { return "POST"; }
+    if (_cli_body != 0)   { return "POST"; }
     return "GET";
 }

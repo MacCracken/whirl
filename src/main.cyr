@@ -58,10 +58,16 @@ fn _print_help(): i64 {
     _puts("  -X METHOD   request method (default GET, or POST when -d is given)\n");
     _puts("  -d DATA     request body (sets POST + Content-Length; default\n");
     _puts("              Content-Type application/x-www-form-urlencoded)\n");
+    _puts("              @file reads a file, @- reads stdin\n");
+    _puts("  --data-binary D  request body, raw (same loader; @file / @-)\n");
     _puts("  -H 'H: v'   add a request header (repeatable)\n");
+    _puts("  -A UA       set the User-Agent (alias --user-agent)\n");
     _puts("  -o FILE     write the response body to FILE (default: stdout)\n");
     _puts("  -O          write to a filename derived from the URL\n");
     _puts("  -C          resume a partial download (-o/-O file; Range request)\n");
+    _puts("  -i          include response headers in the output\n");
+    _puts("  -I          HEAD request (headers only)\n");
+    _puts("  -f          fail (exit 22, no body) on HTTP >= 400\n");
     _puts("  -L          follow redirects (3xx Location)\n");
     _puts("  -r          recursive fetch (same-host links, saved to files)\n");
     _puts("  -l N        recursion depth for -r (default 1)\n");
@@ -83,6 +89,10 @@ fn _dup_location(resp, total, lv): i64 {
 
 # Emit the body of a parsed response (dechunk if needed; honor Content-Length).
 fn _emit_body(rbuf, total, outfile): i64 {
+    if ((cli_include() == 1) || (cli_head() == 1)) {
+        output_write(rbuf, total, outfile);   # -i/-I: status line + headers [+ body] verbatim
+        return 0;
+    }
     var bo = http_body_offset(rbuf, total);
     if (bo < 0) { _eputs("whirl: no response body\n"); return 9; }
     var blen = total - bo;
@@ -235,8 +245,20 @@ fn _robots_value(body, start, e): i64 {
     return p;
 }
 
-# Parse robots body → Disallow path prefixes for `User-agent: *`. Returns count.
-fn _robots_parse(body, len, rules, rulesmax): i64 {
+# Copy body[v..e) into a fresh cstr; returns it (or 0 if empty).
+fn _robots_dup(body, v, e): i64 {
+    var vlen = e - v;
+    if (vlen <= 0) { return 0; }
+    var d = alloc(vlen + 1);
+    var k = 0;
+    while (k < vlen) { store8(d + k, load8(body + v + k)); k = k + 1; }
+    store8(d + vlen, 0);
+    return d;
+}
+
+# Parse robots body → path-prefix rules for `User-agent: *`. `rules[i]` holds the
+# prefix cstr; `flags[i]` = 1 for Allow, 0 for Disallow. Returns the rule count.
+fn _robots_parse(body, len, rules, flags, rulesmax): i64 {
     var n = 0;
     var applies = 0;
     var i = 0;
@@ -254,17 +276,15 @@ fn _robots_parse(body, len, rules, rulesmax): i64 {
                 if ((v < e) && (load8(body + v) == 42)) { applies = 1; }   # '*'
             }
             elif (_robots_ci(body, p, e, "disallow:") == 1) {
-                if (applies == 1) {
-                    var v = _robots_value(body, p + 9, e);
-                    var vlen = e - v;
-                    if ((vlen > 0) && (n < rulesmax)) {
-                        var d = alloc(vlen + 1);
-                        var k = 0;
-                        while (k < vlen) { store8(d + k, load8(body + v + k)); k = k + 1; }
-                        store8(d + vlen, 0);
-                        store64(rules + n * 8, d);
-                        n = n + 1;
-                    }
+                if ((applies == 1) && (n < rulesmax)) {
+                    var d = _robots_dup(body, _robots_value(body, p + 9, e), e);
+                    if (d != 0) { store64(rules + n * 8, d); store64(flags + n * 8, 0); n = n + 1; }
+                }
+            }
+            elif (_robots_ci(body, p, e, "allow:") == 1) {
+                if ((applies == 1) && (n < rulesmax)) {
+                    var a = _robots_dup(body, _robots_value(body, p + 6, e), e);
+                    if (a != 0) { store64(rules + n * 8, a); store64(flags + n * 8, 1); n = n + 1; }
                 }
             }
         }
@@ -273,9 +293,9 @@ fn _robots_parse(body, len, rules, rulesmax): i64 {
     return n;
 }
 
-# Fetch base/robots.txt and parse it. Returns the Disallow-prefix count (0 on
-# any failure / missing — i.e. nothing disallowed).
-fn _robots_load(base_host, base_https, rules, rulesmax): i64 {
+# Fetch base/robots.txt and parse it. Returns the rule count (0 on any failure /
+# missing — i.e. nothing restricted).
+fn _robots_load(base_host, base_https, rules, flags, rulesmax): i64 {
     var port = 80;
     if (base_https == 1) { port = 443; }
     var rbuf = alloc(65536);
@@ -290,17 +310,29 @@ fn _robots_load(base_host, base_https, rules, rulesmax): i64 {
     if (status >= 300) { return 0; }
     var bo = http_body_offset(rbuf, total);
     if (bo < 0) { return 0; }
-    return _robots_parse(rbuf + bo, total - bo, rules, rulesmax);
+    return _robots_parse(rbuf + bo, total - bo, rules, flags, rulesmax);
 }
 
-# Is `path` blocked by any Disallow prefix?
-fn _robots_blocked(path, rules, nrules): i64 {
+# Is `path` blocked? Longest-matching prefix wins (RFC 9309 specificity); a tie
+# resolves to Allow. No match → allowed.
+fn _robots_blocked(path, rules, flags, nrules): i64 {
+    var best_len = -1;
+    var best_allow = 0;
     var i = 0;
     while (i < nrules) {
-        if (_starts(path, load64(rules + i * 8)) == 1) { return 1; }
+        var r = load64(rules + i * 8);
+        if (_starts(path, r) == 1) {
+            var rl = strlen(r);
+            if (rl > best_len) { best_len = rl; best_allow = load64(flags + i * 8); }
+            elif (rl == best_len) {
+                if (load64(flags + i * 8) == 1) { best_allow = 1; }   # tie → Allow wins
+            }
+        }
         i = i + 1;
     }
-    return 0;
+    if (best_len < 0) { return 0; }      # nothing matched → allowed
+    if (best_allow == 1) { return 0; }   # most-specific rule is Allow
+    return 1;                            # most-specific rule is Disallow
 }
 
 var _CRAWL_MAX = 64;
@@ -316,7 +348,8 @@ fn _crawl(start_url, base_host, base_https, maxdepth): i64 {
     var qtail = 0;
     var rbuf = alloc(WHIRL_RBUF_SZ);
     var rules = alloc(64 * 8);
-    var nrules = _robots_load(base_host, base_https, rules, 64);
+    var rflags = alloc(64 * 8);
+    var nrules = _robots_load(base_host, base_https, rules, rflags, 64);
 
     store64(queue + 0, start_url);
     store64(qdepth + 0, 0);
@@ -335,7 +368,7 @@ fn _crawl(start_url, base_host, base_https, maxdepth): i64 {
         if (url_parse(url, u) != URL_PARSE_OK) { continue; }
         var uh = url_host(u);
         if (streq(uh, base_host) == 0) { continue; }   # same-host bound
-        if (_robots_blocked(url_path(u), rules, nrules) == 1) {
+        if (_robots_blocked(url_path(u), rules, rflags, nrules) == 1) {
             _eputs("whirl: robots blocked "); _eputs(url); _eputs("\n");
             continue;
         }
@@ -383,6 +416,8 @@ fn main() {
     var rc = cli_parse(ac, av);
     if (rc == CLI_HELP) { _print_help(); return 0; }
     if (rc == CLI_ERR)  { _eputs("whirl: usage: whirl [-o FILE] [-L] <url>\n"); return 2; }
+
+    if (cli_useragent() != 0) { http_set_user_agent(cli_useragent()); }   # -A override
 
     var u = url_new();
     if (url_parse(cli_url(), u) != URL_PARSE_OK) {
@@ -482,7 +517,13 @@ fn main() {
                     _eputs("  (use -L to follow)\n");
                 }
             }
-            if ((resume_off > 0) && (status == 206)) {
+            if ((cli_fail() == 1) && (status >= 400)) {   # -f: no body, exit 22
+                _eputs("whirl: HTTP ");
+                _eput_int(status);
+                _eputs("\n");
+                ret = 22;
+            }
+            elif ((resume_off > 0) && (status == 206)) {
                 var rbo = http_body_offset(rbuf, total);
                 if (rbo >= 0) {
                     output_append(rbuf + rbo, total - rbo, outfile);

@@ -5,6 +5,19 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-06-18 — polish (curl/wget flag round-out)
+
+### Added
+- **`-A UA` / `--user-agent UA`** — override the `User-Agent` (default `whirl/<ver>`). New `http_set_user_agent`.
+- **`-i`** — include the response status line + headers in the output (verbatim response).
+- **`-I`** — HEAD request (headers only; method override + implies header output).
+- **`-f`** — fail on HTTP ≥ 400: suppress the body, report `whirl: HTTP <code>`, exit **22** (curl-compatible).
+- **`-d @file` / `-d @-`** — read the request body from a file or stdin (≤ 256 KB). **`--data-binary`** added (same loader, raw body).
+- **robots.txt `Allow:` precedence** — `-r` now parses `Allow:` as well as `Disallow:` and applies RFC 9309 longest-match specificity (a tie resolves to Allow). New `_robots_dup`; `_robots_parse`/`_robots_load`/`_robots_blocked` carry a parallel allow/disallow flag array.
+
+### Validated
+- Live (postman-echo / example.com): `-A` echoed; `-i` emitted status+headers; `-I` returned headers only; `-f` on a 404 → exit 22, 0 body bytes; `-d @file` and `-d @-` echoed the body. **Allow precedence proven on `en.wikipedia.org`** — `/w/load.php?…` saved (matches the longer `Allow: /w/load.php?`) while `/w/index.php?…` and `/w/rest.php/…` blocked (only `Disallow: /w/`). 52 unit assertions green.
+
 ## [0.5.2] — 2026-06-18 — resume (-C)
 
 ### Added
