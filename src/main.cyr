@@ -28,6 +28,23 @@ fn _sleep_ms(ms): i64 {
     return syscall(35, &ts, 0);   # nanosleep
 }
 
+# Build a "Range: bytes=<off>-" header cstr (for -C resume).
+fn _build_range_header(off): i64 {
+    var d = alloc(48);
+    var p = 0;
+    var pfx = "Range: bytes=";
+    var i = 0;
+    while (load8(pfx + i) != 0) { store8(d + p, load8(pfx + i)); p = p + 1; i = i + 1; }
+    var tmp[24];
+    var nl = fmt_int_buf(off, &tmp);
+    var k = 0;
+    while (k < nl) { store8(d + p, load8(&tmp + k)); p = p + 1; k = k + 1; }
+    store8(d + p, 45);   # '-'
+    p = p + 1;
+    store8(d + p, 0);
+    return d;
+}
+
 fn _materialize_argv(ac): i64 {
     var av = alloc(ac * 8);
     var i = 0;
@@ -44,6 +61,7 @@ fn _print_help(): i64 {
     _puts("  -H 'H: v'   add a request header (repeatable)\n");
     _puts("  -o FILE     write the response body to FILE (default: stdout)\n");
     _puts("  -O          write to a filename derived from the URL\n");
+    _puts("  -C          resume a partial download (-o/-O file; Range request)\n");
     _puts("  -L          follow redirects (3xx Location)\n");
     _puts("  -r          recursive fetch (same-host links, saved to files)\n");
     _puts("  -l N        recursion depth for -r (default 1)\n");
@@ -382,6 +400,10 @@ fn main() {
     var outfile = cli_outfile();
     if ((outfile == 0) && (cli_remote() == 1)) { outfile = url_filename(path); }
 
+    # -C resume: continue from the existing output file's size via a Range request.
+    var resume_off = 0;
+    if ((cli_resume() == 1) && (outfile != 0)) { resume_off = output_file_size(outfile); }
+
     if (cli_recursive() == 1) {
         return _crawl(cli_url(), host, is_https, cli_depth());
     }
@@ -396,10 +418,20 @@ fn main() {
         var meth = cli_method();
         var bdy = cli_body();
         var blen = cli_bodylen();
+        var hdrs = cli_hdrs();
+        var nhdrs = cli_nhdrs();
         if (hops > 0) { meth = "GET"; bdy = 0; blen = 0; }
+        if ((hops == 0) && (resume_off > 0)) {     # -C: add Range to the first request
+            var aug = alloc((nhdrs + 1) * 8);
+            var hi = 0;
+            while (hi < nhdrs) { store64(aug + hi * 8, load64(hdrs + hi * 8)); hi = hi + 1; }
+            store64(aug + nhdrs * 8, _build_range_header(resume_off));
+            hdrs = aug;
+            nhdrs = nhdrs + 1;
+        }
         var reqsz = 4096 + blen;
         var req = alloc(reqsz);
-        var reqlen = http_build_request(meth, host, path, cli_hdrs(), cli_nhdrs(), bdy, blen, req, reqsz);
+        var reqlen = http_build_request(meth, host, path, hdrs, nhdrs, bdy, blen, req, reqsz);
         # Fetch with up to --retry N retries (linear backoff) on transient failure.
         var total = 0 - 1;
         var tries = cli_retries() + 1;
@@ -450,7 +482,21 @@ fn main() {
                     _eputs("  (use -L to follow)\n");
                 }
             }
-            ret = _emit_body(rbuf, total, outfile);
+            if ((resume_off > 0) && (status == 206)) {
+                var rbo = http_body_offset(rbuf, total);
+                if (rbo >= 0) {
+                    output_append(rbuf + rbo, total - rbo, outfile);
+                    _eputs("whirl: resumed at "); _eput_int(resume_off); _eputs(" bytes\n");
+                    ret = 0;
+                } else { _eputs("whirl: malformed 206 response\n"); ret = 9; }
+            }
+            elif ((resume_off > 0) && (status == 416)) {
+                _eputs("whirl: already complete\n");
+                ret = 0;
+            }
+            else {
+                ret = _emit_body(rbuf, total, outfile);   # 200 / no-resume → overwrite
+            }
         }
     }
     return ret;

@@ -5,6 +5,16 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-06-18 — resume (-C)
+
+### Added
+- **`-C`** — resume a partial download. When the `-o`/`-O` output file already exists, whirl sends `Range: bytes=<size>-` and:
+  - **206 Partial Content** → appends the remainder (`output_append`),
+  - **200 OK** (server ignores Range) → overwrites with the full body,
+  - **416 Range Not Satisfiable** → reports "already complete".
+  Resume applies to the first hop only (a redirect falls back to a full GET). New `output_file_size` (`lseek` SEEK_END) + `_build_range_header`.
+- Live-validated: example.com 559 B → truncated to 300 B → `-C` → "resumed at 300 bytes" → reassembled to 559 B (valid tail); `Range: bytes=N-` confirmed sent via postman-echo; 200-overwrite path confirmed.
+
 ## [0.5.1] — 2026-06-18 — -r niceties
 
 ### Added / Changed

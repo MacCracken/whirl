@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-06-18 (0.5.1 — wget side + `-r` niceties: tree mirroring, robots.txt, `../` normalize).
+> **Last refresh**: 2026-06-18 (0.5.2 — resume `-C`; + `-r` niceties: tree mirroring, robots.txt, `../` normalize).
 
 ---
 
@@ -10,7 +10,7 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.5.1** (HTTP/1.1 + HTTPS; GET/POST/methods + headers; **`-r` recursive** w/ tree-mirroring + robots.txt + `../` normalize, `-O`, `--retry` — over the taar transport) |
+| Current version | **0.5.2** (HTTP/1.1 + HTTPS; GET/POST/methods + headers; **`-r` recursive** w/ tree-mirroring + robots.txt, `-O`, `-C` **resume**, `--retry` — over the taar transport) |
 | Status | Working. `whirl [-X M] [-d DATA] [-H 'H: v'] [-r [-l N]] [-O|-o FILE] [-L] [--retry N] http(s)://…` — resolve + connect (+ TLS) + request + emit/save; redirects (`-L`); recursive same-host crawl (`-r`); cert chain + hostname verified fail-closed. |
 | Module footprint | `src/{url,http,cli,transport,output,main}.cyr` (+ `test.cyr`). url/http pure-tested; transport rides taar (TCP+DNS) + stdlib tls for https. |
 | Cyrius pin | 6.2.6 (family-aligned with yo / dig / taar) |

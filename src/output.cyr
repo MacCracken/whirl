@@ -13,3 +13,23 @@ fn output_write(buf, len, outfile): i64 {
     if (r < 0) { return r; }
     return 0;
 }
+
+# Append `len` bytes to `outfile` (created if absent) — for -C resume after a
+# 206 Partial Content. Returns 0 on success, < 0 on a file error.
+fn output_append(buf, len, outfile): i64 {
+    var fd = syscall(2, outfile, 1089, 420);   # open(O_WRONLY|O_APPEND|O_CREAT, 0644)
+    if (fd < 0) { return fd; }
+    syscall(1, fd, buf, len);
+    syscall(3, fd);
+    return 0;
+}
+
+# Size of an existing file, or 0 if missing/empty (for -C resume offset).
+fn output_file_size(path): i64 {
+    var fd = syscall(2, path, 0, 0);   # open(path, O_RDONLY)
+    if (fd < 0) { return 0; }
+    var sz = syscall(8, fd, 0, 2);     # lseek(fd, 0, SEEK_END)
+    syscall(3, fd);                    # close
+    if (sz < 0) { return 0; }
+    return sz;
+}

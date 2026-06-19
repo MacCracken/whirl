@@ -19,6 +19,7 @@ var _cli_remote    = 0;   # -O: save body to a filename derived from the URL
 var _cli_retries   = 0;   # --retry N: retry transient failures
 var _cli_recursive = 0;   # -r: recursive same-host fetch
 var _cli_depth     = 1;   # -l N: recursion depth (default 1)
+var _cli_resume    = 0;   # -C: resume a partial download (Range request + append)
 
 var CLI_OK   = 0;
 var CLI_HELP = 1;
@@ -52,6 +53,7 @@ fn cli_parse(ac, av): i64 {
     _cli_retries = 0;
     _cli_recursive = 0;
     _cli_depth = 1;
+    _cli_resume = 0;
 
     var i = 1;
     while (i < ac) {
@@ -94,6 +96,7 @@ fn cli_parse(ac, av): i64 {
             i = i + 1;
         }
         elif (streq(arg, "-r") == 1) { _cli_recursive = 1; i = i + 1; }
+        elif (streq(arg, "-C") == 1) { _cli_resume = 1; i = i + 1; }
         elif (streq(arg, "-l") == 1) {
             i = i + 1;
             if (i >= ac) { return CLI_ERR; }
@@ -120,6 +123,7 @@ fn cli_remote(): i64    { return _cli_remote; }
 fn cli_retries(): i64   { return _cli_retries; }
 fn cli_recursive(): i64 { return _cli_recursive; }
 fn cli_depth(): i64     { return _cli_depth; }
+fn cli_resume(): i64    { return _cli_resume; }
 
 # Effective method: explicit -X, else POST when a body was given, else GET.
 fn cli_method(): i64 {
