@@ -5,6 +5,15 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-06-18 — -r niceties
+
+### Added / Changed
+- **Directory-tree mirroring** — `-r` saves each resource to a path tree under cwd (`/docs/g.html` → `docs/g.html`, creating dirs; `/` or `/d/` → `…/index.html`) instead of flat `a_b.html` names.
+- **`../` / `.` path normalization** (RFC 3986 §5.2.4) — new `links_path_normalize`; relative + root-relative links are normalized before fetch/dedup (6 unit tests).
+- **robots.txt** — `-r` fetches `/robots.txt` and honors `Disallow` for `User-agent: *`; blocked paths are skipped.
+- **Protocol-relative links** (`//host/path`) now resolve to scheme + host (→ cross-host, filtered) instead of being mis-saved as a base-host path.
+- **52** unit assertions. Live: info.cern.ch saved a nested tree; the Wikipedia crawl honored robots (`/w/…` blocked) and filtered cross-host (`upload.wikimedia.org`).
+
 ## [0.5.0] — 2026-06-18 — wget side (-O / --retry / -r)
 
 ### Added

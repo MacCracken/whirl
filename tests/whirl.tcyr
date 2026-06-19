@@ -138,9 +138,20 @@ fn test_links() {
     assert_eq(streq(load64(out + 16), "http://x.org/y"), 1, "href unquoted");
 }
 
+fn test_path_normalize() {
+    test_group("path-normalize");
+    assert_eq(streq(links_path_normalize("/a/b/../c"), "/a/c"), 1, "../ pops a segment");
+    assert_eq(streq(links_path_normalize("/a/./b"), "/a/b"), 1, ". is skipped");
+    assert_eq(streq(links_path_normalize("/a/b/../../x"), "/x"), 1, "double ..");
+    assert_eq(streq(links_path_normalize("/a/"), "/a/"), 1, "trailing slash kept");
+    assert_eq(streq(links_path_normalize("/"), "/"), 1, "root stays /");
+    assert_eq(streq(links_path_normalize("/a//b"), "/a/b"), 1, "empty segment collapsed");
+}
+
 fn main() {
     alloc_init();
     test_links();
+    test_path_normalize();
     test_url_basic();
     test_url_https_port_path();
     test_url_https_default_port();

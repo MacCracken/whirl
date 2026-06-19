@@ -43,7 +43,8 @@ platform split: taar's `socket` + `dns` modules (driven by this work) abstract i
 ### 0.5.0 — the wget side ✅ (2026-06-18)
 - [x] `-O` (filename derived from the URL path; `url_filename`), `--retry N` (linear backoff).
 - [x] `-r` recursive fetch (`-l N` depth) — `src/links.cyr` href/src extraction + same-host crawl (resolve absolute/root-relative/relative, dedup, 64-fetch cap, flat-file save). Live-validated on info.cern.ch (multi-resource, cross-host filtered).
-- [ ] *Later:* directory-tree mirroring + `../` normalization + robots.txt; resume (`-C`); `--data-binary`/stdin body.
+- [x] **0.5.1:** directory-tree mirroring + `../` normalization + robots.txt (+ protocol-relative `//host` resolution). Live-validated.
+- [ ] *Later:* resume (`-C`); `--data-binary`/stdin body; `Allow:`-rule precedence in robots.
 
 ### 0.6.x — iron validation + parity
 - [ ] First AGNOS run on archaemenid: `whirl https://example.com` over the sovereign backend. Parity benchmark vs `curl` (latency / RSS / binary size).

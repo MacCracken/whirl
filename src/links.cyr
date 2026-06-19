@@ -26,6 +26,45 @@ fn _links_is_alpha(c): i64 {
     return 0;
 }
 
+# Normalize an absolute path's `.` and `..` segments (RFC 3986 §5.2.4). Returns
+# a fresh cstr. "/a/b/../c" -> "/a/c", "/a/./b" -> "/a/b", "/a/../../x" -> "/x".
+# A trailing slash on the input is preserved.
+fn links_path_normalize(path): i64 {
+    var n = strlen(path);
+    var out = alloc(n + 2);
+    var starts = alloc(256 * 8);   # output offset where each kept segment began
+    var nstarts = 0;
+    var w = 0;
+    var i = 0;
+    if ((n > 0) && (load8(path) == 47)) { i = 1; }   # skip leading '/'
+    while (i <= n) {
+        var s = i;
+        while ((i < n) && (load8(path + i) != 47)) { i = i + 1; }
+        var slen = i - s;
+        if (slen == 0) {
+            # empty segment (// or trailing) — skip
+        }
+        elif ((slen == 1) && (load8(path + s) == 46)) {
+            # "." — skip
+        }
+        elif ((slen == 2) && (load8(path + s) == 46) && (load8(path + s + 1) == 46)) {
+            if (nstarts > 0) { nstarts = nstarts - 1; w = load64(starts + nstarts * 8); }
+        }
+        else {
+            if (nstarts < 256) { store64(starts + nstarts * 8, w); nstarts = nstarts + 1; }
+            store8(out + w, 47);
+            w = w + 1;
+            var k = 0;
+            while (k < slen) { store8(out + w, load8(path + s + k)); w = w + 1; k = k + 1; }
+        }
+        i = i + 1;
+    }
+    if ((n > 0) && (load8(path + n - 1) == 47) && (w > 0)) { store8(out + w, 47); w = w + 1; }
+    if (w == 0) { store8(out, 47); w = 1; }   # root
+    store8(out + w, 0);
+    return out;
+}
+
 # Extract href/src URL values from html[0..len) into `out` (array of cstr ptrs,
 # capacity `outmax`). Returns the count.
 fn links_extract(html, len, out, outmax): i64 {

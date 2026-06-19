@@ -140,38 +140,53 @@ fn _resolve_link(link, base_https, base_host, base_path): i64 {
     if (_starts(link, "http://") == 1) { return link; }
     if (_starts(link, "https://") == 1) { return link; }
     if (_has_scheme_colon(link) == 1) { return 0; }  # mailto:/javascript:/...
+    if ((c0 == 47) && (load8(link + 1) == 47)) {     # protocol-relative //host/path
+        var sch = "http:";
+        if (base_https == 1) { sch = "https:"; }
+        return _concat2(sch, link);                  # → absolute (cross-host filtered later)
+    }
     var pfx = "http://";
     if (base_https == 1) { pfx = "https://"; }
-    if (c0 == 47) { return _concat2(_concat2(pfx, base_host), link); }   # root-relative
+    if (c0 == 47) {                                                      # root-relative
+        return _concat2(_concat2(pfx, base_host), links_path_normalize(link));
+    }
     var dir = _path_dir(base_path);                                      # relative
-    return _concat2(_concat2(pfx, base_host), _concat2(dir, link));
+    var np = links_path_normalize(_concat2(dir, link));
+    return _concat2(_concat2(pfx, base_host), np);
 }
 
-# Flat save-name from a path: strip leading '/', '/'→'_', strip '?query';
-# root / trailing-slash → "index.html".
-fn _crawl_savename(path): i64 {
+fn _mkdir(path): i64 { return syscall(83, path, 493); }   # mkdir(path, 0755); EEXIST ignored
+
+# Save buf[0..len) to a file mirroring `path` as a directory tree under cwd:
+# "/docs/g.html" -> docs/g.html (mkdir docs); "/" or "/d/" -> .../index.html.
+fn _save_tree(path, buf, len): i64 {
     var n = strlen(path);
     var end = 0;
-    while ((end < n) && (load8(path + end) != 63)) { end = end + 1; }
-    var d = alloc(end + 12);
+    while ((end < n) && (load8(path + end) != 63)) { end = end + 1; }   # strip ?query
+    var rp = alloc(end + 12);
     var w = 0;
     var i = 0;
-    if ((end > 0) && (load8(path) == 47)) { i = 1; }
-    while (i < end) {
-        var c = load8(path + i);
-        if (c == 47) { c = 95; }
-        store8(d + w, c);
-        w = w + 1;
-        i = i + 1;
-    }
-    if (w == 0) { return _concat2("index.html", ""); }
-    if (load8(d + w - 1) == 95) {
+    if ((end > 0) && (load8(path) == 47)) { i = 1; }   # strip leading '/'
+    while (i < end) { store8(rp + w, load8(path + i)); w = w + 1; i = i + 1; }
+    var need_index = 0;
+    if (w == 0) { need_index = 1; }
+    elif (load8(rp + w - 1) == 47) { need_index = 1; }
+    if (need_index == 1) {
         var idx = "index.html";
         var m = 0;
-        while (load8(idx + m) != 0) { store8(d + w, load8(idx + m)); w = w + 1; m = m + 1; }
+        while (load8(idx + m) != 0) { store8(rp + w, load8(idx + m)); w = w + 1; m = m + 1; }
     }
-    store8(d + w, 0);
-    return d;
+    store8(rp + w, 0);
+    var j = 0;
+    while (j < w) {
+        if (load8(rp + j) == 47) {
+            store8(rp + j, 0);
+            _mkdir(rp);
+            store8(rp + j, 47);
+        }
+        j = j + 1;
+    }
+    return file_write_all(rp, buf, len);
 }
 
 fn _seen(visited, nvis, url): i64 {
@@ -183,11 +198,98 @@ fn _seen(visited, nvis, url): i64 {
     return 0;
 }
 
+# --- robots.txt (honor Disallow for User-agent: *) ---
+
+fn _robots_ci(body, p, e, lit): i64 {
+    var k = 0;
+    while (load8(lit + k) != 0) {
+        if (p + k >= e) { return 0; }
+        var c = load8(body + p + k);
+        if ((c >= 65) && (c <= 90)) { c = c + 32; }
+        if (c != load8(lit + k)) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+fn _robots_value(body, start, e): i64 {
+    var p = start;
+    while ((p < e) && (load8(body + p) == 32)) { p = p + 1; }
+    return p;
+}
+
+# Parse robots body → Disallow path prefixes for `User-agent: *`. Returns count.
+fn _robots_parse(body, len, rules, rulesmax): i64 {
+    var n = 0;
+    var applies = 0;
+    var i = 0;
+    while (i < len) {
+        var s = i;
+        while ((i < len) && (load8(body + i) != 10)) { i = i + 1; }
+        var e = i;
+        if ((e > s) && (load8(body + e - 1) == 13)) { e = e - 1; }   # trim \r
+        var p = s;
+        while ((p < e) && (load8(body + p) == 32)) { p = p + 1; }
+        if ((p < e) && (load8(body + p) != 35)) {                    # not '#'
+            if (_robots_ci(body, p, e, "user-agent:") == 1) {
+                var v = _robots_value(body, p + 11, e);
+                applies = 0;
+                if ((v < e) && (load8(body + v) == 42)) { applies = 1; }   # '*'
+            }
+            elif (_robots_ci(body, p, e, "disallow:") == 1) {
+                if (applies == 1) {
+                    var v = _robots_value(body, p + 9, e);
+                    var vlen = e - v;
+                    if ((vlen > 0) && (n < rulesmax)) {
+                        var d = alloc(vlen + 1);
+                        var k = 0;
+                        while (k < vlen) { store8(d + k, load8(body + v + k)); k = k + 1; }
+                        store8(d + vlen, 0);
+                        store64(rules + n * 8, d);
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+# Fetch base/robots.txt and parse it. Returns the Disallow-prefix count (0 on
+# any failure / missing — i.e. nothing disallowed).
+fn _robots_load(base_host, base_https, rules, rulesmax): i64 {
+    var port = 80;
+    if (base_https == 1) { port = 443; }
+    var rbuf = alloc(65536);
+    var req = alloc(512);
+    var reqlen = http_build_get(base_host, "/robots.txt", req, 512);
+    var total = 0;
+    if (base_https == 1) { total = transport_fetch_tls(base_host, port, req, reqlen, rbuf, 65536); }
+    else { total = transport_fetch(base_host, port, req, reqlen, rbuf, 65536); }
+    if (total < 0) { return 0; }
+    var status = http_status_code(rbuf, total);
+    if (status < 200) { return 0; }
+    if (status >= 300) { return 0; }
+    var bo = http_body_offset(rbuf, total);
+    if (bo < 0) { return 0; }
+    return _robots_parse(rbuf + bo, total - bo, rules, rulesmax);
+}
+
+# Is `path` blocked by any Disallow prefix?
+fn _robots_blocked(path, rules, nrules): i64 {
+    var i = 0;
+    while (i < nrules) {
+        if (_starts(path, load64(rules + i * 8)) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 var _CRAWL_MAX = 64;
 
 # Recursive same-host fetch from `start_url`, saving each resource to a flat file.
 # BFS, depth-bounded, visited-deduped, capped at _CRAWL_MAX fetches.
-fn _crawl(start_url, base_host, maxdepth): i64 {
+fn _crawl(start_url, base_host, base_https, maxdepth): i64 {
     var queue   = alloc(_CRAWL_MAX * 8);
     var qdepth  = alloc(_CRAWL_MAX * 8);
     var visited = alloc(_CRAWL_MAX * 8);
@@ -195,6 +297,8 @@ fn _crawl(start_url, base_host, maxdepth): i64 {
     var qhead = 0;
     var qtail = 0;
     var rbuf = alloc(WHIRL_RBUF_SZ);
+    var rules = alloc(64 * 8);
+    var nrules = _robots_load(base_host, base_https, rules, 64);
 
     store64(queue + 0, start_url);
     store64(qdepth + 0, 0);
@@ -213,6 +317,10 @@ fn _crawl(start_url, base_host, maxdepth): i64 {
         if (url_parse(url, u) != URL_PARSE_OK) { continue; }
         var uh = url_host(u);
         if (streq(uh, base_host) == 0) { continue; }   # same-host bound
+        if (_robots_blocked(url_path(u), rules, nrules) == 1) {
+            _eputs("whirl: robots blocked "); _eputs(url); _eputs("\n");
+            continue;
+        }
 
         var req = alloc(2048);
         var reqlen = http_build_get(uh, url_path(u), req, 2048);
@@ -223,9 +331,8 @@ fn _crawl(start_url, base_host, maxdepth): i64 {
 
         var bo = http_body_offset(rbuf, total);
         if (bo < 0) { continue; }
-        var name = _crawl_savename(url_path(u));
-        output_write(rbuf + bo, total - bo, name);
-        _eputs("whirl: saved "); _eputs(name); _eputs("\n");
+        _save_tree(url_path(u), rbuf + bo, total - bo);
+        _eputs("whirl: saved "); _eputs(url_path(u)); _eputs("\n");
 
         if (depth < maxdepth) {
             var links = alloc(64 * 8);
@@ -276,7 +383,7 @@ fn main() {
     if ((outfile == 0) && (cli_remote() == 1)) { outfile = url_filename(path); }
 
     if (cli_recursive() == 1) {
-        return _crawl(cli_url(), host, cli_depth());
+        return _crawl(cli_url(), host, is_https, cli_depth());
     }
 
     var ret = 0;
