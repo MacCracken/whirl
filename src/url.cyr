@@ -31,6 +31,28 @@ fn url_port(u): i64     { return load64(u + URL_OFF_PORT); }
 fn url_host(u): i64     { return load64(u + URL_OFF_HOST); }
 fn url_path(u): i64     { return load64(u + URL_OFF_PATH); }
 
+# Derive a download filename from a path (cstr): the last '/'-segment with any
+# `?query` stripped, or "index.html" when the path is "/" or ends in "/". Returns
+# a fresh cstr.
+fn url_filename(path): i64 {
+    var n = 0;
+    while (load8(path + n) != 0) { n = n + 1; }
+    # cut at the first '?' (63)
+    var end = 0;
+    while ((end < n) && (load8(path + end) != 63)) { end = end + 1; }
+    # last '/' (47) within [0, end)
+    var lastslash = 0 - 1;
+    var i = 0;
+    while (i < end) {
+        if (load8(path + i) == 47) { lastslash = i; }
+        i = i + 1;
+    }
+    var s = lastslash + 1;
+    var slen = end - s;
+    if (slen <= 0) { return _url_dup_range("index.html", 10); }
+    return _url_dup_range(path + s, slen);
+}
+
 # Does cstr `s` start with cstr `pfx`?
 fn _url_has_prefix(s, pfx): i64 {
     var i = 0;

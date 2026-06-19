@@ -5,6 +5,12 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+### Added — wget side (part 1)
+- **`-O`** — save the body to a filename derived from the URL path (last segment; `index.html` for `/` or a trailing slash). New `url_filename(path)` helper.
+- **`--retry N`** — retry transient connection failures N times with linear backoff (`200·attempt` ms).
+- **42** unit assertions (5 new for `url_filename`). Live: `-O https://example.com` → `index.html`; `--retry 2` on a bad host retries then fails cleanly.
+- *(Next: `-r` recursive fetch — link extraction + same-host crawl, its own bite.)*
+
 ## [0.4.0] — 2026-06-18 — methods + bodies
 
 ### Added

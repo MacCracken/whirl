@@ -15,9 +15,25 @@ var _cli_bodylen = 0;
 var _cli_hdrs    = 0;   # array of cstr ptrs (alloc'd)
 var _cli_nhdrs   = 0;
 
+var _cli_remote  = 0;   # -O: save body to a filename derived from the URL
+var _cli_retries = 0;   # --retry N: retry transient failures
+
 var CLI_OK   = 0;
 var CLI_HELP = 1;
 var CLI_ERR  = 2;
+
+# Parse a non-negative decimal cstr → i64 (stops at the first non-digit).
+fn _cli_atoi(s): i64 {
+    var v = 0;
+    var i = 0;
+    while (load8(s + i) != 0) {
+        var c = load8(s + i);
+        if ((c < 48) || (c > 57)) { return v; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
 
 # Parse argv (av = contiguous array of cstr ptrs, ac entries). Returns
 # CLI_OK / CLI_HELP / CLI_ERR.
@@ -30,6 +46,8 @@ fn cli_parse(ac, av): i64 {
     _cli_bodylen = 0;
     _cli_hdrs = alloc(_CLI_MAX_HDRS * 8);
     _cli_nhdrs = 0;
+    _cli_remote = 0;
+    _cli_retries = 0;
 
     var i = 1;
     while (i < ac) {
@@ -64,6 +82,13 @@ fn cli_parse(ac, av): i64 {
             _cli_nhdrs = _cli_nhdrs + 1;
             i = i + 1;
         }
+        elif (streq(arg, "-O") == 1) { _cli_remote = 1; i = i + 1; }
+        elif (streq(arg, "--retry") == 1) {
+            i = i + 1;
+            if (i >= ac) { return CLI_ERR; }
+            _cli_retries = _cli_atoi(load64(av + i * 8));
+            i = i + 1;
+        }
         else {
             if (_cli_url == 0) { _cli_url = arg; i = i + 1; }
             else { return CLI_ERR; }   # a second positional
@@ -80,6 +105,8 @@ fn cli_body(): i64    { return _cli_body; }
 fn cli_bodylen(): i64 { return _cli_bodylen; }
 fn cli_hdrs(): i64    { return _cli_hdrs; }
 fn cli_nhdrs(): i64   { return _cli_nhdrs; }
+fn cli_remote(): i64  { return _cli_remote; }
+fn cli_retries(): i64 { return _cli_retries; }
 
 # Effective method: explicit -X, else POST when a body was given, else GET.
 fn cli_method(): i64 {

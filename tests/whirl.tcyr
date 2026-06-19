@@ -48,6 +48,15 @@ fn test_url_rejects() {
 
 # === HTTP ===
 
+fn test_url_filename() {
+    test_group("url-filename");
+    assert_eq(streq(url_filename("/a/b/file.html"), "file.html"), 1, "last path segment");
+    assert_eq(streq(url_filename("/a/b/file.html?x=1"), "file.html"), 1, "strip ?query");
+    assert_eq(streq(url_filename("/"), "index.html"), 1, "root -> index.html");
+    assert_eq(streq(url_filename("/dir/"), "index.html"), 1, "trailing slash -> index.html");
+    assert_eq(streq(url_filename("/just"), "just"), 1, "single segment");
+}
+
 fn test_http_build() {
     test_group("http-build");
     var buf = alloc(256);
@@ -123,6 +132,7 @@ fn main() {
     test_url_https_port_path();
     test_url_https_default_port();
     test_url_rejects();
+    test_url_filename();
     test_http_build();
     test_http_status();
     test_http_headers();

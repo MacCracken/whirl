@@ -19,6 +19,13 @@ fn _eput_int(n): i64 {
     syscall(1, 2, b, len);
     return 0;
 }
+fn _sleep_ms(ms): i64 {
+    if (ms <= 0) { return 0; }
+    var ts[16];
+    store64(&ts, ms / 1000);
+    store64(&ts + 8, (ms % 1000) * 1000000);
+    return syscall(35, &ts, 0);   # nanosleep
+}
 
 fn _materialize_argv(ac): i64 {
     var av = alloc(ac * 8);
@@ -35,7 +42,9 @@ fn _print_help(): i64 {
     _puts("              Content-Type application/x-www-form-urlencoded)\n");
     _puts("  -H 'H: v'   add a request header (repeatable)\n");
     _puts("  -o FILE     write the response body to FILE (default: stdout)\n");
+    _puts("  -O          write to a filename derived from the URL\n");
     _puts("  -L          follow redirects (3xx Location)\n");
+    _puts("  --retry N   retry transient failures N times (linear backoff)\n");
     _puts("  -h          this help\n");
     return 0;
 }
@@ -93,6 +102,10 @@ fn main() {
     var hops = 0;
     var rbuf = alloc(WHIRL_RBUF_SZ);
 
+    # -o FILE wins; else -O derives the name from the URL path.
+    var outfile = cli_outfile();
+    if ((outfile == 0) && (cli_remote() == 1)) { outfile = url_filename(path); }
+
     var ret = 0;
     var redirect = 1;
     while (redirect == 1) {
@@ -107,11 +120,21 @@ fn main() {
         var reqsz = 4096 + blen;
         var req = alloc(reqsz);
         var reqlen = http_build_request(meth, host, path, cli_hdrs(), cli_nhdrs(), bdy, blen, req, reqsz);
-        var total = 0;
-        if (is_https == 1) {
-            total = transport_fetch_tls(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);
-        } else {
-            total = transport_fetch(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);
+        # Fetch with up to --retry N retries (linear backoff) on transient failure.
+        var total = 0 - 1;
+        var tries = cli_retries() + 1;
+        var attempt = 0;
+        while (attempt < tries) {
+            if (is_https == 1) {
+                total = transport_fetch_tls(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);
+            } else {
+                total = transport_fetch(host, port, req, reqlen, rbuf, WHIRL_RBUF_SZ);
+            }
+            if (total >= 0) { attempt = tries; }       # success → stop
+            else {
+                attempt = attempt + 1;
+                if (attempt < tries) { _sleep_ms(200 * attempt); }
+            }
         }
         if (total < 0) { _eputs("whirl: connection failed\n"); return 9; }
 
@@ -147,7 +170,7 @@ fn main() {
                     _eputs("  (use -L to follow)\n");
                 }
             }
-            ret = _emit_body(rbuf, total, cli_outfile());
+            ret = _emit_body(rbuf, total, outfile);
         }
     }
     return ret;
