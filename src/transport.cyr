@@ -57,6 +57,14 @@ fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
     var cr = taar_tcp_connect(fd, ip, port);
     if (cr < 0) { taar_sock_close(fd); return TRANSPORT_ERR_CONNECT; }
 
+#ifdef CYRIUS_TARGET_AGNOS
+    # taar's agnos TCP "fd" is a sentinel — the real conn_id lives in a taar
+    # module global — so tls_native's default raw-fd sys_read/sys_write can't
+    # route. Install taar's TCP recv/send as the TLS transport (v6.2.4 hook).
+    # now_fn = 0 keeps the agnos default (_tn_now_unix → sys_time_unix#46) for
+    # cert-window validation. On Linux the real fd works with the default path.
+    tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0);
+#endif
     var ctx = tls_connect(fd, host);          # SNI + handshake + cert/hostname verify
     if (ctx == 0) { taar_sock_close(fd); return TRANSPORT_ERR_TLS; }
 

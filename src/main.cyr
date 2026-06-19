@@ -12,20 +12,20 @@ include "src/output.cyr"
 
 var WHIRL_RBUF_SZ = 262144;   # 256 KB response cap (MVP)
 
-fn _puts(s): i64  { syscall(1, 1, s, strlen(s)); return 0; }
-fn _eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
+# sys_write / sleep_ms are the portable stdlib wrappers — they route to the
+# right syscall number on Linux AND agnos (raw syscall(1)/(35) would be wrong on
+# agnos, where the syscall ABI differs). Keeps whirl's I/O target-agnostic.
+fn _puts(s): i64  { sys_write(1, s, strlen(s)); return 0; }
+fn _eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
 fn _eput_int(n): i64 {
     var b = alloc(24);
     var len = fmt_int_buf(n, b);
-    syscall(1, 2, b, len);
+    sys_write(2, b, len);
     return 0;
 }
 fn _sleep_ms(ms): i64 {
     if (ms <= 0) { return 0; }
-    var ts[16];
-    store64(&ts, ms / 1000);
-    store64(&ts + 8, (ms % 1000) * 1000000);
-    return syscall(35, &ts, 0);   # nanosleep
+    return sleep_ms(ms);   # chrono — portable across Linux / agnos
 }
 
 # Build a "Range: bytes=<off>-" header cstr (for -C resume).
@@ -183,7 +183,18 @@ fn _resolve_link(link, base_https, base_host, base_path): i64 {
     return _concat2(_concat2(pfx, base_host), np);
 }
 
-fn _mkdir(path): i64 { return syscall(83, path, 493); }   # mkdir(path, 0755); EEXIST ignored
+# mkdir; EEXIST ignored by the caller. The two targets' sys_mkdir signatures
+# differ (Linux (path, mode) vs agnos (path, pathlen)), so branch on the target.
+fn _mkdir(path): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    return sys_mkdir(path, 493);   # 0755
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    var nl = 0;
+    while (load8(path + nl) != 0) { nl = nl + 1; }
+    return sys_mkdir(path, nl);
+#endif
+}
 
 # Save buf[0..len) to a file mirroring `path` as a directory tree under cwd:
 # "/docs/g.html" -> docs/g.html (mkdir docs); "/" or "/d/" -> .../index.html.

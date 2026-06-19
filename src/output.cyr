@@ -15,21 +15,47 @@ fn output_write(buf, len, outfile): i64 {
 }
 
 # Append `len` bytes to `outfile` (created if absent) — for -C resume after a
-# 206 Partial Content. Returns 0 on success, < 0 on a file error.
+# 206 Partial Content. Linux uses true O_APPEND (no size cap). agnos has no
+# O_APPEND/flock in the frozen FS surface, so it read-modify-writes the file
+# (≤1 MB resume cap there — fine for the MVP).
 fn output_append(buf, len, outfile): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
     var fd = syscall(2, outfile, 1089, 420);   # open(O_WRONLY|O_APPEND|O_CREAT, 0644)
     if (fd < 0) { return fd; }
     syscall(1, fd, buf, len);
     syscall(3, fd);
     return 0;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    var cap = 1048576;
+    var old = alloc(cap);
+    var on = file_read_all(outfile, old, cap);
+    if (on < 0) { on = 0; }
+    var merged = alloc(on + len);
+    var i = 0;
+    while (i < on)  { store8(merged + i, load8(old + i)); i = i + 1; }
+    var j = 0;
+    while (j < len) { store8(merged + on + j, load8(buf + j)); j = j + 1; }
+    return file_write_all(outfile, merged, on + len);
+#endif
 }
 
-# Size of an existing file, or 0 if missing/empty (for -C resume offset).
+# Size of an existing file, or 0 if missing/empty (for -C resume offset). The
+# targets diverge: Linux lseek(SEEK_END) vs agnos sys_stat (STAT_SIZE=16).
 fn output_file_size(path): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
     var fd = syscall(2, path, 0, 0);   # open(path, O_RDONLY)
     if (fd < 0) { return 0; }
     var sz = syscall(8, fd, 0, 2);     # lseek(fd, 0, SEEK_END)
     syscall(3, fd);                    # close
     if (sz < 0) { return 0; }
     return sz;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    var nl = 0;
+    while (load8(path + nl) != 0) { nl = nl + 1; }
+    var sb = alloc(48);                # AgnosStat (STAT_BUFSZ)
+    if (sys_stat(path, nl, sb) < 0) { return 0; }
+    return load64(sb + 16);            # STAT_SIZE
+#endif
 }

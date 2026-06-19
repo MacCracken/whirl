@@ -5,6 +5,77 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-06-18 — HTTPS on AGNOS (tls_native transport hook)
+
+Closes the `https://` path on agnos. On Linux, tls_native does raw `sys_read`/
+`sys_write` on the real socket fd — but taar's agnos TCP "fd" is a sentinel (the
+real conn_id lives in a taar module global), so the default path can't route.
+
+### Added
+- **`tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0)`** in
+  `transport_fetch_tls`, under `#ifdef CYRIUS_TARGET_AGNOS` — installs taar's TCP
+  recv/send as tls_native's transport vtable (the v6.2.4 "Option C" hook). The
+  per-conn handle whirl passes to `tls_connect` is forwarded to the leaf helpers,
+  but taar's recv/send read the active conn from their own global, so any handle
+  works. `now_fn = 0` keeps the agnos default (`_tn_now_unix` → `sys_time_unix`#46)
+  for cert-window validation — **fail-closed cert + hostname verification is
+  unchanged on agnos**.
+
+### Notes
+- Zero new cyrius/kernel surface: `tls_native_set_transport` (cyrius v6.2.4) and
+  `sys_time_unix`#46 (v6.2.3) are both ≤ the pinned 6.2.6. Linux is untouched
+  (the `#ifdef` is agnos-only; the default raw-fd path still serves Linux).
+
+### Verified
+- **Linux**: HTTPS regression unchanged (example.com fetched; `expired.badssl.com`
+  fail-closed). 52 unit assertions green.
+- **AGNOS**: compiles clean — `tls_native_set_transport` + `&taar_tcp_recv` /
+  `&taar_tcp_send` resolve. End-to-end `https://` is correct-by-construction
+  (transport vtable + matching read/write signatures + agnos cert clock); iron
+  validation on archaemenid is 0.6.2.
+
+## [0.6.0] — 2026-06-18 — HTTP on AGNOS (sovereign backend)
+
+whirl's plain-HTTP path now runs over the **AGNOS kernel's own network stack** —
+no POSIX `socket()`, no Linux syscall numbers anywhere in the agnos build. The
+transport rides **taar 0.3.0**'s sovereign backend; the rest of whirl's I/O was
+made target-agnostic so the whole tool compiles + behaves correctly on agnos.
+
+### Added
+- **`[deps.taar]` → 0.3.0** — taar's AGNOS backend (TCP over `sock_connect`#47 /
+  `sock_send`#48 / `sock_recv`#49 / `sock_close`#50; DNS over `udp_*`#51-54;
+  entropy via `getrandom`#45). `transport_fetch` needed **zero** changes — the
+  `taar_tcp_*` / `taar_resolve_ipv4` API is identical across Linux and agnos.
+- **AGNOS build target** — `CYRIUS_TARGET_AGNOS=1 cyrius build src/main.cyr`
+  emits an agnos ring-3 binary (1.10 MB). The full stack (HTTP framing, links,
+  robots, tls) compiles for agnos.
+
+### Changed (portable I/O — correctness on agnos)
+- `_puts` / `_eputs` / `_eput_int` now use the **`sys_write`** wrapper (raw
+  `syscall(1,…)` is Linux-only; agnos's syscall ABI differs — `1` isn't `write`).
+- `_sleep_ms` → chrono **`sleep_ms`** (was raw `nanosleep`#35).
+- `-d @file` → portable **`file_read_all`** (io); `-d @-` stdin + `--retry` read
+  via the **`sys_read`** wrapper.
+- `_mkdir` and `output_file_size` carry a minimal `#ifdef CYRIUS_TARGET_AGNOS`
+  branch (the `sys_mkdir` / `sys_stat` signatures differ; agnos size via
+  `sys_stat` STAT_SIZE). `-C` append: Linux true `O_APPEND`; agnos read-modify-
+  write (no `O_APPEND`/flock in the frozen FS surface; ≤1 MB resume cap there).
+
+### Verified
+- **Linux**: build + **52** unit assertions + live regression (HTTP, HTTPS w/
+  cert verify, `-C` resume → reassembled, `-d @file`, `--retry`) — no behavior
+  change from the portable-I/O refactor.
+- **AGNOS**: compiles clean (no undefined-function warnings; `sys_sock_*` /
+  `sys_udp_*` / `sys_getrandom` / `sys_stat` / `sys_mkdir` resolve). Iron
+  validation on archaemenid (`whirl http://… ` over the sovereign stack) is the
+  0.6.x roadmap step.
+
+### Still ahead
+- **0.6.1**: HTTPS on agnos — the taar TCP "fd" is a sentinel there, so
+  tls_native's default raw-fd read/write won't route; wire
+  `tls_native_set_transport(read, write, now)` → `taar_tcp_recv`/`send`.
+- Iron burn + curl parity benchmark (latency / RSS / binary size).
+
 ## [0.5.3] — 2026-06-18 — polish (curl/wget flag round-out)
 
 ### Added

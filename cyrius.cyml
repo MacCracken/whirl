@@ -21,11 +21,11 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # Network-probe substrate — whirl is the third consumer (after yo + dig). taar's
 # socket (taar_tcp_*) + dns (taar_resolve_ipv4) modules back whirl's transport.
 # `path` drives local dev; `git`+`tag` is the published fallback. The socket+dns
-# modules ship at taar 0.2.0 (the cut that adds them — see whirl roadmap).
+# socket+dns ship at 0.2.0; the AGNOS sovereign backend lands at taar 0.3.0.
 [deps.taar]
 git = "https://github.com/MacCracken/taar.git"
 path = "../taar"
-tag = "0.2.0"
+tag = "0.3.0"
 modules = ["dist/taar.cyr"]
 
 # --- HTTPS deps land with the TLS bite ---

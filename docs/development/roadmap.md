@@ -50,7 +50,14 @@ platform split: taar's `socket` + `dns` modules (driven by this work) abstract i
 - [x] `-A`/`--user-agent` (UA override), `-i` (include response headers), `-I` (HEAD), `-f` (fail on HTTP ≥ 400 → exit 22), `-d @file`/`-d @-` + `--data-binary` (file/stdin body).
 - [x] robots.txt `Allow:` precedence — RFC 9309 longest-match (tie → Allow). Proven live on en.wikipedia.org (`/w/load.php?` allowed vs `/w/` disallowed).
 
-### 0.6.x — iron validation + parity
+### 0.6.0 — HTTP on AGNOS ✅ (2026-06-18)
+- [x] `[deps.taar]` → **0.3.0** (sovereign `sock_*`#47-50 / `udp_*`#51-54 / `getrandom`#45 backend). `transport_fetch` rides it unchanged.
+- [x] Portable I/O: `sys_write`/`sys_read`/chrono `sleep_ms`/`file_read_all`; `#ifdef` only for `sys_mkdir`/`sys_stat`/agnos `-C` append. The whole tool compiles + behaves on **both** Linux and `CYRIUS_TARGET_AGNOS=1`.
+
+### 0.6.1 — HTTPS on AGNOS ✅ (2026-06-18)
+- [x] `tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0)` in `transport_fetch_tls` under `#ifdef CYRIUS_TARGET_AGNOS` — taar's recv/send become tls_native's transport vtable (v6.2.4 hook); `now_fn=0` keeps the agnos `sys_time_unix`#46 cert clock. Fail-closed cert+hostname verify unchanged. Compiles clean both targets; Linux HTTPS untouched.
+
+### 0.6.2 — iron validation + parity
 - [ ] First AGNOS run on archaemenid: `whirl https://example.com` over the sovereign backend. Parity benchmark vs `curl` (latency / RSS / binary size).
 
 ## v1.0 criteria

@@ -42,14 +42,15 @@ fn _cli_atoi(s): i64 {
     return v;
 }
 
-# Read all of fd into a fresh buffer (≤256 KB). Returns buf, sets _cli_bodylen.
+# Read all of stdin (fd) into a fresh buffer (≤256 KB). Returns buf, sets
+# _cli_bodylen. `sys_read` is the portable wrapper (correct on Linux + agnos).
 fn _cli_read_fd(fd): i64 {
     var cap = 262144;
     var buf = alloc(cap);
     var total = 0;
     var go = 1;
     while (go == 1) {
-        var n = syscall(0, fd, buf + total, cap - total);   # read
+        var n = sys_read(fd, buf + total, cap - total);
         if (n <= 0) { go = 0; }
         else {
             total = total + n;
@@ -61,15 +62,16 @@ fn _cli_read_fd(fd): i64 {
 }
 
 # Resolve a -d value: "@file" reads the file, "@-" reads stdin, else literal.
-# Returns the body cstr/buffer and sets _cli_bodylen.
+# Returns the body cstr/buffer and sets _cli_bodylen. `file_read_all` (io) is
+# portable open+read+close across Linux / agnos.
 fn _cli_load_data(arg): i64 {
     if (load8(arg) == 64) {   # '@'
         var src = arg + 1;
         if ((load8(src) == 45) && (load8(src + 1) == 0)) { return _cli_read_fd(0); }   # @-
-        var fd = syscall(2, src, 0, 0);   # open(src, O_RDONLY)
-        if (fd < 0) { _cli_bodylen = 0; return 0; }
-        var buf = _cli_read_fd(fd);
-        syscall(3, fd);                   # close
+        var buf = alloc(262144);
+        var n = file_read_all(src, buf, 262144);
+        if (n < 0) { _cli_bodylen = 0; return 0; }
+        _cli_bodylen = n;
         return buf;
     }
     _cli_bodylen = strlen(arg);
