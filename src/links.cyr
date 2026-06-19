@@ -1,0 +1,87 @@
+# whirl — minimal HTML link extraction for `-r` (recursive fetch).
+#
+# A pragmatic attribute scan, NOT a full HTML parser: it collects the values of
+# `href=` and `src=` attributes into a caller-supplied array of fresh cstrs.
+# Over-matching is harmless — a bogus "link" just fails to resolve/fetch and is
+# skipped. The attribute must start on a non-alpha boundary so `mysrc=`/`xhref=`
+# don't false-match.
+#
+# Stdlib auto-included via cyrius.cyml.
+
+fn _links_ci_at(html, i, len, lit): i64 {
+    var k = 0;
+    while (load8(lit + k) != 0) {
+        if (i + k >= len) { return 0; }
+        var c = load8(html + i + k);
+        if ((c >= 65) && (c <= 90)) { c = c + 32; }   # lowercase
+        if (c != load8(lit + k)) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _links_is_alpha(c): i64 {
+    if ((c >= 65) && (c <= 90)) { return 1; }
+    if ((c >= 97) && (c <= 122)) { return 1; }
+    return 0;
+}
+
+# Extract href/src URL values from html[0..len) into `out` (array of cstr ptrs,
+# capacity `outmax`). Returns the count.
+fn links_extract(html, len, out, outmax): i64 {
+    var count = 0;
+    var i = 0;
+    while (i < len) {
+        var boundary = 0;
+        if (i == 0) { boundary = 1; }
+        elif (_links_is_alpha(load8(html + i - 1)) == 0) { boundary = 1; }
+
+        var alen = 0;
+        if (boundary == 1) {
+            if (_links_ci_at(html, i, len, "href") == 1) { alen = 4; }
+            elif (_links_ci_at(html, i, len, "src") == 1) { alen = 3; }
+        }
+
+        if (alen > 0) {
+            var j = i + alen;
+            while ((j < len) && (load8(html + j) == 32)) { j = j + 1; }
+            if ((j < len) && (load8(html + j) == 61)) {   # '='
+                j = j + 1;
+                while ((j < len) && (load8(html + j) == 32)) { j = j + 1; }
+                var q = 0;
+                if (j < len) {
+                    var c0 = load8(html + j);
+                    if ((c0 == 34) || (c0 == 39)) { q = c0; j = j + 1; }   # " or '
+                }
+                var s = j;
+                var go = 1;
+                while ((j < len) && (go == 1)) {
+                    var c = load8(html + j);
+                    if (q != 0) {
+                        if (c == q) { go = 0; } else { j = j + 1; }
+                    } else {
+                        if ((c == 32) || (c == 62) || (c == 9) || (c == 10) || (c == 13)) { go = 0; }
+                        else { j = j + 1; }
+                    }
+                }
+                var slen = j - s;
+                if (slen > 0) {
+                    if (count < outmax) {
+                        var d = alloc(slen + 1);
+                        var m = 0;
+                        while (m < slen) { store8(d + m, load8(html + s + m)); m = m + 1; }
+                        store8(d + slen, 0);
+                        store64(out + count * 8, d);
+                        count = count + 1;
+                    }
+                }
+                i = j + 1;
+            } else {
+                i = i + alen;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    return count;
+}

@@ -6,6 +6,7 @@
 
 include "src/url.cyr"
 include "src/http.cyr"
+include "src/links.cyr"
 
 # === URL ===
 
@@ -126,8 +127,20 @@ fn test_http_custom_headers() {
     assert_eq(_http_match_ci(buf, ctv, n, "application/json"), 1, "caller Content-Type wins over default");
 }
 
+fn test_links() {
+    test_group("links");
+    var html = "<a href=\"/a.html\">x</a> <img src='img/p.png'> <a href=http://x.org/y>z</a> mysrc=skipme";
+    var out = alloc(16 * 8);
+    var n = links_extract(html, strlen(html), out, 16);
+    assert_eq(n, 3, "3 links (mysrc= skipped at word boundary)");
+    assert_eq(streq(load64(out + 0), "/a.html"), 1, "href double-quoted");
+    assert_eq(streq(load64(out + 8), "img/p.png"), 1, "src single-quoted");
+    assert_eq(streq(load64(out + 16), "http://x.org/y"), 1, "href unquoted");
+}
+
 fn main() {
     alloc_init();
+    test_links();
     test_url_basic();
     test_url_https_port_path();
     test_url_https_default_port();

@@ -40,10 +40,10 @@ platform split: taar's `socket` + `dns` modules (driven by this work) abstract i
 - [x] `-d DATA` (POST, `Content-Type` default `application/x-www-form-urlencoded` + `Content-Length`), `-X METHOD` (arbitrary), `-H 'Header: val'` (repeatable; caller `Content-Type` overrides). Live-validated over HTTPS (postman-echo). Redirects follow as GET (body dropped).
 - [ ] *Later:* `--data-binary` (raw, no form default), stdin body (`-d @-`).
 
-### 0.5.0 — wget side, part 1 ✅ (2026-06-18)
-- [x] `-O` (filename derived from the URL path; `url_filename`), `--retry N` (linear backoff on transient failures). Live-validated.
-- [ ] *Next bite:* `-r` recursive fetch (HTML link extraction, same-host bound, depth limit) — its own focused bite.
-- [ ] *Later:* resume (`-C`), `--data-binary`/stdin body.
+### 0.5.0 — the wget side ✅ (2026-06-18)
+- [x] `-O` (filename derived from the URL path; `url_filename`), `--retry N` (linear backoff).
+- [x] `-r` recursive fetch (`-l N` depth) — `src/links.cyr` href/src extraction + same-host crawl (resolve absolute/root-relative/relative, dedup, 64-fetch cap, flat-file save). Live-validated on info.cern.ch (multi-resource, cross-host filtered).
+- [ ] *Later:* directory-tree mirroring + `../` normalization + robots.txt; resume (`-C`); `--data-binary`/stdin body.
 
 ### 0.6.x — iron validation + parity
 - [ ] First AGNOS run on archaemenid: `whirl https://example.com` over the sovereign backend. Parity benchmark vs `curl` (latency / RSS / binary size).

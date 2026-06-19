@@ -5,6 +5,7 @@
 include "lib/taar.cyr"
 include "src/url.cyr"
 include "src/http.cyr"
+include "src/links.cyr"
 include "src/cli.cyr"
 include "src/transport.cyr"
 include "src/output.cyr"
@@ -44,6 +45,8 @@ fn _print_help(): i64 {
     _puts("  -o FILE     write the response body to FILE (default: stdout)\n");
     _puts("  -O          write to a filename derived from the URL\n");
     _puts("  -L          follow redirects (3xx Location)\n");
+    _puts("  -r          recursive fetch (same-host links, saved to files)\n");
+    _puts("  -l N        recursion depth for -r (default 1)\n");
     _puts("  --retry N   retry transient failures N times (linear backoff)\n");
     _puts("  -h          this help\n");
     return 0;
@@ -80,6 +83,172 @@ fn _emit_body(rbuf, total, outfile): i64 {
     return 0;
 }
 
+# --- recursive fetch (-r) ---
+
+fn _starts(s, pfx): i64 {
+    var i = 0;
+    while (load8(pfx + i) != 0) {
+        if (load8(s + i) != load8(pfx + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ':' before any '/' → a non-http scheme (mailto:, javascript:, tel:, data:).
+fn _has_scheme_colon(s): i64 {
+    var i = 0;
+    while (load8(s + i) != 0) {
+        var c = load8(s + i);
+        if (c == 58) { return 1; }
+        if (c == 47) { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _concat2(a, b): i64 {
+    var la = strlen(a);
+    var lb = strlen(b);
+    var d = alloc(la + lb + 1);
+    var i = 0;
+    while (i < la) { store8(d + i, load8(a + i)); i = i + 1; }
+    var j = 0;
+    while (j < lb) { store8(d + la + j, load8(b + j)); j = j + 1; }
+    store8(d + la + lb, 0);
+    return d;
+}
+
+# Directory part of a path including the trailing slash ("/a/b.html" -> "/a/").
+fn _path_dir(path): i64 {
+    var n = strlen(path);
+    var lastslash = 0;
+    var i = 0;
+    while (i < n) { if (load8(path + i) == 47) { lastslash = i; } i = i + 1; }
+    var d = alloc(lastslash + 2);
+    var k = 0;
+    while (k <= lastslash) { store8(d + k, load8(path + k)); k = k + 1; }
+    store8(d + lastslash + 1, 0);
+    return d;
+}
+
+# Resolve a raw link against the base → full URL cstr, or 0 to skip (fragment /
+# non-http scheme). Absolute links pass through (host filtered in _crawl).
+fn _resolve_link(link, base_https, base_host, base_path): i64 {
+    var c0 = load8(link);
+    if (c0 == 0) { return 0; }
+    if (c0 == 35) { return 0; }                      # '#'
+    if (_starts(link, "http://") == 1) { return link; }
+    if (_starts(link, "https://") == 1) { return link; }
+    if (_has_scheme_colon(link) == 1) { return 0; }  # mailto:/javascript:/...
+    var pfx = "http://";
+    if (base_https == 1) { pfx = "https://"; }
+    if (c0 == 47) { return _concat2(_concat2(pfx, base_host), link); }   # root-relative
+    var dir = _path_dir(base_path);                                      # relative
+    return _concat2(_concat2(pfx, base_host), _concat2(dir, link));
+}
+
+# Flat save-name from a path: strip leading '/', '/'→'_', strip '?query';
+# root / trailing-slash → "index.html".
+fn _crawl_savename(path): i64 {
+    var n = strlen(path);
+    var end = 0;
+    while ((end < n) && (load8(path + end) != 63)) { end = end + 1; }
+    var d = alloc(end + 12);
+    var w = 0;
+    var i = 0;
+    if ((end > 0) && (load8(path) == 47)) { i = 1; }
+    while (i < end) {
+        var c = load8(path + i);
+        if (c == 47) { c = 95; }
+        store8(d + w, c);
+        w = w + 1;
+        i = i + 1;
+    }
+    if (w == 0) { return _concat2("index.html", ""); }
+    if (load8(d + w - 1) == 95) {
+        var idx = "index.html";
+        var m = 0;
+        while (load8(idx + m) != 0) { store8(d + w, load8(idx + m)); w = w + 1; m = m + 1; }
+    }
+    store8(d + w, 0);
+    return d;
+}
+
+fn _seen(visited, nvis, url): i64 {
+    var i = 0;
+    while (i < nvis) {
+        if (streq(load64(visited + i * 8), url) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+var _CRAWL_MAX = 64;
+
+# Recursive same-host fetch from `start_url`, saving each resource to a flat file.
+# BFS, depth-bounded, visited-deduped, capped at _CRAWL_MAX fetches.
+fn _crawl(start_url, base_host, maxdepth): i64 {
+    var queue   = alloc(_CRAWL_MAX * 8);
+    var qdepth  = alloc(_CRAWL_MAX * 8);
+    var visited = alloc(_CRAWL_MAX * 8);
+    var nvis = 0;
+    var qhead = 0;
+    var qtail = 0;
+    var rbuf = alloc(WHIRL_RBUF_SZ);
+
+    store64(queue + 0, start_url);
+    store64(qdepth + 0, 0);
+    qtail = 1;
+
+    while (qhead < qtail) {
+        var url = load64(queue + qhead * 8);
+        var depth = load64(qdepth + qhead * 8);
+        qhead = qhead + 1;
+
+        if (_seen(visited, nvis, url) == 1) { continue; }
+        store64(visited + nvis * 8, url);
+        nvis = nvis + 1;
+
+        var u = url_new();
+        if (url_parse(url, u) != URL_PARSE_OK) { continue; }
+        var uh = url_host(u);
+        if (streq(uh, base_host) == 0) { continue; }   # same-host bound
+
+        var req = alloc(2048);
+        var reqlen = http_build_get(uh, url_path(u), req, 2048);
+        var total = 0;
+        if (url_is_https(u) == 1) { total = transport_fetch_tls(uh, url_port(u), req, reqlen, rbuf, WHIRL_RBUF_SZ); }
+        else { total = transport_fetch(uh, url_port(u), req, reqlen, rbuf, WHIRL_RBUF_SZ); }
+        if (total < 0) { _eputs("whirl: fetch failed: "); _eputs(url); _eputs("\n"); continue; }
+
+        var bo = http_body_offset(rbuf, total);
+        if (bo < 0) { continue; }
+        var name = _crawl_savename(url_path(u));
+        output_write(rbuf + bo, total - bo, name);
+        _eputs("whirl: saved "); _eputs(name); _eputs("\n");
+
+        if (depth < maxdepth) {
+            var links = alloc(64 * 8);
+            var nl = links_extract(rbuf + bo, total - bo, links, 64);
+            var k = 0;
+            while (k < nl) {
+                var resolved = _resolve_link(load64(links + k * 8), url_is_https(u), base_host, url_path(u));
+                if (resolved != 0) {
+                    if (qtail < _CRAWL_MAX) {
+                        if (_seen(visited, nvis, resolved) == 0) {
+                            store64(queue + qtail * 8, resolved);
+                            store64(qdepth + qtail * 8, depth + 1);
+                            qtail = qtail + 1;
+                        }
+                    }
+                }
+                k = k + 1;
+            }
+        }
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     args_init();
@@ -105,6 +274,10 @@ fn main() {
     # -o FILE wins; else -O derives the name from the URL path.
     var outfile = cli_outfile();
     if ((outfile == 0) && (cli_remote() == 1)) { outfile = url_filename(path); }
+
+    if (cli_recursive() == 1) {
+        return _crawl(cli_url(), host, cli_depth());
+    }
 
     var ret = 0;
     var redirect = 1;

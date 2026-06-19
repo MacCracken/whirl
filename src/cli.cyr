@@ -15,8 +15,10 @@ var _cli_bodylen = 0;
 var _cli_hdrs    = 0;   # array of cstr ptrs (alloc'd)
 var _cli_nhdrs   = 0;
 
-var _cli_remote  = 0;   # -O: save body to a filename derived from the URL
-var _cli_retries = 0;   # --retry N: retry transient failures
+var _cli_remote    = 0;   # -O: save body to a filename derived from the URL
+var _cli_retries   = 0;   # --retry N: retry transient failures
+var _cli_recursive = 0;   # -r: recursive same-host fetch
+var _cli_depth     = 1;   # -l N: recursion depth (default 1)
 
 var CLI_OK   = 0;
 var CLI_HELP = 1;
@@ -48,6 +50,8 @@ fn cli_parse(ac, av): i64 {
     _cli_nhdrs = 0;
     _cli_remote = 0;
     _cli_retries = 0;
+    _cli_recursive = 0;
+    _cli_depth = 1;
 
     var i = 1;
     while (i < ac) {
@@ -89,6 +93,13 @@ fn cli_parse(ac, av): i64 {
             _cli_retries = _cli_atoi(load64(av + i * 8));
             i = i + 1;
         }
+        elif (streq(arg, "-r") == 1) { _cli_recursive = 1; i = i + 1; }
+        elif (streq(arg, "-l") == 1) {
+            i = i + 1;
+            if (i >= ac) { return CLI_ERR; }
+            _cli_depth = _cli_atoi(load64(av + i * 8));
+            i = i + 1;
+        }
         else {
             if (_cli_url == 0) { _cli_url = arg; i = i + 1; }
             else { return CLI_ERR; }   # a second positional
@@ -105,8 +116,10 @@ fn cli_body(): i64    { return _cli_body; }
 fn cli_bodylen(): i64 { return _cli_bodylen; }
 fn cli_hdrs(): i64    { return _cli_hdrs; }
 fn cli_nhdrs(): i64   { return _cli_nhdrs; }
-fn cli_remote(): i64  { return _cli_remote; }
-fn cli_retries(): i64 { return _cli_retries; }
+fn cli_remote(): i64    { return _cli_remote; }
+fn cli_retries(): i64   { return _cli_retries; }
+fn cli_recursive(): i64 { return _cli_recursive; }
+fn cli_depth(): i64     { return _cli_depth; }
 
 # Effective method: explicit -X, else POST when a body was given, else GET.
 fn cli_method(): i64 {

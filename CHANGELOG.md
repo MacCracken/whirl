@@ -5,11 +5,18 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
-### Added — wget side (part 1)
-- **`-O`** — save the body to a filename derived from the URL path (last segment; `index.html` for `/` or a trailing slash). New `url_filename(path)` helper.
+## [0.5.0] — 2026-06-18 — wget side (-O / --retry / -r)
+
+### Added
+- **`-O`** — save the body to a filename derived from the URL path (last segment; `index.html` for `/` or a trailing slash). New `url_filename(path)`.
 - **`--retry N`** — retry transient connection failures N times with linear backoff (`200·attempt` ms).
-- **42** unit assertions (5 new for `url_filename`). Live: `-O https://example.com` → `index.html`; `--retry 2` on a bad host retries then fails cleanly.
-- *(Next: `-r` recursive fetch — link extraction + same-host crawl, its own bite.)*
+- **`-r` recursive fetch** (`-l N` depth, default 1) — `src/links.cyr` extracts `href`/`src` values; the crawl resolves them (absolute / root-relative / relative), **bounds to the same host**, dedups visited, caps at 64 fetches, and saves each resource to a flat file (`/a/b.html` → `a_b.html`). Cross-host / `#`-fragment / `mailto:` links are skipped.
+- **46** unit assertions (links extraction + `url_filename`). Live-validated: `-O https://example.com` → `index.html`; `--retry 2` on a bad host retries then fails; `-r http://info.cern.ch` saved `index.html` + `hypertext_WWW_TheProject.html` (same-host relative link followed, cross-host filtered).
+
+### Still ahead
+- `-r` niceties: directory-tree mirroring (vs flat names), `robots.txt`, `../` path normalization.
+- resume (`-C`), `--data-binary` / stdin body.
+- AGNOS socket backend (taar `#ifdef` + tls_native `set_transport`).
 
 ## [0.4.0] — 2026-06-18 — methods + bodies
 
