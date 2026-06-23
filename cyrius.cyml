@@ -25,7 +25,7 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 [deps.taar]
 git = "https://github.com/MacCracken/taar.git"
 path = "../taar"
-tag = "0.3.0"
+tag = "0.3.1"
 modules = ["dist/taar.cyr"]
 
 # --- HTTPS deps land with the TLS bite ---

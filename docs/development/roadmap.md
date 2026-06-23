@@ -57,8 +57,10 @@ platform split: taar's `socket` + `dns` modules (driven by this work) abstract i
 ### 0.6.1 — HTTPS on AGNOS ✅ (2026-06-18)
 - [x] `tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0)` in `transport_fetch_tls` under `#ifdef CYRIUS_TARGET_AGNOS` — taar's recv/send become tls_native's transport vtable (v6.2.4 hook); `now_fn=0` keeps the agnos `sys_time_unix`#46 cert clock. Fail-closed cert+hostname verify unchanged. Compiles clean both targets; Linux HTTPS untouched.
 
-### 0.6.2 — iron validation + parity
-- [ ] First AGNOS run on archaemenid: `whirl https://example.com` over the sovereign backend. Parity benchmark vs `curl` (latency / RSS / binary size).
+### 0.6.2 — AGNOS validation (QEMU) ✅ + iron next
+- [x] **QEMU + KVM (virtio-net + SLIRP)**: whirl execs from disk + fetches real example.com over the sovereign stack — **HTTP and HTTPS both PASS** (`agnos/scripts/whirl-smoke.sh`). HTTPS cert-verified.
+- [x] Fixed HTTPS-on-agnos: `_agnos_ca_hook` loads the staged CA bundle with the correct agnos `sys_open` ABI (cyrius `tls_native_set_ca_system` uses the Linux ABI — issue filed). CA staging wired into `stage-tools.sh`.
+- [ ] **Iron** on archaemenid: same run over the r8169 NIC. Parity benchmark vs `curl` (latency / RSS / binary size).
 
 ## v1.0 criteria
 - [ ] GET + POST + arbitrary methods + custom headers; redirects; chunked; HTTPS with cert verification (`tls_native_client_verify_hostname`).

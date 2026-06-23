@@ -5,6 +5,39 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-06-23 (AGNOS QEMU validation + HTTPS CA fix + kernel-leased resolver)
+
+### Changed
+- **AGNOS DNS resolution prefers the kernel-leased on-subnet resolver** (via **taar
+  0.3.1**, dep bumped 0.3.0 → 0.3.1). `taar_resolve_ipv4` now consults the new agnos
+  `net_config(3)`#61 syscall (the DHCP option-6 resolver) before the off-subnet
+  `8.8.8.8` fallback. The off-subnet fallback needs working gateway routing the kernel
+  can't guarantee on real iron — it froze `whirl https://google.com` on archaemenid
+  (the binary exec'd and resolved into the void). The leased resolver is on-subnet +
+  directly reachable. Linux is unchanged. **Requires agnos ≥ 1.45.16.**
+
+### Validated on AGNOS (QEMU + KVM, virtio-net + SLIRP)
+- **whirl runs on agnos end-to-end** — booted a production kernel with the staged
+  rootfs (`/bin/whirl`) and fetched **real example.com pages over the sovereign
+  stack**: exec-from-disk (1.1 MB binary, ring 3) → taar DNS (`udp_*`#51-54) →
+  `sock_connect`#47 → HTTP framing → body. **HTTP and HTTPS both PASS.** Harness:
+  `agnos/scripts/whirl-smoke.sh`.
+
+### Fixed — HTTPS on AGNOS (the 0.6.1 path didn't actually work)
+- 0.6.1 claimed HTTPS-on-agnos "correct-by-construction"; QEMU testing proved it
+  failed: cyrius's `tls_native_set_ca_system` opens the CA bundle with the **Linux**
+  `sys_open(path, flags, mode)` ABI, but agnos `sys_open` is `(name, namelen, flags)`
+  → `namelen=0` → the trust store never loads → fail-closed handshake. (A verify-none
+  handshake completes fine on agnos, isolating the fault to trust-root loading — the
+  `set_transport`-over-taar path itself is correct.)
+- **`_agnos_ca_hook`** (`src/transport.cyr`, `#ifdef CYRIUS_TARGET_AGNOS`): loads the
+  staged `/etc/ssl/cert.pem` with the correct agnos ABI and installs it via
+  `tls_native_set_ca_bundle` through `tls_connect_with_ctx_hook` — fail-closed cert +
+  hostname verification now passes on agnos. Stopgap until the cyrius fix lands (filed
+  `cyrius/docs/development/issues/2026-06-18-tls-native-set-ca-system-agnos-sys-open-abi.md`).
+- Requires the CA bundle staged on the agnos-fs — wired into `agnos/scripts/stage-tools.sh`.
+- Linux unchanged (the `#ifndef` path still uses plain `tls_connect`; HTTPS regression green).
+
 ## [0.6.1] — 2026-06-18 — HTTPS on AGNOS (tls_native transport hook)
 
 Closes the `https://` path on agnos. On Linux, tls_native does raw `sys_read`/

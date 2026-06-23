@@ -42,10 +42,44 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
     return total;
 }
 
+#ifdef CYRIUS_TARGET_AGNOS
+# CA-trust hook for agnos. cyrius's `tls_native_set_ca_system` opens the bundle
+# with the Linux `sys_open(path, flags, mode)` ABI, but agnos `sys_open` is
+# `(name, namelen, flags)` — so it passes namelen=0 → empty path → the CA file
+# never opens → TLS_ERR_IO → fail-closed (no roots). Filed upstream as cyrius
+# issue 2026-06-18-tls-native-set-ca-system-agnos-sys-open-abi. Until that lands,
+# this hook (fired by tls_connect_with_ctx_hook AFTER the failed system load)
+# reads the staged /etc/ssl/cert.pem with the correct agnos ABI and installs it
+# via tls_native_set_ca_bundle — the roots the chain then verifies against.
+fn _agnos_ca_hook(hook_ctx, nctx): i64 {
+    var path = "/etc/ssl/cert.pem";
+    var nl = 0;
+    while (load8(path + nl) != 0) { nl = nl + 1; }
+    var fd = sys_open(path, nl, 0);
+    if (fd < 0) { return 0; }                  # no bundle staged → leave roots empty
+    var cap = 1048576;
+    var buf = alloc(cap);
+    var total = 0;
+    var go = 1;
+    while (go == 1) {
+        var n = sys_read(fd, buf + total, cap - total);
+        if (n <= 0) { go = 0; }
+        else {
+            total = total + n;
+            if (total >= cap) { go = 0; }
+        }
+    }
+    sys_close(fd);
+    if (total > 0) { tls_native_set_ca_bundle(nctx, buf, total, 0); }
+    return 0;
+}
+#endif
+
 # HTTPS variant: resolve + TCP connect over taar, then a TLS session via the
 # stdlib (tls_connect handshakes + verifies the cert chain + hostname fail-closed,
-# CVE-18). tls_native's default transport does raw read/write on taar's real
-# socket fd — no transport-callback wiring needed on the Linux backend.
+# CVE-18). On Linux tls_native's default transport does raw read/write on taar's
+# real socket fd; on agnos the fd is a sentinel so the transport + CA roots are
+# wired explicitly (set_transport + _agnos_ca_hook).
 fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
     var ip = taar_resolve_ipv4(host);
     if (ip < 0) { return TRANSPORT_ERR_RESOLVE; }
@@ -64,8 +98,14 @@ fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
     # now_fn = 0 keeps the agnos default (_tn_now_unix → sys_time_unix#46) for
     # cert-window validation. On Linux the real fd works with the default path.
     tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0);
+    # _agnos_ca_hook installs the trust roots: cyrius's tls_native_set_ca_system
+    # can't open the bundle on agnos (it uses the Linux sys_open ABI), so we load
+    # it here with the correct agnos ABI via the ctx hook (fires post-system-load).
+    var ctx = tls_connect_with_ctx_hook(fd, host, &_agnos_ca_hook, 0);
 #endif
+#ifndef CYRIUS_TARGET_AGNOS
     var ctx = tls_connect(fd, host);          # SNI + handshake + cert/hostname verify
+#endif
     if (ctx == 0) { taar_sock_close(fd); return TRANSPORT_ERR_TLS; }
 
     tls_write(ctx, req, reqlen);
