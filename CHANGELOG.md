@@ -5,6 +5,17 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-07-08 (validation re-cut — HTTPS confirmed under mirshi)
+
+### Validated
+- **HTTPS under mirshi confirmed working** — no whirl code change vs 0.6.3. The transient
+  HTTPS-under-mirshi segfault seen during 0.6.3 bring-up was root-caused to a NULL-deref in
+  the **stale pre-6.4.25 sigil** snapshot whirl's old vendored `lib/` carried (heap
+  crypto-scratch `mmap` returned 0, zeroed unchecked → SIGSEGV `faultaddr=0`). The 6.4.25
+  sigil (static crypto banks) already fixes it. Confirmed: whirl HTTPS fetches over **both**
+  mirshi (`--root <ca> --net-allow`) and the real agnos kernel. No mirshi patch / cyrius
+  issue required.
+
 ## [0.6.3] — 2026-07-08 (AGNOS build under cyrius 6.4.x — fdlopen → tls_native; toolchain 6.4.25)
 
 ### Changed
