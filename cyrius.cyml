@@ -16,7 +16,12 @@ output = "whirl"
 # below — sovereign raw-syscall, no stdlib net. HTTPS opts in to the crypto/TLS
 # libs (vendored via `cyrius lib sync`): tls_native is transport-agnostic, wired
 # over taar's socket. ct/keccak/random/bayan are sigil's crypto deps.
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags", "chrono", "ct", "keccak", "random", "bayan", "sigil", "tls_native", "tls"]
+# `dynlib`+`fdlopen` back the `tls` facade's libssl.so.3 bridge — cyrius 6.4.x
+# resolves tls.cyr's `fdlopen_*` refs from the explicit include list (no longer
+# auto-pulled), so the Linux build needs them named or it fails reachable-undef.
+# On --agnos they compile (Linux path is `#ifdef CYRIUS_TARGET_LINUX`-gated) and
+# stay unreachable (the agnos TLS path uses tls_native directly) → DCE'd.
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags", "chrono", "ct", "keccak", "random", "bayan", "sigil", "dynlib", "fdlopen", "tls_native", "tls"]
 
 # Network-probe substrate — whirl is the third consumer (after yo + dig). taar's
 # socket (taar_tcp_*) + dns (taar_resolve_ipv4) modules back whirl's transport.

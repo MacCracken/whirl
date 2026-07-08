@@ -11,6 +11,11 @@ All notable changes to whirl are documented here. Format follows
 - **Toolchain pin `6.2.6` → `6.4.25`** (latest cyrius). Clears the stale-pin drift; the
   build fix below is mandated by 6.4.x's stricter reachable-undef gate — 6.2.6 tolerated
   the unreachable `fdlopen_*` refs, 6.4.x refuses to emit a binary with them.
+- **stdlib list gains `dynlib` + `fdlopen`.** cyrius 6.4.x resolves the `tls` facade's
+  libssl.so.3-bridge `fdlopen_*` refs from the explicit include list (no longer
+  auto-pulled via tls's transitive requires), so the **Linux** build needs them named or
+  it fails reachable-undef. On `--agnos` they compile (Linux path is
+  `#ifdef CYRIUS_TARGET_LINUX`-gated) and stay unreachable (native TLS path) → DCE'd.
 
 ### Fixed — AGNOS build under cyrius 6.4.x (fdlopen reachable-undef)
 - **`cyrius build --agnos` no longer fails on `fdlopen_*` reachable-undef.** On the
