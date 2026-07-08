@@ -5,6 +5,36 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-07-08 (AGNOS build under cyrius 6.4.x — fdlopen → tls_native; toolchain 6.4.25)
+
+### Changed
+- **Toolchain pin `6.2.6` → `6.4.25`** (latest cyrius). Clears the stale-pin drift; the
+  build fix below is mandated by 6.4.x's stricter reachable-undef gate — 6.2.6 tolerated
+  the unreachable `fdlopen_*` refs, 6.4.x refuses to emit a binary with them.
+
+### Fixed — AGNOS build under cyrius 6.4.x (fdlopen reachable-undef)
+- **`cyrius build --agnos` no longer fails on `fdlopen_*` reachable-undef.** On the
+  6.4.x toolchain the `lib/tls.cyr` facade's `tls_connect*` verbs pull in
+  `tls_connect_alloc → _tls_init → fdlopen_init_full` — the libssl.so.3 dynamic-loader
+  bridge (fdlopen bootstraps ld.so to `dlopen` glibc). AGNOS binaries are STATIC (no
+  ld.so, no fdlopen), so those symbols were both unbuildable (`refusing to emit binary
+  with 4 reachable undefined function(s)`) and structurally unusable. The agnos HTTPS
+  path now calls the sovereign `tls_native_*` API directly (`_agnos_tls_native_connect`:
+  `tls_native_new_client` → CA roots via the agnos-ABI `_agnos_ca_hook` →
+  `tls_native_connect`, chain+hostname fail-closed), returning a native-backed shim so
+  the shared `tls_read/write/close` still drive it. fdlopen is now unreachable on
+  `--agnos` and DCE-eliminated; the Linux path is byte-identical (all changes are
+  `#ifdef CYRIUS_TARGET_AGNOS`-guarded). Rounds out the net-tools (yo + dig) in the
+  agnos-dev docker image.
+
+### Validated on AGNOS (QEMU + KVM real kernel, virtio-net + SLIRP)
+- **HTTP and HTTPS both PASS** with the rebuilt binary — `whirl https://example.com`
+  fetched the real Example Domain page (tls_native over taar, cert-verified) over the
+  sovereign stack. Also runs under mirshi (`--net-allow`): HTTP over the emulated net
+  band PASS. (HTTPS *under mirshi* segfaults inside cyrius `tls_native_connect` — a
+  mirshi net-band emulation gap, NOT a whirl issue; the identical binary does HTTPS
+  fine on the real kernel.)
+
 ## [0.6.2] — 2026-06-23 (AGNOS QEMU validation + HTTPS CA fix + kernel-leased resolver)
 
 ### Changed

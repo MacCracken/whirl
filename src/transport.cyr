@@ -48,9 +48,9 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
 # `(name, namelen, flags)` — so it passes namelen=0 → empty path → the CA file
 # never opens → TLS_ERR_IO → fail-closed (no roots). Filed upstream as cyrius
 # issue 2026-06-18-tls-native-set-ca-system-agnos-sys-open-abi. Until that lands,
-# this hook (fired by tls_connect_with_ctx_hook AFTER the failed system load)
-# reads the staged /etc/ssl/cert.pem with the correct agnos ABI and installs it
-# via tls_native_set_ca_bundle — the roots the chain then verifies against.
+# this hook (called by _agnos_tls_native_connect AFTER new_client) reads the
+# staged /etc/ssl/cert.pem with the correct agnos ABI and installs it via
+# tls_native_set_ca_bundle — the roots the chain then verifies against.
 fn _agnos_ca_hook(hook_ctx, nctx): i64 {
     var path = "/etc/ssl/cert.pem";
     var nl = 0;
@@ -72,6 +72,35 @@ fn _agnos_ca_hook(hook_ctx, nctx): i64 {
     sys_close(fd);
     if (total > 0) { tls_native_set_ca_bundle(nctx, buf, total, 0); }
     return 0;
+}
+
+# agnos TLS connect via the SOVEREIGN native stack (lib/tls_native.cyr), NOT the
+# lib/tls.cyr facade's tls_connect* verbs. Those verbs route through
+# tls_connect_alloc → _tls_init → fdlopen_init_full, i.e. the libssl.so.3
+# dynamic-loader bridge (fdlopen bootstraps ld.so to dlopen glibc). agnos
+# binaries are STATIC — no ld.so, no fdlopen — so that path is both unbuildable
+# (reachable-undef fdlopen_*) and structurally unusable. Wire the native client
+# directly instead: new_client (defaults to TLS_VERIFY_PEER) → CA roots via the
+# agnos-ABI hook → handshake over taar's socket (transport installed by caller).
+# Returns a facade-shaped native shim ctx [nctx@0, 0@8, sock@16, NATIVE@24] so the
+# shared tls_read/tls_write/tls_close below route to the native backend (they
+# dispatch on _tls_backend==1 and never touch fdlopen). 0 on any failure.
+fn _agnos_tls_native_connect(fd, host): i64 {
+    var hl = 0;
+    while (load8(host + hl) != 0) { hl = hl + 1; }
+    var nctx = tls_native_new_client(host, hl);   # TLS_VERIFY_PEER by default
+    if (nctx == 0) { return 0; }
+    # tls_native_set_ca_system opens the bundle with the Linux sys_open ABI (fails
+    # on agnos), so install the staged roots directly with the correct agnos ABI.
+    _agnos_ca_hook(0, nctx);
+    # CVE-18: tls_native_connect verifies chain + hostname fail-closed before TLS_OK.
+    if (tls_native_connect(nctx, fd) != TLS_OK) { tls_native_close(nctx); return 0; }
+    var ctx = alloc(40);
+    store64(ctx, nctx);
+    store64(ctx + 8, 0);
+    store64(ctx + 16, fd);
+    store64(ctx + 24, TLS_BACKEND_NATIVE);
+    return ctx;
 }
 #endif
 
@@ -98,10 +127,10 @@ fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
     # now_fn = 0 keeps the agnos default (_tn_now_unix → sys_time_unix#46) for
     # cert-window validation. On Linux the real fd works with the default path.
     tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0);
-    # _agnos_ca_hook installs the trust roots: cyrius's tls_native_set_ca_system
-    # can't open the bundle on agnos (it uses the Linux sys_open ABI), so we load
-    # it here with the correct agnos ABI via the ctx hook (fires post-system-load).
-    var ctx = tls_connect_with_ctx_hook(fd, host, &_agnos_ca_hook, 0);
+    # Sovereign native handshake — no libssl/fdlopen (agnos is static, no ld.so).
+    # _agnos_tls_native_connect wires new_client + agnos-ABI CA roots + connect and
+    # returns a native-backed shim the shared tls_* I/O below drives.
+    var ctx = _agnos_tls_native_connect(fd, host);
 #endif
 #ifndef CYRIUS_TARGET_AGNOS
     var ctx = tls_connect(fd, host);          # SNI + handshake + cert/hostname verify
