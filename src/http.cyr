@@ -235,6 +235,68 @@ fn http_content_length(resp, len): i64 {
     return n;
 }
 
+# Walk the chunk-size headers of `body` without copying. Returns 1 once the
+# terminating zero-size chunk is reached, 0 if the stream runs out first.
+# Mirrors http_dechunk's parse exactly — same hex scan, same skip-to-LF — so the
+# two cannot disagree about where a chunked body ends.
+fn _http_chunked_terminated(body, blen): i64 {
+    var i = 0;
+    while (i < blen) {
+        var sz = 0;
+        var got = 0;
+        while (i < blen) {
+            var h = _http_hexval(load8(body + i));
+            if (h < 0) { break; }
+            sz = sz * 16 + h;
+            got = 1;
+            i = i + 1;
+        }
+        if (got == 0) { return 0; }
+        while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
+        i = i + 1;
+        if (sz == 0) { return 1; }          # terminating chunk — body is complete
+        i = i + sz;
+        while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Set for a HEAD request, whose response carries a Content-Length describing a
+# body that will never arrive. Without it the completeness test below waits for
+# an end-of-body that cannot come.
+var _http_no_body = 0;
+fn http_set_no_body(v): i64 { _http_no_body = v; return 0; }
+
+# Is `len` bytes at `resp` a COMPLETE HTTP response, judged by its own framing?
+#
+# This is the authority on "the response has arrived" — not the socket. A
+# chunked body ends at its terminating chunk and a Content-Length body ends at
+# its length; in neither case does the transport need to see the peer close.
+# Only a close-delimited body (no Content-Length, no chunking) genuinely ends at
+# EOF, and that case returns 0 here so the caller keeps reading.
+#
+# whirl used to read every response to EOF regardless. On Linux that is
+# invisible — read(2) returns 0 the moment the peer closes. On AGNOS the peer
+# close is not surfaced promptly, so a complete chunked response then burned
+# taar's full 10 s receive deadline and came back as _TAAR_ERR_TIMEOUT, which
+# 0.6.6's truncation check correctly reported as an incomplete response. The
+# response was never incomplete; whirl was asking the wrong question.
+fn http_response_complete(resp, len): i64 {
+    var bo = http_body_offset(resp, len);
+    if (bo < 0) { return 0; }               # headers not finished yet
+    if (_http_no_body == 1) { return 1; }   # HEAD: headers are the whole response
+    if (http_is_chunked(resp, len) == 1) {
+        return _http_chunked_terminated(resp + bo, len - bo);
+    }
+    var cl = http_content_length(resp, len);
+    if (cl >= 0) {
+        if ((len - bo) >= cl) { return 1; }
+        return 0;
+    }
+    return 0;                               # close-delimited — only EOF ends it
+}
+
 # 1 if Transfer-Encoding contains "chunked", else 0.
 fn http_is_chunked(resp, len): i64 {
     var v = http_header_value(resp, len, "transfer-encoding");

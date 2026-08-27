@@ -190,21 +190,16 @@ fn _response_truncated(rbuf, total): i64 {
     var st = http_status_code(rbuf, total);
     if (st == 204) { return 0; }                # No Content
     if (st == 304) { return 0; }                # Not Modified — no body
-    if (http_is_chunked(rbuf, total) == 1) {
-        # A cut-short chunked stream fails in http_dechunk already; only an
-        # error/cap stop is invisible there.
-        if (transport_incomplete() == 1) { return 1; }
-        return 0;
-    }
+    # The response's own framing is the authority. Asking the SOCKET instead
+    # was the 0.6.6 defect: a complete chunked body whose peer close arrived
+    # late (or not at all, on agnos) was reported as truncated.
+    if (http_response_complete(rbuf, total) == 1) { return 0; }
     var bo = http_body_offset(rbuf, total);
     if (bo < 0) { return 0; }
-    var cl = http_content_length(rbuf, total);
-    if (cl >= 0) {
-        if ((total - bo) < cl) { return 1; }    # short of the promised length
-        return 0;
-    }
-    # No Content-Length and no chunking: the body is close-delimited, so only a
-    # non-clean end (error or a full rbuf) tells us anything is missing.
+    if (http_is_chunked(rbuf, total) == 1) { return 1; }        # chunk stream never terminated
+    if (http_content_length(rbuf, total) >= 0) { return 1; }    # short of the promised length
+    # Close-delimited: no framing to be complete BY, so a clean peer close is
+    # the only evidence the body finished.
     if (transport_incomplete() == 1) { return 1; }
     return 0;
 }
@@ -469,6 +464,7 @@ fn main() {
     }
 
     if (cli_useragent() != 0) { http_set_user_agent(cli_useragent()); }   # -A override
+    if (cli_head() == 1) { http_set_no_body(1); }   # -I: headers are the whole response
 
     var u = url_new();
     if (url_parse(cli_url(), u) != URL_PARSE_OK) {

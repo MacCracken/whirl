@@ -303,6 +303,38 @@ fn test_links_found() {
     assert_eq(links_found(), 0, "found count reset per call");
 }
 
+# === response completeness (0.6.9) ===
+
+# The framing, not the socket, decides whether a response has fully arrived.
+fn test_response_complete() {
+    test_group("response-complete");
+    var clr = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    assert_eq(http_response_complete(clr, strlen(clr)), 1, "content-length satisfied");
+    var short = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello";
+    assert_eq(http_response_complete(short, strlen(short)), 0, "content-length short");
+    var hdrs = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n";
+    assert_eq(http_response_complete(hdrs, strlen(hdrs)), 0, "headers unterminated");
+
+    # A terminated chunk stream is complete even though the peer has not closed.
+    var ch = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n";
+    assert_eq(http_response_complete(ch, strlen(ch)), 1, "chunked terminated");
+    var chp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n";
+    assert_eq(http_response_complete(chp, strlen(chp)), 0, "chunked not terminated");
+    var chm = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHEL";
+    assert_eq(http_response_complete(chm, strlen(chm)), 0, "chunked mid-chunk");
+
+    # Close-delimited: no framing to be complete by, so never complete here.
+    var cd = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nbody";
+    assert_eq(http_response_complete(cd, strlen(cd)), 0, "close-delimited needs EOF");
+
+    # HEAD: the headers ARE the whole response, despite a Content-Length.
+    http_set_no_body(1);
+    var hd = "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n";
+    assert_eq(http_response_complete(hd, strlen(hd)), 1, "HEAD complete at headers");
+    http_set_no_body(0);
+    assert_eq(http_response_complete(hd, strlen(hd)), 0, "same bytes incomplete for GET");
+}
+
 fn main() {
     alloc_init();
     test_links();
@@ -327,6 +359,7 @@ fn main() {
     test_resolve_link_port();
     test_util_helpers();
     test_links_found();
+    test_response_complete();
     return assert_summary();
 }
 

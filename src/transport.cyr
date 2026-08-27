@@ -70,7 +70,14 @@ fn _transport_read_all(mode, handle, rbuf, rbufmax): i64 {
             else { n = taar_tcp_recv(handle, rbuf + total, rbufmax - total); }
             if (n == 0) { go = 0; }                                    # clean close / close_notify
             elif (n < 0) { _transport_incomplete = 1; go = 0; }        # timeout / reset / TLS error
-            else { total = total + n; }
+            else {
+                total = total + n;
+                # Stop as soon as the response's own framing says it is whole.
+                # Reading on for a peer close we do not need cost a full receive
+                # deadline per fetch on AGNOS (where the close is not surfaced
+                # promptly) and one wasted syscall per fetch on Linux.
+                if (http_response_complete(rbuf, total) == 1) { go = 0; }
+            }
         }
     }
     return total;

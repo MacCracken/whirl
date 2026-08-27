@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 # ---------------------------------------------------------------- infrastructure
 
@@ -604,6 +605,63 @@ def check_crawl_cap_reported(run, rep, new, old):
               next((l for l in err.splitlines() if "cap" in l), err.strip()[:80]))
 
 
+def check_complete_without_close(run, rep, new, old):
+    """0.6.9: a complete response must not wait on a peer close it does not need.
+
+    This is the AGNOS failure reproduced on Linux. There, a complete chunked body
+    whose peer close was not surfaced burned taar's 10s receive deadline and came
+    back as a timeout, which 0.6.6's truncation check reported as an incomplete
+    response. Holding the connection open after a complete body reproduces it
+    without QEMU: the framing says the response is whole, so whirl must return it.
+    """
+    print("\n[15] a complete response does not wait for the peer to close")
+
+    def hold(payload):
+        def h(conn, _req):
+            conn.sendall(payload)
+            time.sleep(20)      # never close — force whirl to decide on framing alone
+        return h
+
+    chunked = (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+               b"5\r\nHELLO\r\n5\r\nWORLD\r\n0\r\n\r\n")
+
+    if old:
+        p = newport()
+        serve(p, hold(chunked))
+        rc, out, _e, _d = run(old, ["http://127.0.0.1:%d/" % p], "hold_baseline", timeout=20)
+        rep.control("baseline stalls then reports a complete body incomplete",
+                    rc != 0 and out == "", (0, 6, 9), "rc=%d" % rc)
+
+    p = newport()
+    serve(p, hold(chunked))
+    rc, out, err, _d = run(new, ["http://127.0.0.1:%d/" % p], "hold_chunked", timeout=15)
+    rep.check("chunked body returned without a close", rc == 0 and out == "HELLOWORLD",
+              "rc=%d %r %s" % (rc, out[:30], err.strip()[:60]))
+
+    sized = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    p = newport()
+    serve(p, hold(sized))
+    rc, out, err, _d = run(new, ["http://127.0.0.1:%d/" % p], "hold_sized", timeout=15)
+    rep.check("content-length body returned without a close", rc == 0 and out == "hello",
+              "rc=%d %r %s" % (rc, out[:30], err.strip()[:60]))
+
+    p = newport()
+    serve(p, hold(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world"))
+    rc, out, _e, _d = run(new, ["-I", "http://127.0.0.1:%d/" % p], "hold_head", timeout=15)
+    rep.check("-I returns without a close", rc == 0 and "200 OK" in out, "rc=%d" % rc)
+
+    # The truncation check must still fire: an UNTERMINATED chunk stream that
+    # then closes is genuinely incomplete and must not be reported as success.
+    def cut(conn, _req):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n")
+        conn.close()
+    p = newport()
+    serve(p, cut)
+    rc, _o, err, _d = run(new, ["http://127.0.0.1:%d/" % p], "cut_chunked", timeout=15)
+    rep.check("unterminated chunk stream still fails", rc != 0,
+              "rc=%d %s" % (rc, err.strip()[:70]))
+
+
 def main():
     ap = argparse.ArgumentParser(description="whirl behavioral test suite")
     ap.add_argument("binary", help="the whirl binary under test")
@@ -656,6 +714,7 @@ def main():
         check_retry_on_empty(run, rep, binary, baseline)
         check_symlink_write(run, rep, binary, baseline)
         check_crawl_cap_reported(run, rep, binary, baseline)
+        check_complete_without_close(run, rep, binary, baseline)
     finally:
         for f in (marker, marker2):
             if os.path.exists(f):

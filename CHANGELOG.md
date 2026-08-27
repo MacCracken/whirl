@@ -5,6 +5,96 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.9] — 2026-08-27 (QEMU validation on AGNOS — and the defect it found)
+
+**The first execution of the AGNOS arm since 0.6.2.** Six releases of
+agnos-affecting change had accumulated behind compile-only verification, and the
+run found a real defect on the first attempt: a complete response was being
+reported as truncated. Fixed here, with the failure reproduced on Linux so it
+stays fixed.
+
+`taar` needed no repair — see *Where the fault was not* below.
+
+### Fixed
+- **A complete response is no longer reported as truncated.** whirl read every
+  response until the peer closed the socket, even when the response's own
+  framing already said it was whole. On Linux that is invisible: `read(2)`
+  returns 0 the instant the peer closes. On AGNOS the close is not surfaced
+  promptly, so a **complete** chunked body burned taar's full 10 s receive
+  deadline, came back as `_TAAR_ERR_TIMEOUT`, and 0.6.6's truncation check
+  correctly reported the result as an incomplete response — `exit 9`, no body.
+  The response was never incomplete; whirl was asking the socket a question only
+  the framing can answer.
+
+  `http_response_complete()` now decides: a chunked body ends at its terminating
+  chunk, a `Content-Length` body at its length, and a HEAD response at its
+  headers. Only a genuinely close-delimited body (no length, no chunking) still
+  ends at EOF. The read loop stops as soon as the framing says the response is
+  whole, and the truncation check consults the same predicate.
+
+  **This was reachable on Linux too**, not only AGNOS — masked because whirl
+  sends `Connection: close` and most servers honour it. Against a server that
+  holds the connection open after a complete body, 0.6.8 stalls **10.4 s** and
+  then exits 9 with no output; 0.6.9 returns the body in **0.0 s**, exit 0.
+- **Every fetch is faster.** Not waiting for a close it does not need removes a
+  wasted round trip per request on Linux and a whole receive deadline per
+  request on AGNOS.
+
+### Validated on AGNOS (QEMU + KVM, virtio-net + SLIRP)
+Re-staged `rootfs/bin/whirl` — the previously staged binary was **`whirl/0.5.3`
+at 13.9 MB**, predating the 0.6.5 shrink and the UA fix; it is now this release
+at 2.0 MB.
+
+- **HTTP PASS and HTTPS PASS** on the shipped artifact (version string `0.6.9`,
+  2,011,416 bytes): `whirl http://example.com` and `whirl https://example.com`
+  each returned the **complete** Example Domain page — full document through
+  `</html>`, not merely a recognisable prefix — over the sovereign stack (taar
+  DNS via `udp_*`#51-54 → `sock_connect`#47 → `tls_native` over taar → HTTP
+  framing), cert-verified. Zero `incomplete response` errors in the run.
+- **The pre-fix run is the evidence the fix was needed**: identical harness,
+  same kernel, HTTP failed with `incomplete response` / exit 9 while HTTPS
+  passed. HTTPS was unaffected because TLS `close_notify` gives `tls_read` a
+  clean 0 without needing socket EOF — which is why the plain-HTTP path failed
+  alone, and why testing only HTTPS would have declared a broken build good.
+- **Harness note:** the smoke's `whirl --help` step reports FAIL in every run.
+  It is an input-layer artifact — the xHCI keyboard drops characters, and agnsh
+  received `-help` with the `whirl ` prefix lost. The binary demonstrably execs:
+  the same run fetched over both schemes.
+
+### Where the fault was **not**
+Worth recording, because two plausible suspects were investigated and cleared:
+- **taar is correct.** Its AGNOS `taar_tcp_recv` polls `sock_recv`#49 and maps
+  the kernel's `-1` (EOF) to a clean `0`, returning `_TAAR_ERR_TIMEOUT` only on
+  deadline expiry. That timeout/EOF split, added in taar 0.5.0, is what made the
+  defect *visible* rather than silent — before it, a deadline expiry also
+  returned 0 and whirl could not tell a stalled read from a finished one. **No
+  taar change was made or needed.**
+- **The agnos kernel ABI is correct as specified**: `sock_recv`#49 documents
+  `bytes / 0 = WOULD_BLOCK / -1 = EOF`. Whether the close is surfaced *promptly*
+  is a separate question this run did not settle — and now does not need to,
+  since whirl no longer depends on the answer for a framed response.
+
+### Tests
+- **130 → 139 assertions.** New group `response-complete`: `Content-Length`
+  satisfied vs short, chunked terminated vs unterminated vs mid-chunk,
+  close-delimited (never complete without EOF), and HEAD complete at its headers
+  while the identical bytes are incomplete for a GET.
+- **`tests/behavior.py` 21 → 25 standalone checks.** `[15]` reproduces the AGNOS
+  failure on Linux without QEMU: a server that sends a complete body and then
+  holds the connection open. Covers chunked, `Content-Length` and `-I` — plus
+  the complement, that an **unterminated** chunk stream followed by a close must
+  still fail, so the fix cannot be mistaken for weakening the truncation check.
+  Paired against 0.6.8 the control reproduces the stall-then-error.
+
+### Still not validated
+- **Iron on archaemenid** — unchanged, still open, and now the critical path to 1.0.
+- The agnos-only CA-hook cache, resume guard and `_path_is_symlink` branch are
+  still **not executed** by the smoke; the harness only drives `--help`, an HTTP
+  fetch and an HTTPS fetch. Recorded as roadmap item **A2**. In particular this
+  run does *not* settle whether `_agnos_ca_hook` is redundant: the hook runs on
+  the HTTPS path that passed, so it is reachable, but nothing here shows
+  `set_ca_system` would succeed without it.
+
 ## [0.6.8] — 2026-08-27 (P-3 tier: dedup, checked allocation, no silent caps)
 
 The last tier from the 0.6.6 audit. Mostly cleanup — but two items turned out to
