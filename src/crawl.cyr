@@ -10,15 +10,6 @@
 #
 # Depends on links.cyr (links_path_normalize); include it first.
 
-fn _starts(s, pfx): i64 {
-    var i = 0;
-    while (load8(pfx + i) != 0) {
-        if (load8(s + i) != load8(pfx + i)) { return 0; }
-        i = i + 1;
-    }
-    return 1;
-}
-
 # ':' before any '/' → a non-http scheme (mailto:, javascript:, tel:, data:).
 fn _has_scheme_colon(s): i64 {
     var i = 0;
@@ -31,40 +22,13 @@ fn _has_scheme_colon(s): i64 {
     return 0;
 }
 
-# Same origin = same scheme, host (case-insensitive) and port.
-fn _ci_streq(a, b): i64 {
-    var i = 0;
-    while (1 == 1) {
-        var x = load8(a + i);
-        var y = load8(b + i);
-        if ((x >= 65) && (x <= 90)) { x = x + 32; }
-        if ((y >= 65) && (y <= 90)) { y = y + 32; }
-        if (x != y) { return 0; }
-        if (x == 0) { return 1; }
-        i = i + 1;
-    }
-    return 0;
-}
-
-fn _concat2(a, b): i64 {
-    var la = strlen(a);
-    var lb = strlen(b);
-    var d = alloc(la + lb + 1);
-    var i = 0;
-    while (i < la) { store8(d + i, load8(a + i)); i = i + 1; }
-    var j = 0;
-    while (j < lb) { store8(d + la + j, load8(b + j)); j = j + 1; }
-    store8(d + la + lb, 0);
-    return d;
-}
-
 # Directory part of a path including the trailing slash ("/a/b.html" -> "/a/").
 fn _path_dir(path): i64 {
     var n = strlen(path);
     var lastslash = 0;
     var i = 0;
     while (i < n) { if (load8(path + i) == 47) { lastslash = i; } i = i + 1; }
-    var d = alloc(lastslash + 2);
+    var d = xalloc(lastslash + 2);
     var k = 0;
     while (k <= lastslash) { store8(d + k, load8(path + k)); k = k + 1; }
     store8(d + lastslash + 1, 0);
@@ -98,7 +62,7 @@ fn _authority(host, is_https, port): i64 {
     var tmp[24];
     var nl = fmt_int_buf(port, &tmp);
     var lh = strlen(host);
-    var d = alloc(lh + nl + 2);
+    var d = xalloc(lh + nl + 2);
     var i = 0;
     while (i < lh) { store8(d + i, load8(host + i)); i = i + 1; }
     store8(d + lh, 58);                                   # ':'
@@ -114,13 +78,13 @@ fn _resolve_link(link, base_https, base_host, base_port, base_path): i64 {
     var c0 = load8(link);
     if (c0 == 0) { return 0; }
     if (c0 == 35) { return 0; }                      # '#'
-    if (_starts(link, "http://") == 1) { return link; }
-    if (_starts(link, "https://") == 1) { return link; }
+    if (util_has_prefix(link, "http://") == 1) { return link; }
+    if (util_has_prefix(link, "https://") == 1) { return link; }
     if (_has_scheme_colon(link) == 1) { return 0; }  # mailto:/javascript:/...
     if ((c0 == 47) && (load8(link + 1) == 47)) {     # protocol-relative //host/path
         var sch = "http:";
         if (base_https == 1) { sch = "https:"; }
-        return _concat2(sch, link);                  # → absolute (cross-host filtered later)
+        return util_concat2(sch, link);                  # → absolute (cross-host filtered later)
     }
     var pfx = "http://";
     if (base_https == 1) { pfx = "https://"; }
@@ -129,11 +93,11 @@ fn _resolve_link(link, base_https, base_host, base_port, base_path): i64 {
     # wrong service (or nothing) — -r was unusable off the default ports.
     var auth = _authority(base_host, base_https, base_port);
     if (c0 == 47) {                                                      # root-relative
-        return _concat2(_concat2(pfx, auth), links_path_normalize(link));
+        return util_concat2(util_concat2(pfx, auth), links_path_normalize(link));
     }
     var dir = _path_dir(base_path);                                      # relative
-    var np = links_path_normalize(_concat2(dir, link));
-    return _concat2(_concat2(pfx, auth), np);
+    var np = links_path_normalize(util_concat2(dir, link));
+    return util_concat2(util_concat2(pfx, auth), np);
 }
 
 # Resolve a `Location:` value against the current request into an absolute URL.
@@ -143,23 +107,23 @@ fn _resolve_link(link, base_https, base_host, base_port, base_path): i64 {
 # the redirect stub as the "result". Mirrors _resolve_link's shape, but keeps
 # the port, which _resolve_link drops.
 fn _abs_location(loc, is_https, host, port, path): i64 {
-    if (_starts(loc, "http://") == 1) { return loc; }
-    if (_starts(loc, "https://") == 1) { return loc; }
+    if (util_has_prefix(loc, "http://") == 1) { return loc; }
+    if (util_has_prefix(loc, "https://") == 1) { return loc; }
     var sch = "http:";
     if (is_https == 1) { sch = "https:"; }
-    if ((load8(loc) == 47) && (load8(loc + 1) == 47)) { return _concat2(sch, loc); }   # //host/path
+    if ((load8(loc) == 47) && (load8(loc + 1) == 47)) { return util_concat2(sch, loc); }   # //host/path
     if (_has_scheme_colon(loc) == 1) { return 0; }        # mailto:/javascript:/...
     var pfx = "http://";
     if (is_https == 1) { pfx = "https://"; }
-    var base = _concat2(pfx, _authority(host, is_https, port));
-    if (load8(loc) == 47) { return _concat2(base, links_path_normalize(loc)); }        # root-relative
-    return _concat2(base, links_path_normalize(_concat2(_path_dir(path), loc)));       # relative
+    var base = util_concat2(pfx, _authority(host, is_https, port));
+    if (load8(loc) == 47) { return util_concat2(base, links_path_normalize(loc)); }        # root-relative
+    return util_concat2(base, links_path_normalize(util_concat2(_path_dir(path), loc)));       # relative
 }
 
 fn _same_origin(is_https, host, port, u2): i64 {
     if (is_https != url_is_https(u2)) { return 0; }
     if (port != url_port(u2)) { return 0; }
-    if (_ci_streq(host, url_host(u2)) == 0) { return 0; }
+    if (util_streq_ci(host, url_host(u2)) == 0) { return 0; }
     return 1;
 }
 
@@ -194,7 +158,7 @@ fn _robots_value(body, start, e): i64 {
 fn _robots_dup(body, v, e): i64 {
     var vlen = e - v;
     if (vlen <= 0) { return 0; }
-    var d = alloc(vlen + 1);
+    var d = xalloc(vlen + 1);
     var k = 0;
     while (k < vlen) { store8(d + k, load8(body + v + k)); k = k + 1; }
     store8(d + vlen, 0);
@@ -246,7 +210,7 @@ fn _robots_blocked(path, rules, flags, nrules): i64 {
     var i = 0;
     while (i < nrules) {
         var r = load64(rules + i * 8);
-        if (_starts(path, r) == 1) {
+        if (util_has_prefix(path, r) == 1) {
             var rl = strlen(r);
             if (rl > best_len) { best_len = rl; best_allow = load64(flags + i * 8); }
             elif (rl == best_len) {
@@ -272,7 +236,7 @@ fn tree_relpath(path): i64 {
     var end = 0;
     while ((end < n) && (load8(path + end) != 63)) { end = end + 1; }   # strip ?query
     if (_path_no_dotdot(path, end) == 0) { return 0; }
-    var rp = alloc(end + 12);
+    var rp = xalloc(end + 12);
     var w = 0;
     var i = 0;
     while ((i < end) && (load8(path + i) == 47)) { i = i + 1; }

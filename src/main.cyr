@@ -3,6 +3,8 @@
 # Plain HTTP GET (the HTTPS/TLS wrap is the next bite). Stdlib auto-included.
 
 include "lib/taar.cyr"
+include "src/version.cyr"
+include "src/util.cyr"
 include "src/url.cyr"
 include "src/http.cyr"
 include "src/links.cyr"
@@ -23,7 +25,7 @@ var WHIRL_RBUF_SZ = 1048576;
 fn _puts(s): i64  { sys_write(1, s, strlen(s)); return 0; }
 fn _eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
 fn _eput_int(n): i64 {
-    var b = alloc(24);
+    var b = xalloc(24);
     var len = fmt_int_buf(n, b);
     sys_write(2, b, len);
     return 0;
@@ -35,7 +37,7 @@ fn _sleep_ms(ms): i64 {
 
 # Build a "Range: bytes=<off>-" header cstr (for -C resume).
 fn _build_range_header(off): i64 {
-    var d = alloc(48);
+    var d = xalloc(48);
     var p = 0;
     var pfx = "Range: bytes=";
     var i = 0;
@@ -51,7 +53,7 @@ fn _build_range_header(off): i64 {
 }
 
 fn _materialize_argv(ac): i64 {
-    var av = alloc(ac * 8);
+    var av = xalloc(ac * 8);
     var i = 0;
     while (i < ac) { store64(av + i * 8, argv(i)); i = i + 1; }
     return av;
@@ -62,7 +64,7 @@ fn _materialize_argv(ac): i64 {
 # left intact for any later use.
 var _stripped_hdrs = 0;
 fn _strip_credentials(hdrs, nhdrs): i64 {
-    _stripped_hdrs = alloc((nhdrs + 1) * 8);
+    _stripped_hdrs = xalloc((nhdrs + 1) * 8);
     var n = 0;
     var i = 0;
     while (i < nhdrs) {
@@ -104,7 +106,7 @@ fn _print_help(): i64 {
 fn _dup_location(resp, total, lv): i64 {
     var n = 0;
     while ((lv + n < total) && (load8(resp + lv + n) != 13)) { n = n + 1; }
-    var d = alloc(n + 1);
+    var d = xalloc(n + 1);
     var i = 0;
     while (i < n) { store8(d + i, load8(resp + lv + i)); i = i + 1; }
     store8(d + n, 0);
@@ -137,7 +139,7 @@ fn _emit_body(rbuf, total, outfile): i64 {
         var ilen = total - ib;
         var ibody = rbuf + ib;
         if (http_is_chunked(rbuf, total) == 1) {
-            var idec = alloc(WHIRL_RBUF_SZ);
+            var idec = xalloc(WHIRL_RBUF_SZ);
             var idn = http_dechunk(ibody, ilen, idec, WHIRL_RBUF_SZ);
             if (idn < 0) { _eputs("whirl: malformed chunked body\n"); return 9; }
             ibody = idec;
@@ -146,7 +148,7 @@ fn _emit_body(rbuf, total, outfile): i64 {
             var icl = http_content_length(rbuf, total);
             if (icl >= 0) { if (icl < ilen) { ilen = icl; } }
         }
-        var comb = alloc(ib + ilen);
+        var comb = xalloc(ib + ilen);
         var ci = 0;
         while (ci < ib) { store8(comb + ci, load8(rbuf + ci)); ci = ci + 1; }
         var cj = 0;
@@ -158,7 +160,7 @@ fn _emit_body(rbuf, total, outfile): i64 {
     if (bo < 0) { _eputs("whirl: no response body\n"); return 9; }
     var blen = total - bo;
     if (http_is_chunked(rbuf, total) == 1) {
-        var out = alloc(WHIRL_RBUF_SZ);
+        var out = xalloc(WHIRL_RBUF_SZ);
         var dn = http_dechunk(rbuf + bo, blen, out, WHIRL_RBUF_SZ);
         if (dn < 0) { _eputs("whirl: malformed chunked body\n"); return 9; }
         if (output_write(out, dn, outfile) < 0) { _eputs("whirl: write failed\n"); return 9; }
@@ -231,12 +233,41 @@ fn _mkdir(path): i64 {
 #endif
 }
 
+# Is `path` an existing symlink? -r would otherwise follow it and write THROUGH
+# it, so a symlink planted in the crawl directory redirects a mirrored file
+# anywhere the user can write — the same outcome as the 0.6.6 traversal bug by a
+# different route.
+#
+# Linux only, and deliberately so: agnos has no lstat peer, and its path-based
+# sys_stat#33 FOLLOWS the final symlink (lib/syscalls_x86_64_agnos.cyr), so the
+# check cannot be expressed there. The agnos arm therefore still writes through
+# a symlink; that gap is real and is recorded in state.md rather than papered
+# over with a stat call that would silently answer about the target.
+#
+# A pre-write lstat is also TOCTOU-racy against an attacker who can create the
+# link between the check and the open. Closing that needs O_NOFOLLOW on the
+# write itself, which means bypassing file_write_all — out of scope here. This
+# still removes the whole class of pre-planted-symlink cases.
+fn _path_is_symlink(path): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    var sb = xalloc(STAT_BUFSZ);
+    if (sys_lstat(path, sb) < 0) { return 0; }       # missing → nothing to follow
+    var mode = load64(sb + STAT_MODE) & 0xFFFFFFFF;  # st_mode is a u32 field
+    if ((mode & 0xF000) == 0xA000) { return 1; }     # S_IFLNK
+    return 0;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # no lstat peer — see the comment above
+#endif
+}
+
 # Save buf[0..len) to a file mirroring `path` as a directory tree under cwd:
 # "/docs/g.html" -> docs/g.html (mkdir docs); "/" or "/d/" -> .../index.html.
 # Returns 0 on success, or < 0 if the path is unsafe or the write failed.
 fn _save_tree(path, buf, len): i64 {
     var rp = tree_relpath(path);      # 0 = refuses to escape cwd (see crawl.cyr)
     if (rp == 0) { return 0 - 1; }
+    if (_path_is_symlink(rp) == 1) { return 0 - 1; }
     var w = strlen(rp);
     var j = 0;
     while (j < w) {
@@ -261,8 +292,8 @@ fn _robots_load(base_host, base_https, port, rules, flags, rulesmax): i64 {
     # http://host:8080/ lives on :8080. Fetching :80 instead consulted a
     # different origin's policy — or, on a host serving something else there,
     # no policy at all — and the crawl proceeded as if unrestricted.
-    var rbuf = alloc(65536);
-    var req = alloc(512);
+    var rbuf = xalloc(65536);
+    var req = xalloc(512);
     var reqlen = http_build_get(_authority(base_host, base_https, port), "/robots.txt", req, 512);
     if (reqlen < 0) { return 0; }   # cannot ask for robots.txt → assume no rules
     var total = 0;
@@ -282,16 +313,19 @@ var _CRAWL_MAX = 64;
 # Recursive same-host fetch from `start_url`, saving each resource to a flat file.
 # BFS, depth-bounded, visited-deduped, capped at _CRAWL_MAX fetches.
 fn _crawl(start_url, base_host, base_https, base_port, maxdepth): i64 {
-    var queue   = alloc(_CRAWL_MAX * 8);
-    var qdepth  = alloc(_CRAWL_MAX * 8);
-    var visited = alloc(_CRAWL_MAX * 8);
+    var queue   = xalloc(_CRAWL_MAX * 8);
+    var qdepth  = xalloc(_CRAWL_MAX * 8);
+    var visited = xalloc(_CRAWL_MAX * 8);
     var nvis = 0;
     var qhead = 0;
     var qtail = 0;
-    var rbuf = alloc(WHIRL_RBUF_SZ);
-    var rules = alloc(64 * 8);
-    var rflags = alloc(64 * 8);
+    var rbuf = xalloc(WHIRL_RBUF_SZ);
+    var rules = xalloc(64 * 8);
+    var rflags = xalloc(64 * 8);
     var nrules = _robots_load(base_host, base_https, base_port, rules, rflags, 64);
+
+    var capped = 0;    # links dropped because the fetch cap was reached
+    var uncrawled = 0; # links dropped because one page had more than the extractor holds
 
     store64(queue + 0, start_url);
     store64(qdepth + 0, 0);
@@ -327,7 +361,7 @@ fn _crawl(start_url, base_host, base_https, base_port, maxdepth): i64 {
             continue;
         }
 
-        var req = alloc(2048);
+        var req = xalloc(2048);
         var reqlen = http_build_get(_authority(uh, url_is_https(u), url_port(u)), url_path(u), req, 2048);
         if (reqlen < 0) { _eputs("whirl: request too large, skipped "); _eputs(url); _eputs("\n"); continue; }
         var total = 0;
@@ -354,7 +388,7 @@ fn _crawl(start_url, base_host, base_https, base_port, maxdepth): i64 {
         var sbuf = rbuf + bo;
         var slen = total - bo;
         if (http_is_chunked(rbuf, total) == 1) {
-            var dout = alloc(WHIRL_RBUF_SZ);
+            var dout = xalloc(WHIRL_RBUF_SZ);
             var dlen = http_dechunk(sbuf, slen, dout, WHIRL_RBUF_SZ);
             if (dlen < 0) {
                 _eputs("whirl: malformed chunked body, skipped "); _eputs(url); _eputs("\n");
@@ -373,23 +407,42 @@ fn _crawl(start_url, base_host, base_https, base_port, maxdepth): i64 {
         _eputs("whirl: saved "); _eputs(url_path(u)); _eputs("\n");
 
         if (depth < maxdepth) {
-            var links = alloc(64 * 8);
+            var links = xalloc(64 * 8);
             var nl = links_extract(sbuf, slen, links, 64);
+            if (links_found() > nl) { uncrawled = uncrawled + (links_found() - nl); }
             var k = 0;
             while (k < nl) {
                 var resolved = _resolve_link(load64(links + k * 8), url_is_https(u), base_host, base_port, url_path(u));
                 if (resolved != 0) {
-                    if (qtail < _CRAWL_MAX) {
-                        if (_seen(visited, nvis, resolved) == 0) {
+                    if (_seen(visited, nvis, resolved) == 0) {
+                        if (qtail < _CRAWL_MAX) {
                             store64(queue + qtail * 8, resolved);
                             store64(qdepth + qtail * 8, depth + 1);
                             qtail = qtail + 1;
+                        } else {
+                            # Say so. A silent drop at the cap made a partial
+                            # mirror look like a complete one — the same class
+                            # of quiet-wrong-answer this release line has been
+                            # removing everywhere else.
+                            capped = capped + 1;
                         }
                     }
                 }
                 k = k + 1;
             }
         }
+    }
+    if (capped > 0) {
+        _eputs("whirl: crawl cap reached (");
+        _eput_int(_CRAWL_MAX);
+        _eputs(" resources) — ");
+        _eput_int(capped);
+        _eputs(" link(s) not followed\n");
+    }
+    if (uncrawled > 0) {
+        _eputs("whirl: ");
+        _eput_int(uncrawled);
+        _eputs(" link(s) past the 64-per-page extractor limit were not seen\n");
     }
     return 0;
 }
@@ -428,7 +481,7 @@ fn main() {
     var path = url_path(u);
     var hops = 0;
     var drop_creds = 0;      # set once a redirect crosses origin (see below)
-    var rbuf = alloc(WHIRL_RBUF_SZ);
+    var rbuf = xalloc(WHIRL_RBUF_SZ);
 
     # -o FILE wins; else -O derives the name from the URL path.
     var outfile = cli_outfile();
@@ -457,7 +510,7 @@ fn main() {
         if (hops > 0) { meth = "GET"; bdy = 0; blen = 0; }
         if (drop_creds == 1) { nhdrs = _strip_credentials(hdrs, nhdrs); hdrs = _stripped_hdrs; }
         if ((hops == 0) && (resume_off > 0)) {     # -C: add Range to the first request
-            var aug = alloc((nhdrs + 1) * 8);
+            var aug = xalloc((nhdrs + 1) * 8);
             var hi = 0;
             while (hi < nhdrs) { store64(aug + hi * 8, load64(hdrs + hi * 8)); hi = hi + 1; }
             store64(aug + nhdrs * 8, _build_range_header(resume_off));
@@ -465,7 +518,7 @@ fn main() {
             nhdrs = nhdrs + 1;
         }
         var reqsz = 4096 + blen;
-        var req = alloc(reqsz);
+        var req = xalloc(reqsz);
         # RFC 9110 s7.2: Host carries the port whenever it is not the scheme
         # default. A bare host made virtual-host routing on a non-default port
         # resolve to the wrong site.

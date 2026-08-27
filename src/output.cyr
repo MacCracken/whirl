@@ -1,6 +1,13 @@
 # whirl — write the response body to stdout or a file.
 #
 # Stdlib auto-included via cyrius.cyml (syscalls: sys_write; io: file_write_all).
+#
+# 0.6.8: the Linux arms below used bare syscall NUMBERS (2/1/3/8) and a bare
+# flag word (1089) where the rest of whirl uses the `sys_*` wrappers and the
+# io.cyr O_* constants. Same instructions, but the numbers said nothing about
+# what they did and could not be checked against the enums that define them.
+
+var SEEK_END = 2;
 
 # Write `len` bytes to stdout (outfile == 0) or to `outfile` (created/truncated).
 # Returns 0 on success, < 0 on a file error.
@@ -20,10 +27,11 @@ fn output_write(buf, len, outfile): i64 {
 # (≤1 MB resume cap there — fine for the MVP).
 fn output_append(buf, len, outfile): i64 {
 #ifndef CYRIUS_TARGET_AGNOS
-    var fd = syscall(2, outfile, 1089, 420);   # open(O_WRONLY|O_APPEND|O_CREAT, 0644)
+    var fd = sys_open(outfile, O_WRONLY | O_APPEND | O_CREAT, 420);   # 0644
     if (fd < 0) { return fd; }
-    syscall(1, fd, buf, len);
-    syscall(3, fd);
+    var w = sys_write(fd, buf, len);
+    sys_close(fd);
+    if (w < 0) { return w; }
     return 0;
 #endif
 #ifdef CYRIUS_TARGET_AGNOS
@@ -34,10 +42,10 @@ fn output_append(buf, len, outfile): i64 {
     # was resuming. Refuse instead; the caller reports it.
     var cap = 1048576;
     if (output_file_size(outfile) > cap) { return 0 - 1; }
-    var old = alloc(cap);
+    var old = xalloc(cap);
     var on = file_read_all(outfile, old, cap);
     if (on < 0) { on = 0; }
-    var merged = alloc(on + len);
+    var merged = xalloc(on + len);
     var i = 0;
     while (i < on)  { store8(merged + i, load8(old + i)); i = i + 1; }
     var j = 0;
@@ -50,18 +58,18 @@ fn output_append(buf, len, outfile): i64 {
 # targets diverge: Linux lseek(SEEK_END) vs agnos sys_stat (STAT_SIZE=16).
 fn output_file_size(path): i64 {
 #ifndef CYRIUS_TARGET_AGNOS
-    var fd = syscall(2, path, 0, 0);   # open(path, O_RDONLY)
+    var fd = sys_open(path, O_RDONLY, 0);
     if (fd < 0) { return 0; }
-    var sz = syscall(8, fd, 0, 2);     # lseek(fd, 0, SEEK_END)
-    syscall(3, fd);                    # close
+    var sz = syscall(SYS_LSEEK, fd, 0, SEEK_END);
+    sys_close(fd);
     if (sz < 0) { return 0; }
     return sz;
 #endif
 #ifdef CYRIUS_TARGET_AGNOS
     var nl = 0;
     while (load8(path + nl) != 0) { nl = nl + 1; }
-    var sb = alloc(48);                # AgnosStat (STAT_BUFSZ)
+    var sb = xalloc(STAT_BUFSZ);
     if (sys_stat(path, nl, sb) < 0) { return 0; }
-    return load64(sb + 16);            # STAT_SIZE
+    return load64(sb + STAT_SIZE);
 #endif
 }

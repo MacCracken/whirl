@@ -50,7 +50,7 @@ fn _cli_atoi(s): i64 {
 # _cli_bodylen. `sys_read` is the portable wrapper (correct on Linux + agnos).
 fn _cli_read_fd(fd): i64 {
     var cap = 262144;
-    var buf = alloc(cap);
+    var buf = xalloc(cap);
     var total = 0;
     var go = 1;
     while (go == 1) {
@@ -87,7 +87,7 @@ fn _cli_load_data(arg): i64 {
         if ((load8(src) == 45) && (load8(src + 1) == 0)) { return _cli_read_fd(0); }   # @-
         # One byte of headroom: a read that fills MAX+1 means the file is larger
         # than the cap, which is an error rather than something to silently cut.
-        var buf = alloc(_CLI_BODY_MAX + 1);
+        var buf = xalloc(_CLI_BODY_MAX + 1);
         var n = file_read_all(src, buf, _CLI_BODY_MAX + 1);
         if (n < 0) { _cli_bodyerr = CLI_BODY_ENOENT; _cli_bodylen = 0; return 0; }
         if (n > _CLI_BODY_MAX) { _cli_bodyerr = CLI_BODY_TOOBIG; _cli_bodylen = 0; return 0; }
@@ -108,7 +108,7 @@ fn cli_parse(ac, av): i64 {
     _cli_body = 0;
     _cli_bodylen = 0;
     _cli_bodyerr = CLI_BODY_OK;
-    _cli_hdrs = alloc(_CLI_MAX_HDRS * 8);
+    _cli_hdrs = xalloc(_CLI_MAX_HDRS * 8);
     _cli_nhdrs = 0;
     _cli_remote = 0;
     _cli_retries = 0;

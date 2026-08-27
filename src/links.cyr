@@ -31,8 +31,8 @@ fn _links_is_alpha(c): i64 {
 # A trailing slash on the input is preserved.
 fn links_path_normalize(path): i64 {
     var n = strlen(path);
-    var out = alloc(n + 2);
-    var starts = alloc(256 * 8);   # output offset where each kept segment began
+    var out = xalloc(n + 2);
+    var starts = xalloc(256 * 8);   # output offset where each kept segment began
     var nstarts = 0;
     var w = 0;
     var i = 0;
@@ -65,9 +65,18 @@ fn links_path_normalize(path): i64 {
     return out;
 }
 
+# Total link-shaped attributes seen by the last links_extract call, INCLUDING
+# any past `outmax`. The return value is clamped to the caller's array, so
+# without this a page with more links than capacity looked identical to one that
+# fitted exactly — the crawl reported a complete mirror of a partial page.
+var _links_found = 0;
+fn links_found(): i64 { return _links_found; }
+
 # Extract href/src URL values from html[0..len) into `out` (array of cstr ptrs,
-# capacity `outmax`). Returns the count.
+# capacity `outmax`). Returns the count STORED (<= outmax); links_found()
+# reports how many were actually present.
 fn links_extract(html, len, out, outmax): i64 {
+    _links_found = 0;
     var count = 0;
     var i = 0;
     while (i < len) {
@@ -105,8 +114,9 @@ fn links_extract(html, len, out, outmax): i64 {
                 }
                 var slen = j - s;
                 if (slen > 0) {
+                    _links_found = _links_found + 1;
                     if (count < outmax) {
-                        var d = alloc(slen + 1);
+                        var d = xalloc(slen + 1);
                         var m = 0;
                         while (m < slen) { store8(d + m, load8(html + s + m)); m = m + 1; }
                         store8(d + slen, 0);

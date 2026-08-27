@@ -5,6 +5,94 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.8] — 2026-08-27 (P-3 tier: dedup, checked allocation, no silent caps)
+
+The last tier from the 0.6.6 audit. Mostly cleanup — but two items turned out to
+have teeth: `alloc()` failure was unchecked at 39 call sites, and two caps were
+dropping work silently. Three of the original P-3s (the integer-overflow bounds
+on `_url_parse_uint`, `_cli_atoi` and `http_content_length`) already landed in
+0.6.7 and are not repeated here.
+
+### Security
+- **`-r` refuses to write through a symlink.** A symlink planted in the crawl
+  directory redirected a mirrored file anywhere the user could write — the same
+  outcome as the 0.6.6 traversal bug by a different route. `_save_tree` now
+  `lstat`s the target and refuses if it is a link.
+  **Linux only, and deliberately not faked on agnos:** agnos has no `lstat`
+  peer, and its path-based `sys_stat`#33 *follows* the final symlink, so the
+  check cannot be expressed there. Using `sys_stat` anyway would have answered
+  about the target rather than the link — a check that looks like coverage and
+  is not. The gap is recorded in `state.md` instead.
+  A pre-write `lstat` is also TOCTOU-racy; closing that needs `O_NOFOLLOW` on
+  the write itself, which means bypassing `file_write_all`. This removes the
+  whole pre-planted-link class, which is the realistic one.
+
+### Fixed — silent caps
+- **The crawl no longer drops work silently.** Two separate caps discarded links
+  with no signal, so a partial mirror was indistinguishable from a complete one:
+  the 64-resource fetch cap, and `links_extract`'s 64-per-page array. Both are
+  now counted and reported on stderr. Against a 200-link page whirl now says
+  `crawl cap reached (64 resources) — 1 link(s) not followed` **and**
+  `136 link(s) past the 64-per-page extractor limit were not seen`; previously
+  it said nothing at all. `links_extract` gained `links_found()`, which reports
+  the true total while the return value stays clamped to the caller's array —
+  changing the return to the unclamped count would have let a caller index past
+  the end of its own buffer.
+
+### Hardening
+- **`alloc()` failure is checked.** It returns 0 on a request past `ALLOC_MAX`
+  or an mmap that cannot extend the heap, and all 39 call sites in `src/` stored
+  straight into address 0. They now go through `xalloc`, which fails loudly with
+  `whirl: out of memory` and exit 9. There is no useful recovery in a one-shot
+  transfer tool, and faulting at address 0 says nothing about the cause.
+
+### Refactor
+- **`src/util.cyr`** — a cstr prefix test, a case-insensitive prefix test, a
+  case-insensitive string compare, a bounded cstr dup and a two-part concat each
+  existed in three or four near-identical copies across `url` / `http` / `crawl`
+  / `main`. Now one copy each. Not cosmetic: the case-insensitive compare is
+  exactly the kind of routine where one copy gets a bounds fix and the others do
+  not — the short-input safety that mattered for credential-header matching in
+  0.6.6 had to be reasoned about per copy.
+- **`src/version.cyr`** — the version lived inline in the User-Agent, where it
+  went stale for six releases before 0.6.5 caught it. It is now a single
+  constant, and CI asserts it equals the root `VERSION` file. (Cyrius has no
+  build-time define to inject the value, so a mirror plus a gate is the honest
+  arrangement — a mirror alone is what created the original problem.)
+- **`src/output.cyr` uses named syscalls and constants.** Its Linux arms used
+  bare syscall numbers (`syscall(2, …)`, `syscall(1, …)`, `syscall(3, …)`,
+  `syscall(8, …)`) and a bare flag word (`1089`) where the rest of whirl uses
+  the `sys_*` wrappers and io.cyr's `O_*`. Same instructions; the numbers now
+  say what they do and the agnos stat offsets come from the `Stat` enum rather
+  than being hardcoded.
+
+### Tests
+- **107 → 130 assertions.** New groups: `util` (every shared helper, including
+  the short-input cases that must not overrun) and `links-found` (the clamped
+  return vs the true total, and that the counter resets per call).
+- **`tests/behavior.py` 19 → 21 standalone checks**: the symlink refusal, and
+  both crawl caps being reported. Against a 0.6.6 baseline: 27/27 with all six
+  0.6.7/0.6.8 controls reproducing and the seven 0.6.6 controls skipped.
+- CI gained the `src/version.cyr` vs `VERSION` check.
+
+### Known latent (still open)
+- **`-r` writes through a symlink on the AGNOS target** — no `lstat` peer
+  exists. Would need a kernel-side `lstat` or an `O_NOFOLLOW` open.
+- The pre-write `lstat` on Linux is TOCTOU-racy (above).
+- `_agnos_ca_hook` may be redundant since cyrius v6.2.23 fixed the
+  `set_ca_system` agnos ABI it works around — retiring it needs a run on real
+  agnos, not a code read.
+- The 64-resource crawl cap and 64-per-page link cap are now *reported* but not
+  configurable; there is no flag to raise them.
+
+### Not validated here
+- **AGNOS runtime**, as with 0.6.6 and 0.6.7. This release changes `output.cyr`
+  on both arms and adds an agnos-only branch to `_path_is_symlink`; both are
+  compile-verified only. The `output.cyr` syscall rewrite is behaviour-preserving
+  by construction but is exactly the kind of change a QEMU run should confirm.
+- The behavioural suite runs over plain HTTP against local servers; the TLS arm
+  is covered only by live fetches and a fail-closed check.
+
 ## [0.6.7] — 2026-08-27 (P-2 tier: origin confinement, port correctness, overflow hardening)
 
 The second tier from the 0.6.6 audit — the "Known latent" list that release

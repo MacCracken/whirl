@@ -134,4 +134,11 @@ jobs:
           fi
           [ "$FILE_VERSION" = "$CYML_VERSION" ] || { echo "VERSION ($FILE_VERSION) != cyrius.cyml ($CYML_RAW)"; exit 1; }
           grep -q "$FILE_VERSION" CHANGELOG.md || { echo "version not in changelog"; exit 1; }
-          echo "Version consistent: $FILE_VERSION (cyml: $CYML_RAW)"
+          # src/version.cyr mirrors VERSION because Cyrius has no build-time
+          # define to inject it. That mirror is only trustworthy if something
+          # checks it: before 0.6.8 the version lived inline in the User-Agent
+          # and went stale for six releases unnoticed.
+          SRC_VERSION=$(sed -n 's/^var WHIRL_VERSION = "\(.*\)";$/\1/p' src/version.cyr)
+          [ "$FILE_VERSION" = "$SRC_VERSION" ] || {
+            echo "VERSION ($FILE_VERSION) != src/version.cyr ($SRC_VERSION)"; exit 1; }
+          echo "Version consistent: $FILE_VERSION (cyml: $CYML_RAW, src: $SRC_VERSION)"

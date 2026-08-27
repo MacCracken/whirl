@@ -111,7 +111,7 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
 # staged /etc/ssl/cert.pem with the correct agnos ABI and installs it via
 # tls_native_set_ca_bundle — the roots the chain then verifies against.
 # The loaded bundle, cached across connects. The allocator is a bump allocator
-# with no free, so the old per-connect alloc(1 MiB) was permanently retained on
+# with no free, so the old per-connect xalloc(1 MiB) was permanently retained on
 # every TLS connection — ~1 MiB leaked per redirect hop and per crawled resource.
 var _agnos_ca_buf = 0;
 var _agnos_ca_len = 0;
@@ -136,7 +136,7 @@ fn _agnos_ca_load(): i64 {
     }
     if (fd < 0) { return 0 - 1; }              # no bundle staged → leave roots empty
     var cap = 1048576;
-    var buf = alloc(cap);
+    var buf = xalloc(cap);
     if (buf == 0) { sys_close(fd); return 0 - 1; }   # never store into address 0
     var total = 0;
     var go = 1;
@@ -182,7 +182,7 @@ fn _agnos_tls_native_connect(fd, host): i64 {
     _agnos_ca_hook(0, nctx);
     # CVE-18: tls_native_connect verifies chain + hostname fail-closed before TLS_OK.
     if (tls_native_connect(nctx, fd) != TLS_OK) { tls_native_close(nctx); return 0; }
-    var ctx = alloc(40);
+    var ctx = xalloc(40);
     store64(ctx, nctx);
     store64(ctx + 8, 0);
     store64(ctx + 16, fd);

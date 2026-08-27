@@ -4,6 +4,8 @@
 #
 # Stdlib auto-included via cyrius.cyml.
 
+include "src/version.cyr"
+include "src/util.cyr"
 include "src/url.cyr"
 include "src/http.cyr"
 include "src/links.cyr"
@@ -258,6 +260,49 @@ fn test_resolve_link_port() {
     assert_eq(_resolve_link("mailto:a@b.c", 0, "h.test", 80, "/i.html"), 0, "mailto skipped");
 }
 
+# === shared helpers (0.6.8: src/util.cyr) ===
+
+fn test_util_helpers() {
+    test_group("util");
+    assert_eq(util_has_prefix("http://x", "http://"), 1, "prefix match");
+    assert_eq(util_has_prefix("https://x", "http://"), 0, "prefix mismatch");
+    assert_eq(util_has_prefix("ht", "http://"), 0, "short subject does not overrun");
+    assert_eq(util_has_prefix("anything", ""), 1, "empty prefix matches");
+
+    assert_eq(util_has_prefix_ci("Content-Type: x", "content-type:"), 1, "ci prefix match");
+    assert_eq(util_has_prefix_ci("CONTENT-TYPE: x", "content-type:"), 1, "ci upper match");
+    assert_eq(util_has_prefix_ci("Content-Len: x", "content-type:"), 0, "ci mismatch");
+    assert_eq(util_has_prefix_ci("Con", "content-type:"), 0, "ci short does not overrun");
+
+    assert_eq(util_streq_ci("Example.COM", "example.com"), 1, "ci equal");
+    assert_eq(util_streq_ci("example.com", "example.org"), 0, "ci unequal");
+    assert_eq(util_streq_ci("", ""), 1, "both empty equal");
+    assert_eq(util_streq_ci("a", "ab"), 0, "prefix is not equality");
+
+    assert_eq(streq(util_dup_range("hello world", 5), "hello"), 1, "dup_range copies n bytes");
+    assert_eq(streq(util_dup_range("hello", 0), ""), 1, "dup_range zero length");
+    assert_eq(streq(util_concat2("foo", "bar"), "foobar"), 1, "concat2");
+    assert_eq(streq(util_concat2("", "bar"), "bar"), 1, "concat2 empty lhs");
+    assert_eq(streq(util_concat2("foo", ""), "foo"), 1, "concat2 empty rhs");
+}
+
+# The extractor clamps to the caller's array; links_found() reports the true
+# total so the crawl can say what it did not see (0.6.8).
+fn test_links_found() {
+    test_group("links-found");
+    var out = xalloc(4 * 8);
+    var html = "<a href=\"/1\"><a href=\"/2\"><a href=\"/3\"><a href=\"/4\"><a href=\"/5\">";
+    var n = links_extract(html, strlen(html), out, 2);
+    assert_eq(n, 2, "stored count clamped to capacity");
+    assert_eq(links_found(), 5, "found count reports all five");
+    var n2 = links_extract(html, strlen(html), out, 4);
+    assert_eq(n2, 4, "clamped to 4");
+    assert_eq(links_found(), 5, "found count still five");
+    var none = "<p>no links</p>";
+    assert_eq(links_extract(none, strlen(none), out, 4), 0, "no links stored");
+    assert_eq(links_found(), 0, "found count reset per call");
+}
+
 fn main() {
     alloc_init();
     test_links();
@@ -280,6 +325,8 @@ fn main() {
     test_abs_location();
     test_same_origin();
     test_resolve_link_port();
+    test_util_helpers();
+    test_links_found();
     return assert_summary();
 }
 

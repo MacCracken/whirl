@@ -543,6 +543,67 @@ def check_retry_on_empty(run, rep, new, old):
               "attempts=%d rc=%d" % (len(attempts), rc))
 
 
+def check_symlink_write(run, rep, new, old):
+    """0.6.8: -r must not write THROUGH a symlink planted in the crawl directory."""
+    print("\n[13] -r refuses to write through a symlink")
+
+    def h(conn, req):
+        if "robots.txt" in req:
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            return
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nPAYLOAD")
+
+    def attempt(binary, tag):
+        # Pre-plant target.html -> a file outside the crawl directory, the way an
+        # attacker with local write access to the download dir would.
+        d = os.path.join(run.workdir, tag)
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+        outside = os.path.join(run.workdir, "%s-outside.txt" % tag)
+        with open(outside, "w") as f:
+            f.write("ORIGINAL")
+        os.symlink(outside, os.path.join(d, "target.html"))
+        p = newport()
+        serve(p, h, n=8)
+        subprocess.run([binary, "-r", "-l", "0", "http://127.0.0.1:%d/target.html" % p],
+                       cwd=d, capture_output=True, timeout=25)
+        return open(outside).read()
+
+    if old:
+        rep.control("baseline writes through the symlink",
+                    attempt(old, "sym_baseline") == "PAYLOAD", (0, 6, 8))
+
+    rep.check("symlink target left untouched", attempt(new, "sym") == "ORIGINAL")
+
+
+def check_crawl_cap_reported(run, rep, new, old):
+    """0.6.8: hitting the crawl cap must be reported, not silently truncate the mirror."""
+    print("\n[14] crawl cap is reported, not silent")
+
+    def h(conn, req):
+        if "robots.txt" in req:
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            return
+        if req.startswith("GET /p"):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            return
+        links = "".join('<a href="/p%d.html">x</a>' % i for i in range(200)).encode()
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(links) + links)
+
+    if old:
+        p = newport()
+        serve(p, h, n=200)
+        _rc, _o, err, _d = run(old, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p],
+                               "cap_baseline", timeout=90)
+        rep.control("baseline drops links silently", "crawl cap" not in err, (0, 6, 8))
+
+    p = newport()
+    serve(p, h, n=200)
+    _rc, _o, err, _d = run(new, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p], "cap", timeout=90)
+    rep.check("crawl cap reported on stderr", "crawl cap reached" in err,
+              next((l for l in err.splitlines() if "cap" in l), err.strip()[:80]))
+
+
 def main():
     ap = argparse.ArgumentParser(description="whirl behavioral test suite")
     ap.add_argument("binary", help="the whirl binary under test")
@@ -593,6 +654,8 @@ def main():
         check_host_header_port(run, rep, binary, baseline)
         check_include_chunked(run, rep, binary, baseline)
         check_retry_on_empty(run, rep, binary, baseline)
+        check_symlink_write(run, rep, binary, baseline)
+        check_crawl_cap_reported(run, rep, binary, baseline)
     finally:
         for f in (marker, marker2):
             if os.path.exists(f):

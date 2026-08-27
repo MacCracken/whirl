@@ -18,7 +18,7 @@ var URL_PARSE_OK   = 0;
 var URL_PARSE_FAIL = 0 - 1;
 
 fn url_new(): i64 {
-    var u = alloc(URL_STRUCT_SZ);
+    var u = xalloc(URL_STRUCT_SZ);
     store64(u + URL_OFF_HTTPS, 0);
     store64(u + URL_OFF_PORT, 0);
     store64(u + URL_OFF_HOST, 0);
@@ -49,27 +49,8 @@ fn url_filename(path): i64 {
     }
     var s = lastslash + 1;
     var slen = end - s;
-    if (slen <= 0) { return _url_dup_range("index.html", 10); }
-    return _url_dup_range(path + s, slen);
-}
-
-# Does cstr `s` start with cstr `pfx`?
-fn _url_has_prefix(s, pfx): i64 {
-    var i = 0;
-    while (load8(pfx + i) != 0) {
-        if (load8(s + i) != load8(pfx + i)) { return 0; }
-        i = i + 1;
-    }
-    return 1;
-}
-
-# Copy `len` bytes from `src` into a fresh null-terminated cstr.
-fn _url_dup_range(src, len): i64 {
-    var d = alloc(len + 1);
-    var i = 0;
-    while (i < len) { store8(d + i, load8(src + i)); i = i + 1; }
-    store8(d + len, 0);
-    return d;
+    if (slen <= 0) { return util_dup_range("index.html", 10); }
+    return util_dup_range(path + s, slen);
 }
 
 # 1 if the `len` bytes at `s` are safe to place in a request line or a Host
@@ -115,10 +96,10 @@ fn url_parse(url, u): i64 {
     var p = url;
     var is_https = 0;
     var defport = 80;
-    if (_url_has_prefix(p, "https://") == 1) {
+    if (util_has_prefix(p, "https://") == 1) {
         is_https = 1; defport = 443; p = p + 8;
     } else {
-        if (_url_has_prefix(p, "http://") == 1) {
+        if (util_has_prefix(p, "http://") == 1) {
             is_https = 0; defport = 80; p = p + 7;
         } else {
             return URL_PARSE_FAIL;
@@ -149,17 +130,17 @@ fn url_parse(url, u): i64 {
     if (host_end == 0) { return URL_PARSE_FAIL; }
     if (_url_bytes_clean(p, host_end) == 0) { return URL_PARSE_FAIL; }
 
-    var host = _url_dup_range(p, host_end);
+    var host = util_dup_range(p, host_end);
 
     var path = 0;
     if (load8(p + hostlen) == 0) {
-        path = _url_dup_range("/", 1);
+        path = util_dup_range("/", 1);
     } else {
         var q = p + hostlen;
         var pl = 0;
         while (load8(q + pl) != 0) { pl = pl + 1; }
         if (_url_bytes_clean(q, pl) == 0) { return URL_PARSE_FAIL; }
-        path = _url_dup_range(q, pl);
+        path = util_dup_range(q, pl);
     }
 
     store64(u + URL_OFF_HTTPS, is_https);
