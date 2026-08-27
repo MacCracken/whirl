@@ -148,6 +148,41 @@ fn test_path_normalize() {
     assert_eq(streq(links_path_normalize("/a//b"), "/a/b"), 1, "empty segment collapsed");
 }
 
+# === 0.6.6 security regressions ===
+
+# A redirect Location / crawled href reaches url_parse with attacker bytes in
+# it. Anything that could break the request line or Host header must be
+# rejected here, at the single choke point, rather than being written into the
+# request unescaped (request splitting).
+fn test_url_rejects_injection() {
+    test_group("url-reject-injection");
+    var u = url_new();
+    assert_eq(url_parse("http://evil.test/a HTTP/1.1\nX-Injected: 1", u), URL_PARSE_FAIL, "bare LF in path rejected");
+    assert_eq(url_parse("http://evil.test/a\r\nX-Injected: 1", u), URL_PARSE_FAIL, "CRLF in path rejected");
+    assert_eq(url_parse("http://evil.test/a b", u), URL_PARSE_FAIL, "space in path rejected");
+    assert_eq(url_parse("http://ev\r\nil.test/", u), URL_PARSE_FAIL, "CRLF in host rejected");
+    assert_eq(url_parse("http://ev il.test/", u), URL_PARSE_FAIL, "space in host rejected");
+    assert_eq(url_parse("http://evil.test/a\tb", u), URL_PARSE_FAIL, "tab in path rejected");
+    # Legitimate URLs must still parse — the check must not over-reject.
+    assert_eq(url_parse("http://example.com/a/b?q=1&r=2#frag", u), URL_PARSE_OK, "ordinary URL still ok");
+    assert_eq(url_parse("https://example.com:8443/p%20q", u), URL_PARSE_OK, "percent-encoded space still ok");
+}
+
+# Credential headers must be recognised case-insensitively so the redirect path
+# can drop them when a hop crosses origin.
+fn test_credential_headers() {
+    test_group("credential-headers");
+    assert_eq(http_hdr_is_credential("Authorization: Bearer x"), 1, "Authorization matched");
+    assert_eq(http_hdr_is_credential("authorization: Bearer x"), 1, "lowercase matched");
+    assert_eq(http_hdr_is_credential("AUTHORIZATION: Bearer x"), 1, "uppercase matched");
+    assert_eq(http_hdr_is_credential("Cookie: a=b"), 1, "Cookie matched");
+    assert_eq(http_hdr_is_credential("Proxy-Authorization: x"), 1, "Proxy-Authorization matched");
+    assert_eq(http_hdr_is_credential("Accept: */*"), 0, "Accept not a credential");
+    assert_eq(http_hdr_is_credential("X-Auth: x"), 0, "X-Auth not matched");
+    assert_eq(http_hdr_is_credential("Auth"), 0, "short line does not overrun");
+    assert_eq(http_hdr_is_credential(""), 0, "empty line does not overrun");
+}
+
 fn main() {
     alloc_init();
     test_links();
@@ -163,8 +198,10 @@ fn main() {
     test_http_chunked();
     test_http_request_post();
     test_http_custom_headers();
+    test_url_rejects_injection();
+    test_credential_headers();
     return assert_summary();
 }
 
 var exit_code = main();
-syscall(60, exit_code);
+syscall(SYS_EXIT, exit_code);

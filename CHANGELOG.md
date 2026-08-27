@@ -5,6 +5,132 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-08-27 (P-1 security + correctness sweep; CI compiles the AGNOS arm)
+
+A hardening cut. A multi-lens audit of `src/` produced findings that were then
+adversarially re-checked; the survivors are fixed here. **Three are genuine
+remote-attacker security defects** — one of them a remote arbitrary file write.
+Every fix below was proven by running the 0.6.5 binary against a local test
+server to reproduce the defect, then the 0.6.6 binary against the same server to
+show it closed (17 paired checks, plus positive controls that the fixes do not
+over-block).
+
+### Security — fixed
+- **Remote arbitrary file write in `-r` (path traversal).** `_resolve_link`
+  returned absolute same-host links *verbatim*, skipping the `links_path_normalize`
+  applied to relative ones, and `_save_tree` sanitized the result only by
+  stripping **one** leading `/`. A crawled page containing
+  `<a href="http://host/../../../../tmp/x">` — or the `//tmp/x` variant, which
+  survived one slash-strip as the absolute path `/tmp/x` — made whirl create or
+  truncate files anywhere the user could write. **Reproduced against 0.6.5**,
+  which wrote `/tmp/whirl_pwned_marker2` outside the crawl directory.
+  Confinement now lives at `_save_tree`, the single point that touches the
+  filesystem: any `..` segment is refused outright and *all* leading slashes are
+  stripped, so the write is always relative to cwd regardless of caller.
+- **Request splitting via an attacker-controlled `Location` / `href`.**
+  `_dup_location` stops only at CR, `url_parse` copied the path through to NUL
+  without validation, and `http_build_request` writes host and path into the
+  request line **unescaped** — so a redirect carrying bare LFs spliced
+  attacker-chosen headers, or a whole second request, into the request whirl
+  then sent to the *redirect target*. Now rejected in `url_parse`: controls,
+  space and DEL are refused in both host and path. One choke point covers the
+  command line, `Location:` and crawled hrefs alike. High bytes (≥ 128) still
+  pass, so UTF-8 / IDN paths are unaffected.
+- **Credential replay across origins on redirect.** `-H 'Authorization: …'`
+  (and `Cookie`, `Proxy-Authorization`) was re-sent verbatim to whatever host a
+  `Location:` named, so any site whirl was given a credential for could harvest
+  it by redirecting to a host it controls. Redirects that change scheme, host
+  (case-insensitively) or port now drop credential headers. Same-origin hops and
+  non-redirect requests keep them — verified both ways.
+
+### Fixed — silent wrong results
+- **A truncated transfer no longer reports success.** Both read loops folded
+  `n < 0` into the same branch as `n == 0`, so a timeout, RST or full buffer was
+  indistinguishable from a clean close: whirl wrote a short file and exited 0.
+  The loops now separate the two, and — more importantly — **every** response is
+  checked against its `Content-Length`, since a server that sends a short body
+  and then closes *cleanly* is the most common truncation of all and no
+  error-flag scheme would catch it. `HEAD`, 204 and 304 are correctly exempt.
+- **Response cap 256 KB → 1 MiB, and exceeding it is now an error.** This is the
+  root cause of the reported `whirl -L https://github.com` → `malformed chunked
+  body` (exit 9): github.com's 575 KB chunked body was cut mid-chunk at 256 KB,
+  and the dechunker reported the *symptom*. Now returns the full 574,917-byte
+  body, exit 0; a body over the new cap fails loudly instead of silently.
+- **`-r` wrote raw chunk framing to disk.** The crawl saved `rbuf` verbatim with
+  no dechunking, so every chunked resource was mirrored corrupt (`5\r\nHELLO…`)
+  — and link extraction then ran over the corrupt bytes. It now decodes first,
+  clamps to `Content-Length`, and extracts links from the decoded body.
+- **`-r` mirrored error pages as though they were the resource.** A 404 or 500
+  body was written under the requested name. Non-2xx is now skipped and reported.
+- **A failed `-o` write exited 0.** `output_write`'s error return was discarded
+  at every call site in `_emit_body`. Now checked; a write failure exits 9.
+- **`-d @missing-file` silently became a bodyless GET** with exit 0, and
+  **`-d @file` over the cap was truncated and sent under a `Content-Length` that
+  matched the truncated length** — so the server stored a short body and both
+  ends reported success. Both are now hard errors (exit 2) with distinct
+  messages; the body cap is 1 MiB with one byte of read headroom to tell "full"
+  from "too large".
+- **`-L` now follows a relative `Location:`.** RFC 9110 permits one and real
+  sites send bare `/docs/`; `url_parse` rejects a schemeless URL, so `-L`
+  silently stopped following and exited 0 with the redirect stub as the result.
+  Relative, root-relative and protocol-relative forms all resolve now — and the
+  resolver **keeps the port**, which the existing `_resolve_link` drops.
+
+### Hardening
+- **`taar_tcp_send` partial writes.** The return was discarded and never looped,
+  though both backends document a short write (`sock_send`#48 on agnos returns
+  "bytes sent (≤ len)"). Now a bounded send-all that tolerates a transient `0`
+  with a spin cap, matching taar's own `_taar_dns_tcp_send_all`. The TLS path
+  was already correct — `tls_write` / `tls_native_write` send-all internally —
+  so only its return code is checked, not re-looped.
+
+### CI
+- **CI now compiles and selects the AGNOS arm.** There was no `--agnos` step, so
+  a hard break inside an agnos-only block landed green: lint, the Linux build,
+  the ELF check and `cyrius test` all pass without ever touching it (`cyrius
+  test` builds a host binary, so every assertion runs the Linux arm). The step
+  builds with the same `CYRIUS_DCE=1` flags as the Linux build and `cmp`s the
+  two images — identical output means the `#ifdef` arm was not taken and fails
+  the job. Proves compilation and selection only; nothing executes it.
+
+### Tests
+- **52 → 69 assertions.** New groups: `url-reject-injection` (CRLF, LF, tab and
+  space refused in host and path; ordinary and percent-encoded URLs still
+  accepted, so the check cannot over-reject) and `credential-headers`
+  (case-insensitive matching, non-credentials not matched, and short/empty
+  header lines that must not overrun).
+- `tests/whirl.tcyr` now exits via `syscall(SYS_EXIT, …)` rather than a bare
+  `syscall(60, …)`, matching the project idiom.
+
+### Known latent (found and confirmed, deliberately not fixed here)
+- The crawl has no **scheme** confinement: an `https` crawl follows same-host
+  `http://` links over cleartext. Same-host is enforced; same-scheme is not.
+- `robots.txt` is fetched from port 80/443 rather than the port being crawled,
+  and relative links lose a non-default `:port` — `-r` is effectively unusable
+  against a non-default port. `_resolve_link` needs the `_authority` treatment
+  this release gave `_abs_location`.
+- `_save_tree` follows symlinks and truncates pre-existing files (`O_CREAT|O_TRUNC`).
+- `http_build_request` truncates an oversized request silently; no caller can
+  detect it. `_http_puts` clamps at `bufmax` and returns as if it wrote.
+- `_agnos_ca_hook` allocates 1 MiB per TLS connect and never reclaims it (bump
+  allocator), and probes only `/etc/ssl/cert.pem`. It may also now be redundant
+  — cyrius v6.2.23 fixed the `set_ca_system` agnos ABI it works around — but
+  removing it needs a run on real agnos.
+- `alloc()` failure is unchecked at every call site in `src/`.
+- `transport_fetch` and `transport_fetch_tls` remain near-duplicates; this
+  release had to fix the same read-loop bug in both.
+
+### Not validated here
+- **AGNOS runtime.** The new CI step and the local `--agnos` build are
+  **compile-only**. Several fixes touch code paths shared with the agnos arm
+  (`transport.cyr`'s read loops and send-all, `output.cyr`'s callers); a QEMU
+  smoke against a re-staged 0.6.6 rootfs is still owed, and iron on archaemenid
+  remains open.
+- The behavioral suite runs against local test servers over plain HTTP; the
+  fixes are transport-agnostic, but the TLS arm was exercised only by live
+  `https://example.com` / `https://github.com` fetches and a fail-closed check
+  against a local self-signed server.
+
 ## [0.6.5] — 2026-08-26 (toolchain 6.5.35; taar 0.5.0; vendored stdlib re-cut)
 
 Housekeeping cut: toolchain, substrate and vendored stdlib all move to the

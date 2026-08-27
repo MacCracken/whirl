@@ -11,11 +11,50 @@ var TRANSPORT_ERR_RESOLVE = 0 - 2;
 var TRANSPORT_ERR_SOCKET  = 0 - 3;
 var TRANSPORT_ERR_CONNECT = 0 - 4;
 var TRANSPORT_ERR_TLS     = 0 - 5;
+var TRANSPORT_ERR_SEND    = 0 - 6;
+
+# Set by every transport_fetch*: 1 when the read loop ended on a socket/TLS
+# ERROR or on filling rbuf, rather than on a clean peer close. Both loops used
+# to fold `n < 0` into the same branch as `n == 0`, so a mid-body timeout or RST
+# returned `total` as a SUCCESSFUL fetch and whirl wrote a truncated file with
+# exit 0. taar 0.5.0 separates the two on purpose (_TAAR_ERR_TIMEOUT = -11 vs 0
+# for a clean close) — this flag carries that distinction up to the caller,
+# which cross-checks it against Content-Length before trusting the bytes.
+# A flag rather than an error return: a peer that RSTs after sending a complete
+# Content-Length-delimited body is common, and must not become a hard failure.
+var _transport_incomplete = 0;
+fn transport_incomplete(): i64 { return _transport_incomplete; }
+
+# Send all of `len` bytes. taar_tcp_send is write(2) on Linux and sock_send#48
+# on agnos; BOTH document a short write ("bytes accepted, which may be < len —
+# the caller loops"), and the old call discarded the return entirely, so an
+# oversized -d body could be sent truncated under a Content-Length that promised
+# more. 0 is a legal transient (full tx buffer), so it is tolerated with a
+# bounded spin rather than treated as fatal — the same shape as taar's own
+# _taar_dns_tcp_send_all. Returns 0, or TRANSPORT_ERR_SEND.
+var _TRANSPORT_SEND_SPIN_MAX = 1000;
+fn _transport_send_all(fd, buf, len): i64 {
+    var off = 0;
+    var spin = 0;
+    while (off < len) {
+        var w = taar_tcp_send(fd, buf + off, len - off);
+        if (w < 0) { return TRANSPORT_ERR_SEND; }
+        if (w == 0) {
+            spin = spin + 1;
+            if (spin > _TRANSPORT_SEND_SPIN_MAX) { return TRANSPORT_ERR_SEND; }
+        } else {
+            spin = 0;
+            off = off + w;
+        }
+    }
+    return 0;
+}
 
 # Resolve `host` (cstr), open a TCP connection to host:port, send `req`, and read
 # the full response into rbuf (bounded by rbufmax). Returns total bytes read
 # (>= 0), or a TRANSPORT_ERR_* (< 0). Plain HTTP only.
 fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
+    _transport_incomplete = 0;
     var ip = taar_resolve_ipv4(host);
     if (ip < 0) { return TRANSPORT_ERR_RESOLVE; }
 
@@ -26,16 +65,20 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
     var cr = taar_tcp_connect(fd, ip, port);
     if (cr < 0) { taar_sock_close(fd); return TRANSPORT_ERR_CONNECT; }
 
-    taar_tcp_send(fd, req, reqlen);
+    if (_transport_send_all(fd, req, reqlen) < 0) {
+        taar_sock_close(fd);
+        return TRANSPORT_ERR_SEND;
+    }
 
     var total = 0;
     var go = 1;
     while (go == 1) {
-        var n = taar_tcp_recv(fd, rbuf + total, rbufmax - total);
-        if (n <= 0) { go = 0; }                      # 0 = peer closed; <0 = error
+        if (total >= rbufmax) { _transport_incomplete = 1; go = 0; }   # rbuf full — more may follow
         else {
-            total = total + n;
-            if (total >= rbufmax) { go = 0; }
+            var n = taar_tcp_recv(fd, rbuf + total, rbufmax - total);
+            if (n == 0) { go = 0; }                                    # clean peer close
+            elif (n < 0) { _transport_incomplete = 1; go = 0; }        # timeout / reset / errno
+            else { total = total + n; }
         }
     }
     taar_sock_close(fd);
@@ -110,6 +153,7 @@ fn _agnos_tls_native_connect(fd, host): i64 {
 # real socket fd; on agnos the fd is a sentinel so the transport + CA roots are
 # wired explicitly (set_transport + _agnos_ca_hook).
 fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
+    _transport_incomplete = 0;
     var ip = taar_resolve_ipv4(host);
     if (ip < 0) { return TRANSPORT_ERR_RESOLVE; }
 
@@ -137,16 +181,23 @@ fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
 #endif
     if (ctx == 0) { taar_sock_close(fd); return TRANSPORT_ERR_TLS; }
 
-    tls_write(ctx, req, reqlen);
+    # tls_write / tls_native_write already send-all internally — only the return
+    # code needs checking here, not a loop.
+    if (tls_write(ctx, req, reqlen) < 0) {
+        tls_close(ctx);
+        taar_sock_close(fd);
+        return TRANSPORT_ERR_SEND;
+    }
 
     var total = 0;
     var go = 1;
     while (go == 1) {
-        var n = tls_read(ctx, rbuf + total, rbufmax - total);
-        if (n <= 0) { go = 0; }
+        if (total >= rbufmax) { _transport_incomplete = 1; go = 0; }
         else {
-            total = total + n;
-            if (total >= rbufmax) { go = 0; }
+            var n = tls_read(ctx, rbuf + total, rbufmax - total);
+            if (n == 0) { go = 0; }                                    # close_notify → EOF
+            elif (n < 0) { _transport_incomplete = 1; go = 0; }        # TLS/socket error
+            else { total = total + n; }
         }
     }
     tls_close(ctx);

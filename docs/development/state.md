@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-08-26 (0.6.5 — toolchain 6.5.35, taar 0.5.0, vendored stdlib re-cut. Clears three releases of doc drift. Iron on archaemenid still the open validation step.)
+> **Last refresh**: 2026-08-27 (0.6.6 — P-1 security + correctness sweep: remote arbitrary file write via `-r`, request splitting via `Location`, cross-origin credential replay, and silent truncation all fixed. CI now compiles the AGNOS arm. Iron on archaemenid still the open validation step.)
 
 ---
 
@@ -10,14 +10,15 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.6.5** (HTTP/1.1 + HTTPS; GET/POST/methods + headers + `-A` UA; `-i`/`-I`/`-f`; **`-r` recursive** w/ tree-mirroring + robots.txt `Allow`/`Disallow` precedence, `-O`, `-C` **resume**, `--retry` — over the taar transport; **HTTP + HTTPS both run on AGNOS**, QEMU-validated at 0.6.2, rebuilt at 0.6.3 onto the sovereign `tls_native_*` path) |
+| Current version | **0.6.6** (HTTP/1.1 + HTTPS; GET/POST/methods + headers + `-A` UA; `-i`/`-I`/`-f`; **`-r` recursive** w/ tree-mirroring + robots.txt `Allow`/`Disallow` precedence, `-O`, `-C` **resume**, `--retry` — over the taar transport; **HTTP + HTTPS both run on AGNOS**, QEMU-validated at 0.6.2, rebuilt at 0.6.3 onto the sovereign `tls_native_*` path) |
 | Status | Working. `whirl [-X M] [-d DATA\|@file\|@-] [--data-binary D] [-H 'H: v'] [-A UA] [-i] [-I] [-f] [-r [-l N]] [-O\|-o FILE] [-C] [-L] [--retry N] http(s)://…` — resolve + connect (+ TLS) + request + emit/save; redirects (`-L`); recursive same-host crawl (`-r`); cert chain + hostname verified fail-closed. |
 | Module footprint | `src/{url,http,cli,transport,output,links,main}.cyr` (+ `test.cyr`) — 8 modules, 1,529 lines. url / http / links / path-normalize pure-tested; transport rides taar (TCP+DNS), with TLS for https. |
 | Cyrius pin | **6.5.35** (family-aligned with yo + taar; `dig` is the outlier at 6.2.24) |
 | Backends | **Linux** (raw-syscall TCP via taar; the `tls.cyr` facade for TLS) + **AGNOS** (taar's sovereign `sock_*`#47-50 / `udp_*`#51-54 / `getrandom`#45 backend, landed at taar 0.3.0; whirl I/O portable via `sys_write`/`sys_read`/chrono/io + `#ifdef` for mkdir/stat/append). HTTP + HTTPS both **QEMU-validated on agnos** at 0.6.2; since 0.6.3 the agnos handshake calls `tls_native_*` **directly** (`_agnos_tls_native_connect`) rather than the facade's `tls_connect`, because agnos binaries are static and cannot use the libssl/`fdlopen` bridge. `tls_read`/`tls_write`/`tls_close` are shared by both targets. **`net` is not in the `[deps].stdlib` include list** — the transport is sovereign. |
-| Tests | `tests/whirl.tcyr` → **52 assertions** across 13 groups (URL parse, HTTP framing, links extraction, path normalization); live: `http://example.com` + `https://example.com` fetch, reachable self-signed cert rejected fail-closed (exit 9). |
+| Tests | `tests/whirl.tcyr` → **69 assertions** across 15 groups (URL parse + injection rejection, HTTP framing, credential-header matching, links extraction, path normalization). Plus a **17-check paired behavioral suite** run out-of-tree against local servers: each 0.6.6 fix is proven by reproducing the defect on the prior binary first. Live: `http://example.com` + `https://example.com` fetch, `-L https://github.com` (575 KB chunked), reachable self-signed cert rejected fail-closed (exit 9). |
 | Family position | Third entry in the network-tools family (after yo + dig). Third `taar` consumer — drove taar's `socket` + `dns` modules (taar 0.2.0); `tls`/`http` module growth still open. |
 | Deps | stdlib base + **`[deps.taar]` 0.5.0** + the **opt-in crypto/TLS libs** (`chrono`/`ct`/`keccak`/`random`/`bayan`/`sigil`/`tls_native`/`tls` plus `dynlib`/`fdlopen` since 0.6.3, vendored via `cyrius lib sync` — wired into CI). No stdlib `net`/`sandhi`. `lib/` is gitignored; `cyrius.lock` (61 entries) is the committed record. |
+| Response cap | **1 MiB** (`WHIRL_RBUF_SZ`) for both the response buffer and a `-d @file` request body. Exceeding it is a reported error, never a silent truncation. |
 | Floors | **agnos ≥ 1.45.16** (0.6.2's kernel-leased resolver, `net_config`#61) · **taar ≥ 0.5.0** (fail-closed DNS query-ID entropy) · **cyrius ≥ v5.6.37** for the `dynlib`+`fdlopen` include rule. |
 
 ## AGNOS readiness
@@ -32,7 +33,21 @@ whirl needs **zero new kernel syscalls** — the full call surface (`sock_*`#47-
 |---|---|---|
 | `taar` `tls` / `http` modules | whirl is the consumer that would add them (`tcp` shipped at taar 0.2.0 and whirl runs on it) | whirl + taar |
 | Iron validation on archaemenid | hardware run over the r8169 NIC; parity benchmark vs `curl` | whirl + agnos |
-| CI compiles the AGNOS arm | `.github/workflows/` has no `--agnos` step, so an agnos-only break lands green (`yo` already gates this) | whirl |
+| QEMU smoke for 0.6.6 | 0.6.6 changed the shared read/send paths; the AGNOS arm is compile-verified only. Needs a re-staged rootfs. | whirl + agnos |
+
+## Open defects (confirmed, not yet fixed)
+
+Carried from the 0.6.6 audit — see [`../../CHANGELOG.md`](../../CHANGELOG.md) § 0.6.6 *Known latent* for detail.
+
+| Area | Defect |
+|---|---|
+| `-r` scheme confinement | an `https` crawl follows same-host `http://` links over cleartext |
+| `-r` on a non-default port | `robots.txt` fetched from :80/:443, and relative links lose `:port` |
+| `_save_tree` | follows symlinks; truncates pre-existing files |
+| `http_build_request` | truncates an oversized request silently; callers cannot detect it |
+| `_agnos_ca_hook` | 1 MiB leaked per TLS connect; probes only `/etc/ssl/cert.pem`; likely redundant since cyrius v6.2.23 |
+| `alloc()` | failure unchecked at every `src/` call site |
+| `transport.cyr` | `transport_fetch` / `transport_fetch_tls` remain near-duplicates |
 
 ## Pointers
 

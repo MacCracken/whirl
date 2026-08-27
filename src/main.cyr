@@ -10,7 +10,11 @@ include "src/cli.cyr"
 include "src/transport.cyr"
 include "src/output.cyr"
 
-var WHIRL_RBUF_SZ = 262144;   # 256 KB response cap (MVP)
+# Response cap. 256 KB truncated real pages silently (github.com's 575 KB
+# chunked body is the reported case) — 1 MiB covers ordinary documents, and a
+# body that still exceeds it is now REPORTED rather than silently cut short
+# (see transport_incomplete + _response_truncated).
+var WHIRL_RBUF_SZ = 1048576;
 
 # sys_write / sleep_ms are the portable stdlib wrappers — they route to the
 # right syscall number on Linux AND agnos (raw syscall(1)/(35) would be wrong on
@@ -52,6 +56,47 @@ fn _materialize_argv(ac): i64 {
     return av;
 }
 
+# Same origin = same scheme, host (case-insensitive) and port.
+fn _ci_streq(a, b): i64 {
+    var i = 0;
+    while (1 == 1) {
+        var x = load8(a + i);
+        var y = load8(b + i);
+        if ((x >= 65) && (x <= 90)) { x = x + 32; }
+        if ((y >= 65) && (y <= 90)) { y = y + 32; }
+        if (x != y) { return 0; }
+        if (x == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _same_origin(is_https, host, port, u2): i64 {
+    if (is_https != url_is_https(u2)) { return 0; }
+    if (port != url_port(u2)) { return 0; }
+    if (_ci_streq(host, url_host(u2)) == 0) { return 0; }
+    return 1;
+}
+
+# Copy `hdrs` minus any credential header into _stripped_hdrs; returns the new
+# count. A fresh array rather than an in-place edit, so the caller's -H list is
+# left intact for any later use.
+var _stripped_hdrs = 0;
+fn _strip_credentials(hdrs, nhdrs): i64 {
+    _stripped_hdrs = alloc((nhdrs + 1) * 8);
+    var n = 0;
+    var i = 0;
+    while (i < nhdrs) {
+        var h = load64(hdrs + i * 8);
+        if (http_hdr_is_credential(h) == 0) {
+            store64(_stripped_hdrs + n * 8, h);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
 fn _print_help(): i64 {
     _puts("whirl — curl + wget unified, in sovereign Cyrius.\n\n");
     _puts("usage: whirl [-X METHOD] [-d DATA] [-H 'H: v'] [-o FILE] [-L] <url>\n");
@@ -89,8 +134,14 @@ fn _dup_location(resp, total, lv): i64 {
 
 # Emit the body of a parsed response (dechunk if needed; honor Content-Length).
 fn _emit_body(rbuf, total, outfile): i64 {
+    # A truncated transfer must never be written out as if it were complete.
+    if (_response_truncated(rbuf, total) == 1) {
+        _warn_truncated("body");
+        return 9;
+    }
     if ((cli_include() == 1) || (cli_head() == 1)) {
-        output_write(rbuf, total, outfile);   # -i/-I: status line + headers [+ body] verbatim
+        # -i/-I: status line + headers [+ body] verbatim
+        if (output_write(rbuf, total, outfile) < 0) { _eputs("whirl: write failed\n"); return 9; }
         return 0;
     }
     var bo = http_body_offset(rbuf, total);
@@ -100,14 +151,58 @@ fn _emit_body(rbuf, total, outfile): i64 {
         var out = alloc(WHIRL_RBUF_SZ);
         var dn = http_dechunk(rbuf + bo, blen, out, WHIRL_RBUF_SZ);
         if (dn < 0) { _eputs("whirl: malformed chunked body\n"); return 9; }
-        output_write(out, dn, outfile);
+        if (output_write(out, dn, outfile) < 0) { _eputs("whirl: write failed\n"); return 9; }
     } else {
         var cl = http_content_length(rbuf, total);
         if (cl >= 0) {
             if (cl < blen) { blen = cl; }
         }
-        output_write(rbuf + bo, blen, outfile);
+        if (output_write(rbuf + bo, blen, outfile) < 0) { _eputs("whirl: write failed\n"); return 9; }
     }
+    return 0;
+}
+
+# Did we receive the WHOLE body? Only consulted when transport_incomplete() is
+# set (the read ended on an error or on a full rbuf rather than a clean close).
+# A server that RSTs after delivering a complete Content-Length-delimited body
+# is common and must still count as success, so the length is the arbiter;
+# without a Content-Length there is nothing to check against and the transfer
+# has to be treated as truncated.
+# Is this response short of what it promised? Runs on EVERY response, not only
+# when transport_incomplete() is set: a server that sends fewer bytes than its
+# Content-Length and then closes CLEANLY looks like a normal EOF to the read
+# loop, so the flag alone would miss the most common truncation of all.
+# Returns 1 when the transfer must be treated as failed.
+fn _response_truncated(rbuf, total): i64 {
+    if (cli_head() == 1) { return 0; }          # HEAD: Content-Length describes the absent body
+    var st = http_status_code(rbuf, total);
+    if (st == 204) { return 0; }                # No Content
+    if (st == 304) { return 0; }                # Not Modified — no body
+    if (http_is_chunked(rbuf, total) == 1) {
+        # A cut-short chunked stream fails in http_dechunk already; only an
+        # error/cap stop is invisible there.
+        if (transport_incomplete() == 1) { return 1; }
+        return 0;
+    }
+    var bo = http_body_offset(rbuf, total);
+    if (bo < 0) { return 0; }
+    var cl = http_content_length(rbuf, total);
+    if (cl >= 0) {
+        if ((total - bo) < cl) { return 1; }    # short of the promised length
+        return 0;
+    }
+    # No Content-Length and no chunking: the body is close-delimited, so only a
+    # non-clean end (error or a full rbuf) tells us anything is missing.
+    if (transport_incomplete() == 1) { return 1; }
+    return 0;
+}
+
+fn _warn_truncated(what): i64 {
+    _eputs("whirl: incomplete response (");
+    _eputs(what);
+    _eputs(") — connection ended early or exceeded the ");
+    _eput_int(WHIRL_RBUF_SZ);
+    _eputs("-byte cap\n");
     return 0;
 }
 
@@ -183,6 +278,46 @@ fn _resolve_link(link, base_https, base_host, base_path): i64 {
     return _concat2(_concat2(pfx, base_host), np);
 }
 
+# "host" or "host:port" — the authority to rebuild an absolute URL with. The
+# port must survive: dropping it turned every redirect on a non-default port
+# into a request to :80/:443.
+fn _authority(host, is_https, port): i64 {
+    var defport = 80;
+    if (is_https == 1) { defport = 443; }
+    if (port == defport) { return host; }
+    var tmp[24];
+    var nl = fmt_int_buf(port, &tmp);
+    var lh = strlen(host);
+    var d = alloc(lh + nl + 2);
+    var i = 0;
+    while (i < lh) { store8(d + i, load8(host + i)); i = i + 1; }
+    store8(d + lh, 58);                                   # ':'
+    var k = 0;
+    while (k < nl) { store8(d + lh + 1 + k, load8(&tmp + k)); k = k + 1; }
+    store8(d + lh + 1 + nl, 0);
+    return d;
+}
+
+# Resolve a `Location:` value against the current request into an absolute URL.
+# RFC 9110 permits a relative Location and real sites use one (a bare "/docs/"
+# is common); whirl previously handed it straight to url_parse, which rejects
+# anything without a scheme — so -L silently stopped following and exited 0 with
+# the redirect stub as the "result". Mirrors _resolve_link's shape, but keeps
+# the port, which _resolve_link drops.
+fn _abs_location(loc, is_https, host, port, path): i64 {
+    if (_starts(loc, "http://") == 1) { return loc; }
+    if (_starts(loc, "https://") == 1) { return loc; }
+    var sch = "http:";
+    if (is_https == 1) { sch = "https:"; }
+    if ((load8(loc) == 47) && (load8(loc + 1) == 47)) { return _concat2(sch, loc); }   # //host/path
+    if (_has_scheme_colon(loc) == 1) { return 0; }        # mailto:/javascript:/...
+    var pfx = "http://";
+    if (is_https == 1) { pfx = "https://"; }
+    var base = _concat2(pfx, _authority(host, is_https, port));
+    if (load8(loc) == 47) { return _concat2(base, links_path_normalize(loc)); }        # root-relative
+    return _concat2(base, links_path_normalize(_concat2(_path_dir(path), loc)));       # relative
+}
+
 # mkdir; EEXIST ignored by the caller. The two targets' sys_mkdir signatures
 # differ (Linux (path, mode) vs agnos (path, pathlen)), so branch on the target.
 fn _mkdir(path): i64 {
@@ -196,16 +331,37 @@ fn _mkdir(path): i64 {
 #endif
 }
 
+# 1 if `len` bytes of `path` are safe to mirror under cwd — i.e. no ".."
+# segment. A crawled page controls these bytes, and _save_tree turns them into a
+# filesystem path, so an unchecked "/../../../../home/user/.bashrc" (which
+# _resolve_link passes through verbatim for absolute same-host links) is a
+# remote arbitrary-file-write. Checked here, at the single point that touches
+# the filesystem, rather than trusting any particular caller to normalize.
+fn _path_no_dotdot(path, len): i64 {
+    var i = 0;
+    while (i < len) {
+        var seg = i;
+        while ((i < len) && (load8(path + i) != 47)) { i = i + 1; }
+        if (((i - seg) == 2) && (load8(path + seg) == 46) && (load8(path + seg + 1) == 46)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
 # Save buf[0..len) to a file mirroring `path` as a directory tree under cwd:
 # "/docs/g.html" -> docs/g.html (mkdir docs); "/" or "/d/" -> .../index.html.
+# Returns 0 on success, or < 0 if the path is unsafe or the write failed.
 fn _save_tree(path, buf, len): i64 {
     var n = strlen(path);
     var end = 0;
     while ((end < n) && (load8(path + end) != 63)) { end = end + 1; }   # strip ?query
+    if (_path_no_dotdot(path, end) == 0) { return 0 - 1; }
     var rp = alloc(end + 12);
     var w = 0;
     var i = 0;
-    if ((end > 0) && (load8(path) == 47)) { i = 1; }   # strip leading '/'
+    # Strip EVERY leading '/', not just one: "//tmp/x" would otherwise leave
+    # "/tmp/x" and escape cwd as an absolute path.
+    while ((i < end) && (load8(path + i) == 47)) { i = i + 1; }
     while (i < end) { store8(rp + w, load8(path + i)); w = w + 1; i = i + 1; }
     var need_index = 0;
     if (w == 0) { need_index = 1; }
@@ -225,7 +381,9 @@ fn _save_tree(path, buf, len): i64 {
         }
         j = j + 1;
     }
-    return file_write_all(rp, buf, len);
+    var wr = file_write_all(rp, buf, len);
+    if (wr < 0) { return wr; }
+    return 0;
 }
 
 fn _seen(visited, nvis, url): i64 {
@@ -391,14 +549,46 @@ fn _crawl(start_url, base_host, base_https, maxdepth): i64 {
         else { total = transport_fetch(uh, url_port(u), req, reqlen, rbuf, WHIRL_RBUF_SZ); }
         if (total < 0) { _eputs("whirl: fetch failed: "); _eputs(url); _eputs("\n"); continue; }
 
+        if (_response_truncated(rbuf, total) == 1) {
+            _eputs("whirl: incomplete, skipped "); _eputs(url); _eputs("\n");
+            continue;
+        }
+        # Only mirror what was actually served. Without this a 404/500/3xx error
+        # page was written to disk under the requested resource's name.
+        var st = http_status_code(rbuf, total);
+        if ((st < 200) || (st >= 300)) {
+            _eputs("whirl: HTTP "); _eput_int(st); _eputs(", skipped "); _eputs(url); _eputs("\n");
+            continue;
+        }
         var bo = http_body_offset(rbuf, total);
         if (bo < 0) { continue; }
-        _save_tree(url_path(u), rbuf + bo, total - bo);
+        # Decode before saving. The crawl used to write rbuf verbatim, so a
+        # chunked response landed on disk with its hex chunk framing still in
+        # it — a corrupt file that also broke link extraction below.
+        var sbuf = rbuf + bo;
+        var slen = total - bo;
+        if (http_is_chunked(rbuf, total) == 1) {
+            var dout = alloc(WHIRL_RBUF_SZ);
+            var dlen = http_dechunk(sbuf, slen, dout, WHIRL_RBUF_SZ);
+            if (dlen < 0) {
+                _eputs("whirl: malformed chunked body, skipped "); _eputs(url); _eputs("\n");
+                continue;
+            }
+            sbuf = dout;
+            slen = dlen;
+        } else {
+            var ccl = http_content_length(rbuf, total);
+            if (ccl >= 0) { if (ccl < slen) { slen = ccl; } }
+        }
+        if (_save_tree(url_path(u), sbuf, slen) < 0) {
+            _eputs("whirl: unsafe or unwritable path, skipped "); _eputs(url); _eputs("\n");
+            continue;
+        }
         _eputs("whirl: saved "); _eputs(url_path(u)); _eputs("\n");
 
         if (depth < maxdepth) {
             var links = alloc(64 * 8);
-            var nl = links_extract(rbuf + bo, total - bo, links, 64);
+            var nl = links_extract(sbuf, slen, links, 64);
             var k = 0;
             while (k < nl) {
                 var resolved = _resolve_link(load64(links + k * 8), url_is_https(u), base_host, url_path(u));
@@ -428,6 +618,17 @@ fn main() {
     if (rc == CLI_HELP) { _print_help(); return 0; }
     if (rc == CLI_ERR)  { _eputs("whirl: usage: whirl [-o FILE] [-L] <url>\n"); return 2; }
 
+    if (cli_bodyerr() == CLI_BODY_ENOENT) {
+        _eputs("whirl: cannot read request body file\n");
+        return 2;
+    }
+    if (cli_bodyerr() == CLI_BODY_TOOBIG) {
+        _eputs("whirl: request body exceeds the ");
+        _eput_int(1048576);
+        _eputs("-byte cap\n");
+        return 2;
+    }
+
     if (cli_useragent() != 0) { http_set_user_agent(cli_useragent()); }   # -A override
 
     var u = url_new();
@@ -440,6 +641,7 @@ fn main() {
     var port = url_port(u);
     var path = url_path(u);
     var hops = 0;
+    var drop_creds = 0;      # set once a redirect crosses origin (see below)
     var rbuf = alloc(WHIRL_RBUF_SZ);
 
     # -o FILE wins; else -O derives the name from the URL path.
@@ -467,6 +669,7 @@ fn main() {
         var hdrs = cli_hdrs();
         var nhdrs = cli_nhdrs();
         if (hops > 0) { meth = "GET"; bdy = 0; blen = 0; }
+        if (drop_creds == 1) { nhdrs = _strip_credentials(hdrs, nhdrs); hdrs = _stripped_hdrs; }
         if ((hops == 0) && (resume_off > 0)) {     # -C: add Range to the first request
             var aug = alloc((nhdrs + 1) * 8);
             var hi = 0;
@@ -502,15 +705,22 @@ fn main() {
         if ((cli_follow() == 1) && (status >= 300) && (status < 400) && (hops < 10)) {
             var lv = http_header_value(rbuf, total, "location");
             if (lv >= 0) {
-                var loc = _dup_location(rbuf, total, lv);
+                var loc = _abs_location(_dup_location(rbuf, total, lv), is_https, host, port, path);
                 var u2 = url_new();
+                if (loc != 0) {
                 if (url_parse(loc, u2) == URL_PARSE_OK) {
+                    # Cross-origin hop: drop caller-supplied credentials. They
+                    # were previously replayed verbatim, so a 302 from any site
+                    # whirl was given an -H 'Authorization: ...' for could
+                    # harvest that credential by pointing at a host it controls.
+                    if (_same_origin(is_https, host, port, u2) == 0) { drop_creds = 1; }
                     is_https = url_is_https(u2);
                     host = url_host(u2);
                     port = url_port(u2);
                     path = url_path(u2);
                     hops = hops + 1;
                     redirect = 1;
+                }
                 }
             }
         }

@@ -72,6 +72,25 @@ fn _url_dup_range(src, len): i64 {
     return d;
 }
 
+# 1 if the `len` bytes at `s` are safe to place in a request line or a Host
+# header: no controls, no space, no DEL. RFC 9110 forbids all of them in a
+# request target, and whirl writes host/path into the request UNESCAPED — so a
+# bare LF in a redirect `Location:` (which _dup_location stops only on CR) would
+# otherwise splice attacker-chosen header lines, or a whole second request, into
+# the request sent to the redirect TARGET. Validating here covers every source
+# of a URL at once: the command line, `Location:`, and crawled hrefs.
+# High bytes (>= 128) are left alone so UTF-8 / IDN paths still parse.
+fn _url_bytes_clean(s, len): i64 {
+    var i = 0;
+    while (i < len) {
+        var c = load8(s + i);
+        if ((c >= 0) && (c <= 32)) { return 0; }   # CTL + space
+        if (c == 127) { return 0; }                # DEL
+        i = i + 1;
+    }
+    return 1;
+}
+
 # Parse `len` decimal digits at `s` → value, or -1 on any non-digit / empty.
 fn _url_parse_uint(s, len): i64 {
     if (len <= 0) { return 0 - 1; }
@@ -124,6 +143,7 @@ fn url_parse(url, u): i64 {
         if (port > 65535) { return URL_PARSE_FAIL; }
     }
     if (host_end == 0) { return URL_PARSE_FAIL; }
+    if (_url_bytes_clean(p, host_end) == 0) { return URL_PARSE_FAIL; }
 
     var host = _url_dup_range(p, host_end);
 
@@ -134,6 +154,7 @@ fn url_parse(url, u): i64 {
         var q = p + hostlen;
         var pl = 0;
         while (load8(q + pl) != 0) { pl = pl + 1; }
+        if (_url_bytes_clean(q, pl) == 0) { return URL_PARSE_FAIL; }
         path = _url_dup_range(q, pl);
     }
 

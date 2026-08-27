@@ -62,6 +62,32 @@ jobs:
       - name: Verify ELF
         run: xxd -l 4 build/whirl | grep -q "7f45 4c46"
 
+      - name: Build (AGNOS target)
+        # NOT redundant with the Build step above. whirl has no src/platform.cyr
+        # split — the AGNOS backend is inline `#ifdef CYRIUS_TARGET_AGNOS` blocks
+        # in src/transport.cyr, src/main.cyr and src/output.cyr — so the host
+        # build compiles the `#ifndef` arm and NEVER touches the agnos one.
+        # Until this step existed nothing in CI compiled the AGNOS backend at
+        # all: a hard break inside an agnos-only block landed green while lint,
+        # the Linux build, the ELF check and `cyrius test` all passed. `cyrius
+        # test` cannot cover it either — the test binary is a host build, so
+        # every assertion runs against the Linux arm.
+        #
+        # Same flags as the Linux build above (CYRIUS_DCE=1) so the `cmp` is
+        # meaningful: identical images would mean the #ifdef arm was not taken.
+        # This proves only that the arm COMPILES and IS SELECTED — nothing
+        # executes it. Runtime coverage is the QEMU smoke, which needs sibling
+        # checkouts + QEMU/OVMF a GitHub runner does not have and so stays a
+        # manual gate (docs/development/state.md § AGNOS readiness).
+        run: |
+          CYRIUS_DCE=1 cyrius build --agnos src/main.cyr build/whirl-agnos
+          echo "whirl-agnos: $(wc -c < build/whirl-agnos) bytes"
+          if cmp -s build/whirl build/whirl-agnos; then
+            echo "AGNOS image is identical to the Linux build — the #ifdef arm was not taken"
+            exit 1
+          fi
+          echo "AGNOS arm compiled and selected"
+
       - name: Test
         # bare `cyrius test` runs the [build].test entry AND auto-discovers
         # tests/*.tcyr (the unit suite lands with the transport bite).

@@ -45,17 +45,30 @@ fn _http_put_int(buf, pos, bufmax, n): i64 {
     return pos;
 }
 
-# Does header line `h` start with "content-type:" (case-insensitive)?
-fn _http_hdr_is_content_type(h): i64 {
-    var ct = "content-type:";
+# Does header line `h` start with the lowercase literal `name` (which must
+# include the trailing ':'), case-insensitively? Safe against a short header
+# line: load8 walks into h's NUL, which mismatches and returns 0 before
+# overrunning. Generalized from the old content-type-only form so the redirect
+# path can also recognise credential headers by name.
+fn _http_hdr_name_is(h, name): i64 {
     var i = 0;
-    while (load8(ct + i) != 0) {
+    while (load8(name + i) != 0) {
         var c = load8(h + i);
         if ((c >= 65) && (c <= 90)) { c = c + 32; }   # lowercase
-        if (c != load8(ct + i)) { return 0; }
+        if (c != load8(name + i)) { return 0; }
         i = i + 1;
     }
     return 1;
+}
+
+# 1 if header line `h` carries credentials that must NOT survive a cross-origin
+# redirect. Matches curl/wget behaviour: a 302 to another origin gets a fresh
+# request with no caller-supplied Authorization / Cookie.
+fn http_hdr_is_credential(h): i64 {
+    if (_http_hdr_name_is(h, "authorization:") == 1) { return 1; }
+    if (_http_hdr_name_is(h, "cookie:") == 1) { return 1; }
+    if (_http_hdr_name_is(h, "proxy-authorization:") == 1) { return 1; }
+    return 0;
 }
 
 # Build an HTTP/1.1 request: "<method> <path>" + Host/UA/Accept/Connection, then
@@ -71,14 +84,14 @@ fn http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, buf, bufma
     p = _http_puts(buf, p, bufmax, host);
     p = _http_puts(buf, p, bufmax, "\r\nUser-Agent: ");
     if (_http_ua != 0) { p = _http_puts(buf, p, bufmax, _http_ua); }
-    else { p = _http_puts(buf, p, bufmax, "whirl/0.6.5"); }
+    else { p = _http_puts(buf, p, bufmax, "whirl/0.6.6"); }
     p = _http_puts(buf, p, bufmax, "\r\nAccept: */*\r\nConnection: close\r\n");
 
     var has_ct = 0;
     var i = 0;
     while (i < nhdrs) {
         var h = load64(hdrs + i * 8);
-        if (_http_hdr_is_content_type(h) == 1) { has_ct = 1; }
+        if (_http_hdr_name_is(h, "content-type:") == 1) { has_ct = 1; }
         p = _http_puts(buf, p, bufmax, h);
         p = _http_puts(buf, p, bufmax, "\r\n");
         i = i + 1;

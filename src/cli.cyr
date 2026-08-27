@@ -64,13 +64,29 @@ fn _cli_read_fd(fd): i64 {
 # Resolve a -d value: "@file" reads the file, "@-" reads stdin, else literal.
 # Returns the body cstr/buffer and sets _cli_bodylen. `file_read_all` (io) is
 # portable open+read+close across Linux / agnos.
+# Set when a -d/--data-binary body could not be loaded: 1 = file unreadable,
+# 2 = file larger than the cap. Both used to be silent — a missing @file
+# downgraded the request to a bodyless GET, and an oversized one was truncated
+# and sent under a Content-Length that matched the TRUNCATED length, so the
+# server stored a short body and everyone reported success.
+var CLI_BODY_OK      = 0;
+var CLI_BODY_ENOENT  = 1;
+var CLI_BODY_TOOBIG  = 2;
+var _cli_bodyerr = 0;
+fn cli_bodyerr(): i64 { return _cli_bodyerr; }
+
+var _CLI_BODY_MAX = 1048576;   # 1 MiB request-body cap
+
 fn _cli_load_data(arg): i64 {
     if (load8(arg) == 64) {   # '@'
         var src = arg + 1;
         if ((load8(src) == 45) && (load8(src + 1) == 0)) { return _cli_read_fd(0); }   # @-
-        var buf = alloc(262144);
-        var n = file_read_all(src, buf, 262144);
-        if (n < 0) { _cli_bodylen = 0; return 0; }
+        # One byte of headroom: a read that fills MAX+1 means the file is larger
+        # than the cap, which is an error rather than something to silently cut.
+        var buf = alloc(_CLI_BODY_MAX + 1);
+        var n = file_read_all(src, buf, _CLI_BODY_MAX + 1);
+        if (n < 0) { _cli_bodyerr = CLI_BODY_ENOENT; _cli_bodylen = 0; return 0; }
+        if (n > _CLI_BODY_MAX) { _cli_bodyerr = CLI_BODY_TOOBIG; _cli_bodylen = 0; return 0; }
         _cli_bodylen = n;
         return buf;
     }
@@ -87,6 +103,7 @@ fn cli_parse(ac, av): i64 {
     _cli_method = 0;
     _cli_body = 0;
     _cli_bodylen = 0;
+    _cli_bodyerr = CLI_BODY_OK;
     _cli_hdrs = alloc(_CLI_MAX_HDRS * 8);
     _cli_nhdrs = 0;
     _cli_remote = 0;
