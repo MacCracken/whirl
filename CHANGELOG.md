@@ -92,13 +92,31 @@ over-block).
   builds with the same `CYRIUS_DCE=1` flags as the Linux build and `cmp`s the
   two images — identical output means the `#ifdef` arm was not taken and fails
   the job. Proves compilation and selection only; nothing executes it.
+- **CI runs the new behavioral suite** against the built binary, so a regression
+  in any of this release's security fixes fails the job rather than shipping.
 
 ### Tests
-- **52 → 69 assertions.** New groups: `url-reject-injection` (CRLF, LF, tab and
-  space refused in host and path; ordinary and percent-encoded URLs still
-  accepted, so the check cannot over-reject) and `credential-headers`
-  (case-insensitive matching, non-credentials not matched, and short/empty
-  header lines that must not overrun).
+- **New `tests/behavior.py` — an end-to-end behavioral suite, now checked in and
+  gated in CI.** `tests/whirl.tcyr` covers pure logic, so none of the defects
+  above were reachable from it: they live in the interaction between the CLI,
+  the transport and the filesystem, and need a real binary with a real working
+  directory and a server that answers adversarially. Every fix in this release
+  is asserted there.
+  - Run standalone (`python3 tests/behavior.py build/whirl`) it checks the 12
+    assertions that must hold for the build to ship — and it has teeth: run
+    against the 0.6.5 binary, 7 of the 12 fail and it exits 1.
+  - Run with `--baseline <pre-0.6.6 binary>` each security check becomes a
+    **paired** test that first reproduces the defect on the old binary (19
+    checks). A failed control then means the check has stopped exercising the
+    vulnerable path — a silent false pass — rather than a broken build.
+  - Python because Cyrius has no test-harness/scripting spinoff yet; it should
+    move over when one exists. Nothing in it needs Python specifically.
+- **52 → 69 assertions** in `tests/whirl.tcyr`. New groups:
+  `url-reject-injection` (CRLF, LF, tab and space refused in host and path;
+  ordinary and percent-encoded URLs still accepted, so the check cannot
+  over-reject) and `credential-headers` (case-insensitive matching,
+  non-credentials not matched, and short/empty header lines that must not
+  overrun).
 - `tests/whirl.tcyr` now exits via `syscall(SYS_EXIT, …)` rather than a bare
   `syscall(60, …)`, matching the project idiom.
 

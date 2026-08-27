@@ -93,6 +93,24 @@ jobs:
         # tests/*.tcyr (the unit suite lands with the transport bite).
         run: cyrius test
 
+      - name: Behavioral suite
+        # tests/whirl.tcyr covers pure logic only. The 0.6.6 security fixes live
+        # in the interaction between CLI, transport and filesystem — a remote
+        # arbitrary file write via -r, request splitting via Location, credential
+        # replay across origins, silent truncation — and none of those are
+        # reachable without a real binary, a real cwd and a server that answers
+        # adversarially. This suite supplies all three.
+        #
+        # Written in Python because Cyrius has no test-harness/scripting spinoff
+        # yet; it should move over when one exists. Nothing here needs Python
+        # specifically — a socket server, a subprocess and a scratch directory.
+        #
+        # Runs standalone here (no --baseline), so only the assertions that must
+        # hold for the build to ship are checked. Locally, pass a pre-0.6.6
+        # binary as --baseline to also reproduce each defect first, which proves
+        # the check still exercises the vulnerable path.
+        run: python3 tests/behavior.py build/whirl
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest
