@@ -50,6 +50,32 @@ fn _transport_send_all(fd, buf, len): i64 {
     return 0;
 }
 
+# The response read loop, shared by both fetch paths. It exists once because
+# the policy in it is subtle and was previously duplicated: the two copies had
+# to be fixed in lockstep when error-vs-EOF conflation was found, and a third
+# consumer would have had to remember. `mode` selects the reader with a direct
+# call rather than a function pointer — the AGNOS arm has no executed test
+# coverage, so this keeps its hot path on the same mechanism it already ships.
+#   mode 0 = plain socket (handle = fd), mode 1 = TLS (handle = ctx)
+var _TRANSPORT_READ_SOCK = 0;
+var _TRANSPORT_READ_TLS  = 1;
+fn _transport_read_all(mode, handle, rbuf, rbufmax): i64 {
+    var total = 0;
+    var go = 1;
+    while (go == 1) {
+        if (total >= rbufmax) { _transport_incomplete = 1; go = 0; }   # rbuf full — more may follow
+        else {
+            var n = 0;
+            if (mode == _TRANSPORT_READ_TLS) { n = tls_read(handle, rbuf + total, rbufmax - total); }
+            else { n = taar_tcp_recv(handle, rbuf + total, rbufmax - total); }
+            if (n == 0) { go = 0; }                                    # clean close / close_notify
+            elif (n < 0) { _transport_incomplete = 1; go = 0; }        # timeout / reset / TLS error
+            else { total = total + n; }
+        }
+    }
+    return total;
+}
+
 # Resolve `host` (cstr), open a TCP connection to host:port, send `req`, and read
 # the full response into rbuf (bounded by rbufmax). Returns total bytes read
 # (>= 0), or a TRANSPORT_ERR_* (< 0). Plain HTTP only.
@@ -70,17 +96,7 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
         return TRANSPORT_ERR_SEND;
     }
 
-    var total = 0;
-    var go = 1;
-    while (go == 1) {
-        if (total >= rbufmax) { _transport_incomplete = 1; go = 0; }   # rbuf full — more may follow
-        else {
-            var n = taar_tcp_recv(fd, rbuf + total, rbufmax - total);
-            if (n == 0) { go = 0; }                                    # clean peer close
-            elif (n < 0) { _transport_incomplete = 1; go = 0; }        # timeout / reset / errno
-            else { total = total + n; }
-        }
-    }
+    var total = _transport_read_all(_TRANSPORT_READ_SOCK, fd, rbuf, rbufmax);
     taar_sock_close(fd);
     return total;
 }
@@ -94,14 +110,34 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
 # this hook (called by _agnos_tls_native_connect AFTER new_client) reads the
 # staged /etc/ssl/cert.pem with the correct agnos ABI and installs it via
 # tls_native_set_ca_bundle — the roots the chain then verifies against.
-fn _agnos_ca_hook(hook_ctx, nctx): i64 {
-    var path = "/etc/ssl/cert.pem";
-    var nl = 0;
-    while (load8(path + nl) != 0) { nl = nl + 1; }
-    var fd = sys_open(path, nl, 0);
-    if (fd < 0) { return 0; }                  # no bundle staged → leave roots empty
+# The loaded bundle, cached across connects. The allocator is a bump allocator
+# with no free, so the old per-connect alloc(1 MiB) was permanently retained on
+# every TLS connection — ~1 MiB leaked per redirect hop and per crawled resource.
+var _agnos_ca_buf = 0;
+var _agnos_ca_len = 0;
+
+fn _agnos_ca_load(): i64 {
+    if (_agnos_ca_buf != 0) { return 0; }      # already loaded
+    # Distributions disagree on where the bundle lives; probe the common layouts
+    # rather than assuming one. Previously only the first was tried, so an image
+    # with a Debian/RHEL trust store had no roots at all and every HTTPS
+    # handshake failed closed — correct, but for the wrong reason.
+    var fd = 0 - 1;
+    var i = 0;
+    while ((i < 4) && (fd < 0)) {
+        var path = "/etc/ssl/cert.pem";
+        if (i == 1) { path = "/etc/ssl/certs/ca-certificates.crt"; }
+        if (i == 2) { path = "/etc/pki/tls/certs/ca-bundle.crt"; }
+        if (i == 3) { path = "/etc/ssl/ca-bundle.pem"; }
+        var nl = 0;
+        while (load8(path + nl) != 0) { nl = nl + 1; }
+        fd = sys_open(path, nl, 0);
+        i = i + 1;
+    }
+    if (fd < 0) { return 0 - 1; }              # no bundle staged → leave roots empty
     var cap = 1048576;
     var buf = alloc(cap);
+    if (buf == 0) { sys_close(fd); return 0 - 1; }   # never store into address 0
     var total = 0;
     var go = 1;
     while (go == 1) {
@@ -113,7 +149,15 @@ fn _agnos_ca_hook(hook_ctx, nctx): i64 {
         }
     }
     sys_close(fd);
-    if (total > 0) { tls_native_set_ca_bundle(nctx, buf, total, 0); }
+    if (total <= 0) { return 0 - 1; }
+    _agnos_ca_buf = buf;
+    _agnos_ca_len = total;
+    return 0;
+}
+
+fn _agnos_ca_hook(hook_ctx, nctx): i64 {
+    if (_agnos_ca_load() < 0) { return 0; }
+    tls_native_set_ca_bundle(nctx, _agnos_ca_buf, _agnos_ca_len, 0);
     return 0;
 }
 
@@ -189,17 +233,7 @@ fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
         return TRANSPORT_ERR_SEND;
     }
 
-    var total = 0;
-    var go = 1;
-    while (go == 1) {
-        if (total >= rbufmax) { _transport_incomplete = 1; go = 0; }
-        else {
-            var n = tls_read(ctx, rbuf + total, rbufmax - total);
-            if (n == 0) { go = 0; }                                    # close_notify → EOF
-            elif (n < 0) { _transport_incomplete = 1; go = 0; }        # TLS/socket error
-            else { total = total + n; }
-        }
-    }
+    var total = _transport_read_all(_TRANSPORT_READ_TLS, ctx, rbuf, rbufmax);
     tls_close(ctx);
     taar_sock_close(fd);
     return total;

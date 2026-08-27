@@ -94,6 +94,10 @@ fn _url_bytes_clean(s, len): i64 {
 # Parse `len` decimal digits at `s` → value, or -1 on any non-digit / empty.
 fn _url_parse_uint(s, len): i64 {
     if (len <= 0) { return 0 - 1; }
+    # Bail before the multiply can wrap. A long digit run overflowed i64 and
+    # could land back in 1..65535, defeating the caller's port range check —
+    # ":18446744073709551696" parsed as port 80.
+    if (len > 10) { return 0 - 1; }
     var v = 0;
     var i = 0;
     while (i < len) {

@@ -15,11 +15,19 @@ socket server, a subprocess and a scratch directory.
                                      [--workdir DIR] [--keep]
 
 Without --baseline, every assertion runs against <whirl-binary> alone: these are
-the checks that must hold for the build to ship. With --baseline pointing at a
-pre-0.6.6 binary, each security check additionally runs as a *paired* test — it
-first reproduces the defect on the old binary, so a check that silently stopped
-exercising the vulnerable path shows up as a failed control rather than a false
-pass. That pairing is why these fixes are trustworthy; keep it when you can.
+the checks that must hold for the build to ship, and they are what CI runs.
+
+With --baseline pointing at an older binary, each fix additionally runs as a
+*paired* test: the defect is first reproduced on the old binary, so a check that
+has silently stopped exercising the vulnerable path shows up as a failed control
+rather than a false pass. That pairing is what makes these fixes trustworthy;
+use it when you have an older binary to hand.
+
+Controls are tagged with the release that fixed the defect, and the baseline's
+version is read off the `User-Agent` it puts on the wire. A control whose fix
+the baseline already contains is SKIPPED, not failed — otherwise every future
+release would report phantom failures for every fix older than its baseline.
+An unknown baseline version runs every control, which is the safe direction.
 
 Exit status: 0 if every check passed, 1 otherwise.
 """
@@ -94,29 +102,73 @@ class Runner:
 
 
 class Report:
-    def __init__(self):
+    def __init__(self, baseline_version=None):
         self.checks = []
+        self.skipped = 0
+        # (major, minor, patch) of the --baseline binary, or None. A control is
+        # only meaningful against a baseline OLDER than the release that fixed
+        # the defect: run against a newer one it cannot reproduce, and would
+        # report a phantom failure on every future release.
+        self.baseline_version = baseline_version
 
     def check(self, name, ok, detail=""):
         self.checks.append((name, ok))
         print(("  PASS  " if ok else "  FAIL  ") + name + (("   :: " + detail) if detail else ""))
 
-    def control(self, name, ok, detail=""):
-        """A control asserts the OLD binary really was vulnerable.
+    def control(self, name, ok, fixed_in, detail=""):
+        """Assert the baseline binary really did exhibit the defect.
 
         A failed control does not mean the shipping binary is broken — it means
-        the check is no longer exercising the path it was written for, so the
-        corresponding PASS proves less than it appears to. Surfaced loudly for
-        that reason, and counted as a failure.
+        the check has stopped exercising the path it was written for, so the
+        corresponding PASS proves less than it appears to. That is a silent
+        false pass, so it counts as a failure.
+
+        `fixed_in` is the release that closed the defect. Against a baseline at
+        or after it the control is skipped rather than failed: the baseline is
+        simply already fixed, which is information, not a regression.
         """
+        if self.baseline_version is not None and self.baseline_version >= fixed_in:
+            self.skipped += 1
+            print("  skip  %s   :: baseline %s already has the %s fix"
+                  % (name, ver_str(self.baseline_version), ver_str(fixed_in)))
+            return
         self.checks.append((name, ok))
         print(("  CTRL  " if ok else "  FAIL  ") + name + (("   :: " + detail) if detail else ""))
 
     def summary(self):
         passed = sum(1 for _n, ok in self.checks if ok)
         total = len(self.checks)
-        print("\n==== %d/%d checks passed ====" % (passed, total))
+        extra = ("  (%d control(s) skipped: baseline already fixed)" % self.skipped) if self.skipped else ""
+        print("\n==== %d/%d checks passed ====%s" % (passed, total, extra))
         return passed == total
+
+
+def ver_str(v):
+    return ".".join(str(x) for x in v)
+
+
+def probe_version(run, binary):
+    """Learn a binary's version from the User-Agent it puts on the wire.
+
+    Self-describing, and it needs no flag the older binaries do not have: whirl
+    has sent `User-Agent: whirl/<version>` by default since 0.6.5. Returns a
+    (major, minor, patch) tuple, or None if it could not be determined (in which
+    case every control runs, which is the safe direction).
+    """
+    seen = []
+    p = newport()
+    serve(p, h_ok(seen))
+    run(binary, ["http://127.0.0.1:%d/" % p], "probe")
+    for req in seen:
+        for line in req.splitlines():
+            if line.lower().startswith("user-agent:") and "whirl/" in line:
+                raw = line.split("whirl/", 1)[1].strip()
+                parts = raw.split(".")
+                try:
+                    return tuple(int(x) for x in parts[:3])
+                except ValueError:
+                    return None
+    return None
 
 
 # ---------------------------------------------------------------- shared handlers
@@ -170,7 +222,7 @@ def check_path_traversal(run, rep, new, old, marker, marker2):
         p = newport()
         serve(p, make(p))
         run(old, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p], "trav_baseline")
-        rep.control("baseline writes outside cwd", bool(escaped()), str(escaped()))
+        rep.control("baseline writes outside cwd", bool(escaped()), (0, 6, 6), str(escaped()))
 
     clean()
     p = newport()
@@ -202,7 +254,7 @@ def check_crlf_injection(run, rep, new, old):
         p = newport()
         serve(p, make(p, seen))
         run(old, ["-L", "http://127.0.0.1:%d/go" % p], "crlf_baseline")
-        rep.control("baseline injects a header", any("X-Injected" in r for r in seen))
+        rep.control("baseline injects a header", any("X-Injected" in r for r in seen), (0, 6, 6))
 
     seen = []
     p = newport()
@@ -223,7 +275,7 @@ def check_credential_replay(run, rep, new, old):
         serve(b, h_ok(seen))
         run(old, ["-L", "-H", "Authorization: Bearer SECRET", "http://127.0.0.1:%d/x" % a],
             "cred_baseline")
-        rep.control("baseline leaks the credential", any("SECRET" in r for r in seen))
+        rep.control("baseline leaks the credential", any("SECRET" in r for r in seen), (0, 6, 6))
 
     seen = []
     a, b = newport(), newport()
@@ -254,7 +306,7 @@ def check_relative_location(run, rep, new, old):
         p = newport()
         serve(p, h)
         _rc, out, _e, _d = run(old, ["-L", "http://127.0.0.1:%d/docs" % p], "rel_baseline")
-        rep.control("baseline fails to follow", "PAYLOAD-OK" not in out, repr(out[:40]))
+        rep.control("baseline fails to follow", "PAYLOAD-OK" not in out, (0, 6, 6), repr(out[:40]))
 
     p = newport()
     serve(p, h)
@@ -274,7 +326,7 @@ def check_truncation(run, rep, new, old):
         p = newport()
         serve(p, h)
         rc, _o, _e, _d = run(old, ["http://127.0.0.1:%d/f" % p], "trunc_baseline")
-        rep.control("baseline exits 0 on truncation", rc == 0, "rc=%d" % rc)
+        rep.control("baseline exits 0 on truncation", rc == 0, (0, 6, 6), "rc=%d" % rc)
 
     p = newport()
     serve(p, h)
@@ -301,7 +353,7 @@ def check_crawl_dechunk(run, rep, new, old):
         p = newport()
         serve(p, h)
         _rc, _o, _e, d = run(old, ["-r", "-l", "0", "http://127.0.0.1:%d/p.html" % p], "chunk_baseline")
-        rep.control("baseline writes raw chunk framing", b"5\r\n" in saved(d), repr(saved(d)[:28]))
+        rep.control("baseline writes raw chunk framing", b"5\r\n" in saved(d), (0, 6, 6), repr(saved(d)[:28]))
 
     p = newport()
     serve(p, h)
@@ -319,7 +371,7 @@ def check_body_file(run, rep, new, old):
         serve(p, h_ok(seen))
         rc, _o, _e, _d = run(old, ["-d", "@/nonexistent/nope", "http://127.0.0.1:%d/x" % p],
                              "body_baseline")
-        rep.control("baseline sends a bodyless request", bool(seen) and rc == 0, "rc=%d" % rc)
+        rep.control("baseline sends a bodyless request", bool(seen) and rc == 0, (0, 6, 6), "rc=%d" % rc)
 
     seen = []
     p = newport()
@@ -331,7 +383,7 @@ def check_body_file(run, rep, new, old):
 
 def check_regressions(run, rep, new):
     """The fixes above must not break ordinary transfers."""
-    print("\n[8] regressions: ordinary transfers still work")
+    print("\n[7b] regressions: ordinary transfers still work")
 
     p = newport()
     serve(p, h_ok(body=b"hello world"))
@@ -366,6 +418,131 @@ def check_regressions(run, rep, new):
 
 # ---------------------------------------------------------------- entry point
 
+def check_origin_confinement(run, rep, new, old):
+    """0.6.7: the crawl is bounded by ORIGIN — scheme, host and port — not host alone."""
+    print("\n[8] -r origin confinement (scheme + port)")
+
+    def make(other_port):
+        def h(conn, req):
+            if "robots.txt" in req:
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                return
+            # A same-host link on another port, and one on another scheme.
+            body = ('<a href="http://127.0.0.1:%d/reached.html">port</a>'
+                    '<a href="https://127.0.0.1/reached2.html">scheme</a>' % other_port).encode()
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        return h
+
+    reached = []
+    base, other = newport(), newport()
+    serve(base, make(other))
+    serve(other, h_ok(reached, b"REACHED"))
+    _rc, _o, err, _d = run(new, ["-r", "-l", "1", "http://127.0.0.1:%d/" % base], "origin")
+    rep.check("cross-port link not followed", not reached, "reached=%d" % len(reached))
+    rep.check("cross-scheme link reported", "cross-scheme" in err, err.strip()[:90])
+
+
+def check_crawl_nondefault_port(run, rep, new, old):
+    """0.6.7: relative links must keep :port, or -r is useless off :80/:443."""
+    print("\n[9] -r works on a non-default port")
+
+    def h(conn, req):
+        if "robots.txt" in req:
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            return
+        if req.startswith("GET /child.html"):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nCHILD")
+            return
+        body = b'<a href="/child.html">c</a>'
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+
+    if old:
+        p = newport()
+        serve(p, h, n=12)
+        _rc, _o, _e, d = run(old, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p], "port_baseline")
+        rep.control("baseline cannot crawl off the default port",
+                    not os.path.exists(os.path.join(d, "child.html")), (0, 6, 7))
+
+    p = newport()
+    serve(p, h, n=12)
+    _rc, _o, _e, d = run(new, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p], "port")
+    f = os.path.join(d, "child.html")
+    got = open(f, "rb").read() if os.path.exists(f) else b""
+    rep.check("relative link fetched on odd port", got == b"CHILD", repr(got[:20]))
+
+
+def check_host_header_port(run, rep, new, old):
+    """0.6.7: RFC 9110 s7.2 — Host carries a non-default port."""
+    print("\n[10] Host header carries a non-default port")
+    seen = []
+    p = newport()
+    serve(p, h_ok(seen))
+    run(new, ["http://127.0.0.1:%d/x" % p], "hosthdr")
+    want = "Host: 127.0.0.1:%d" % p
+    if old:
+        seen_old = []
+        q = newport()
+        serve(q, h_ok(seen_old))
+        run(old, ["http://127.0.0.1:%d/x" % q], "hosthdr_baseline")
+        rep.control("baseline omits the port",
+                    not any(("Host: 127.0.0.1:%d" % q) in r for r in seen_old), (0, 6, 7))
+    rep.check("Host includes the port", any(want in r for r in seen),
+              (seen[0].splitlines()[1] if seen else "no request"))
+
+
+def check_include_chunked(run, rep, new, old):
+    """0.6.7: -i must emit the decoded body, not raw chunk framing."""
+    print("\n[11] -i on a chunked response emits a decoded body")
+
+    def h(conn, _req):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"5\r\nHELLO\r\n5\r\nWORLD\r\n0\r\n\r\n")
+
+    if old:
+        p = newport()
+        serve(p, h)
+        _rc, out, _e, _d = run(old, ["-i", "http://127.0.0.1:%d/" % p], "inc_baseline")
+        rep.control("baseline emits raw chunk framing", "5\r\nHELLO" in out, (0, 6, 7), repr(out[-30:]))
+
+    p = newport()
+    serve(p, h)
+    rc, out, _e, _d = run(new, ["-i", "http://127.0.0.1:%d/" % p], "inc")
+    ok = ("HELLOWORLD" in out) and ("5\r\nHELLO" not in out) and ("200 OK" in out)
+    rep.check("-i decoded, headers kept", rc == 0 and ok, repr(out[-40:]))
+
+    # -i -o must put BOTH halves in the file (a two-write fix would lose one).
+    p = newport()
+    serve(p, h)
+    rc, _o, _e, d = run(new, ["-i", "-o", "both.txt", "http://127.0.0.1:%d/" % p], "inc_file")
+    f = os.path.join(d, "both.txt")
+    got = open(f, "rb").read() if os.path.exists(f) else b""
+    rep.check("-i -o writes headers AND body",
+              b"200 OK" in got and b"HELLOWORLD" in got, repr(got[-40:]))
+
+
+def check_retry_on_empty(run, rep, new, old):
+    """0.6.7: a zero-byte response is a failure, so --retry must fire on it."""
+    print("\n[12] --retry fires on a zero-byte response")
+    attempts = []
+
+    def h(conn, req):
+        attempts.append(req)
+        conn.close()          # accept, send nothing, close
+
+    if old:
+        p = newport()
+        serve(p, h, n=12)
+        run(old, ["--retry", "2", "http://127.0.0.1:%d/" % p], "retry_baseline")
+        rep.control("baseline does not retry", len(attempts) == 1, (0, 6, 7), "attempts=%d" % len(attempts))
+
+    attempts.clear()
+    p = newport()
+    serve(p, h, n=12)
+    rc, _o, _e, _d = run(new, ["--retry", "2", "http://127.0.0.1:%d/" % p], "retry")
+    rep.check("retried and then failed", len(attempts) == 3 and rc != 0,
+              "attempts=%d rc=%d" % (len(attempts), rc))
+
+
 def main():
     ap = argparse.ArgumentParser(description="whirl behavioral test suite")
     ap.add_argument("binary", help="the whirl binary under test")
@@ -398,7 +575,10 @@ def main():
     print("  workdir:  %s" % workdir)
 
     run = Runner(workdir)
-    rep = Report()
+    baseline_version = probe_version(Runner(workdir), baseline) if baseline else None
+    if baseline:
+        print("  baseline version: %s" % (ver_str(baseline_version) if baseline_version else "unknown"))
+    rep = Report(baseline_version)
     try:
         check_path_traversal(run, rep, binary, baseline, marker, marker2)
         check_crlf_injection(run, rep, binary, baseline)
@@ -408,6 +588,11 @@ def main():
         check_crawl_dechunk(run, rep, binary, baseline)
         check_body_file(run, rep, binary, baseline)
         check_regressions(run, rep, binary)
+        check_origin_confinement(run, rep, binary, baseline)
+        check_crawl_nondefault_port(run, rep, binary, baseline)
+        check_host_header_port(run, rep, binary, baseline)
+        check_include_chunked(run, rep, binary, baseline)
+        check_retry_on_empty(run, rep, binary, baseline)
     finally:
         for f in (marker, marker2):
             if os.path.exists(f):

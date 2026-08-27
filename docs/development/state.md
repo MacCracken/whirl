@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-08-27 (0.6.6 — P-1 security + correctness sweep: remote arbitrary file write via `-r`, request splitting via `Location`, cross-origin credential replay, and silent truncation all fixed. CI now compiles the AGNOS arm. Iron on archaemenid still the open validation step.)
+> **Last refresh**: 2026-08-27 (0.6.7 — P-2 tier: crawl confined to an origin (no cleartext downgrade), port correctness throughout, overflow bounds, and `src/crawl.cyr` carved out so the confinement logic is unit-testable. Iron on archaemenid still the open validation step.)
 
 ---
 
@@ -10,12 +10,12 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.6.6** (HTTP/1.1 + HTTPS; GET/POST/methods + headers + `-A` UA; `-i`/`-I`/`-f`; **`-r` recursive** w/ tree-mirroring + robots.txt `Allow`/`Disallow` precedence, `-O`, `-C` **resume**, `--retry` — over the taar transport; **HTTP + HTTPS both run on AGNOS**, QEMU-validated at 0.6.2, rebuilt at 0.6.3 onto the sovereign `tls_native_*` path) |
+| Current version | **0.6.7** (HTTP/1.1 + HTTPS; GET/POST/methods + headers + `-A` UA; `-i`/`-I`/`-f`; **`-r` recursive** w/ tree-mirroring + robots.txt `Allow`/`Disallow` precedence, `-O`, `-C` **resume**, `--retry` — over the taar transport; **HTTP + HTTPS both run on AGNOS**, QEMU-validated at 0.6.2, rebuilt at 0.6.3 onto the sovereign `tls_native_*` path) |
 | Status | Working. `whirl [-X M] [-d DATA\|@file\|@-] [--data-binary D] [-H 'H: v'] [-A UA] [-i] [-I] [-f] [-r [-l N]] [-O\|-o FILE] [-C] [-L] [--retry N] http(s)://…` — resolve + connect (+ TLS) + request + emit/save; redirects (`-L`); recursive same-host crawl (`-r`); cert chain + hostname verified fail-closed. |
-| Module footprint | `src/{url,http,cli,transport,output,links,main}.cyr` (+ `test.cyr`) — 8 modules, 1,529 lines. url / http / links / path-normalize pure-tested; transport rides taar (TCP+DNS), with TLS for https. |
+| Module footprint | `src/{url,http,cli,crawl,transport,output,links,main}.cyr` (+ `test.cyr`) — 9 modules, ~2,000 lines. `crawl.cyr` (0.6.7) holds link resolution, path confinement and robots parsing as pure logic, so the security-critical half is reachable from the unit suite. url / http / links / path-normalize pure-tested; transport rides taar (TCP+DNS), with TLS for https. |
 | Cyrius pin | **6.5.35** (family-aligned with yo + taar; `dig` is the outlier at 6.2.24) |
 | Backends | **Linux** (raw-syscall TCP via taar; the `tls.cyr` facade for TLS) + **AGNOS** (taar's sovereign `sock_*`#47-50 / `udp_*`#51-54 / `getrandom`#45 backend, landed at taar 0.3.0; whirl I/O portable via `sys_write`/`sys_read`/chrono/io + `#ifdef` for mkdir/stat/append). HTTP + HTTPS both **QEMU-validated on agnos** at 0.6.2; since 0.6.3 the agnos handshake calls `tls_native_*` **directly** (`_agnos_tls_native_connect`) rather than the facade's `tls_connect`, because agnos binaries are static and cannot use the libssl/`fdlopen` bridge. `tls_read`/`tls_write`/`tls_close` are shared by both targets. **`net` is not in the `[deps].stdlib` include list** — the transport is sovereign. |
-| Tests | `tests/whirl.tcyr` → **69 assertions** across 15 groups (URL parse + injection rejection, HTTP framing, credential-header matching, links extraction, path normalization). Plus **`tests/behavior.py`** — an end-to-end suite against local adversarial servers, gated in CI (12 checks standalone; 19 with `--baseline <pre-0.6.6 binary>`, where each security check first reproduces the defect on the old binary). It fails 7/12 against the 0.6.5 build, so it demonstrably has teeth. Live: `http://example.com` + `https://example.com` fetch, `-L https://github.com` (575 KB chunked), reachable self-signed cert rejected fail-closed (exit 9). |
+| Tests | `tests/whirl.tcyr` → **107 assertions** across 20 groups (URL parse + injection rejection, HTTP framing, credential headers, links, path normalization, path confinement, authority/port, origin comparison). Plus **`tests/behavior.py`** — an end-to-end suite against local adversarial servers, gated in CI (**19 checks** standalone; up to **30** with `--baseline <older binary>`, where each fix first reproduces its defect). Controls are version-aware: the baseline's version is read off its User-Agent, and a control the baseline already has fixed is skipped rather than failed. Live: `http://example.com` + `https://example.com` fetch, `-L https://github.com` (575 KB chunked), reachable self-signed cert rejected fail-closed (exit 9). |
 | Family position | Third entry in the network-tools family (after yo + dig). Third `taar` consumer — drove taar's `socket` + `dns` modules (taar 0.2.0); `tls`/`http` module growth still open. |
 | Deps | stdlib base + **`[deps.taar]` 0.5.0** + the **opt-in crypto/TLS libs** (`chrono`/`ct`/`keccak`/`random`/`bayan`/`sigil`/`tls_native`/`tls` plus `dynlib`/`fdlopen` since 0.6.3, vendored via `cyrius lib sync` — wired into CI). No stdlib `net`/`sandhi`. `lib/` is gitignored; `cyrius.lock` (61 entries) is the committed record. |
 | Response cap | **1 MiB** (`WHIRL_RBUF_SZ`) for both the response buffer and a `-d @file` request body. Exceeding it is a reported error, never a silent truncation. |
@@ -41,13 +41,14 @@ Carried from the 0.6.6 audit — see [`../../CHANGELOG.md`](../../CHANGELOG.md) 
 
 | Area | Defect |
 |---|---|
-| `-r` scheme confinement | an `https` crawl follows same-host `http://` links over cleartext |
-| `-r` on a non-default port | `robots.txt` fetched from :80/:443, and relative links lose `:port` |
-| `_save_tree` | follows symlinks; truncates pre-existing files |
-| `http_build_request` | truncates an oversized request silently; callers cannot detect it |
-| `_agnos_ca_hook` | 1 MiB leaked per TLS connect; probes only `/etc/ssl/cert.pem`; likely redundant since cyrius v6.2.23 |
-| `alloc()` | failure unchecked at every `src/` call site |
-| `transport.cyr` | `transport_fetch` / `transport_fetch_tls` remain near-duplicates |
+| `_save_tree` | follows symlinks; truncates pre-existing files. Needs `O_NOFOLLOW`/`lstat` on Linux with no clean agnos equivalent — a deliberate behavioural split, not a drive-by fix |
+| `alloc()` | failure unchecked at most `src/` call sites (the CA hook is guarded; the rest is its own change) |
+| `_agnos_ca_hook` | may be redundant since cyrius v6.2.23 fixed the `set_ca_system` agnos ABI it works around — needs a run on real agnos to retire |
+| crawl caps | 64-resource cap, dedup and depth bound unreviewed |
+
+> Cleared at 0.6.7: origin confinement, robots/relative-link port handling, silent
+> request truncation, the CA-hook leak and NULL write, the agnos resume data loss,
+> and the duplicated read loop.
 
 ## Pointers
 

@@ -8,7 +8,18 @@
 
 # --- request ---
 
+# http_build_request could not fit the request in `bufmax`. Returned instead of
+# a length so a caller cannot mistake a truncated request for a valid one.
+var HTTP_REQ_TOOBIG = 0 - 1;
+
 var _http_ua = 0;   # User-Agent override (0 = default whirl/<ver>)
+
+# Set by the append helpers whenever they hit `bufmax` and drop bytes. They
+# clamp and return as though they wrote, so an oversized request (many -H
+# headers, or a long crawl path) was silently emitted MALFORMED — a half-written
+# header line, no terminating CRLFCRLF — and no caller could tell. Reset per
+# http_build_request; consulted before returning a length.
+var _http_trunc = 0;
 
 fn http_set_user_agent(ua): i64 { _http_ua = ua; return 0; }
 
@@ -16,7 +27,7 @@ fn http_set_user_agent(ua): i64 { _http_ua = ua; return 0; }
 fn _http_puts(buf, pos, bufmax, s): i64 {
     var i = 0;
     while (load8(s + i) != 0) {
-        if (pos >= bufmax) { return pos; }
+        if (pos >= bufmax) { _http_trunc = 1; return pos; }
         store8(buf + pos, load8(s + i));
         pos = pos + 1;
         i = i + 1;
@@ -26,7 +37,7 @@ fn _http_puts(buf, pos, bufmax, s): i64 {
 
 # Append one byte. Returns the new pos.
 fn _http_putc(buf, pos, bufmax, c): i64 {
-    if (pos >= bufmax) { return pos; }
+    if (pos >= bufmax) { _http_trunc = 1; return pos; }
     store8(buf + pos, c);
     return pos + 1;
 }
@@ -37,7 +48,7 @@ fn _http_put_int(buf, pos, bufmax, n): i64 {
     var len = fmt_int_buf(n, &tmp);
     var i = 0;
     while (i < len) {
-        if (pos >= bufmax) { return pos; }
+        if (pos >= bufmax) { _http_trunc = 1; return pos; }
         store8(buf + pos, load8(&tmp + i));
         pos = pos + 1;
         i = i + 1;
@@ -76,6 +87,7 @@ fn http_hdr_is_credential(h): i64 {
 # Content-Length + a default Content-Type (unless the caller supplied one). Body
 # bytes follow the blank line. Returns total bytes written.
 fn http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, buf, bufmax): i64 {
+    _http_trunc = 0;
     var p = 0;
     p = _http_puts(buf, p, bufmax, method);
     p = _http_putc(buf, p, bufmax, 32);
@@ -84,7 +96,7 @@ fn http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, buf, bufma
     p = _http_puts(buf, p, bufmax, host);
     p = _http_puts(buf, p, bufmax, "\r\nUser-Agent: ");
     if (_http_ua != 0) { p = _http_puts(buf, p, bufmax, _http_ua); }
-    else { p = _http_puts(buf, p, bufmax, "whirl/0.6.6"); }
+    else { p = _http_puts(buf, p, bufmax, "whirl/0.6.7"); }
     p = _http_puts(buf, p, bufmax, "\r\nAccept: */*\r\nConnection: close\r\n");
 
     var has_ct = 0;
@@ -110,11 +122,12 @@ fn http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, buf, bufma
 
     var j = 0;
     while (j < bodylen) {
-        if (p >= bufmax) { return p; }
+        if (p >= bufmax) { _http_trunc = 1; return HTTP_REQ_TOOBIG; }
         store8(buf + p, load8(body + j));
         p = p + 1;
         j = j + 1;
     }
+    if (_http_trunc == 1) { return HTTP_REQ_TOOBIG; }
     return p;
 }
 
@@ -218,9 +231,15 @@ fn http_content_length(resp, len): i64 {
     var n = 0;
     var any = 0;
     var i = v;
+    var digits = 0;
     while (i < len) {
         var c = load8(resp + i);
         if ((c < 48) || (c > 57)) { break; }
+        digits = digits + 1;
+        # A server-supplied Content-Length is attacker-controlled. Past 18
+        # digits the multiply wraps i64, and a wrapped-negative length would
+        # sail through the "body shorter than promised" comparison.
+        if (digits > 18) { return 0 - 1; }
         n = n * 10 + (c - 48);
         any = 1;
         i = i + 1;

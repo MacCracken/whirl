@@ -5,6 +5,120 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-08-27 (P-2 tier: origin confinement, port correctness, overflow hardening)
+
+The second tier from the 0.6.6 audit — the "Known latent" list that release
+recorded, plus its remaining P-2 findings. One is security-relevant (a cleartext
+downgrade a hostile page could force); the rest are correctness, data-loss and
+hardening. Two refactors close out the tier, both motivated by defects rather
+than taste. Verified the same way as 0.6.6: paired against an older binary that
+reproduces each defect first.
+
+### Security
+- **The crawl is confined to an ORIGIN, not a host.** `-r` compared hostnames
+  only, so a page fetched over `https` could point at same-host `http://` links
+  and whirl would follow them **in cleartext** — a downgrade the page controls,
+  on every resource it names. It could also wander from `:8443` onto `:80`.
+  Scheme, host and port must now all match the starting URL; a link that fails
+  is skipped and named on stderr.
+- **`robots.txt` is fetched from the port being crawled**, not from 80/443. On a
+  non-default port whirl consulted a *different origin's* policy — or, where
+  nothing was listening, none at all — and then crawled as though unrestricted.
+
+### Fixed
+- **`-r` works on non-default ports at all.** `_resolve_link` built resolved
+  URLs from the bare hostname, dropping the port, so on `:8080` every relative
+  and root-relative link resolved to `:80`. Combined with the same-host check
+  this made recursive fetch silently useless off the default ports. It now
+  builds the authority with `_authority`, the same helper 0.6.6 added for
+  `Location:` resolution.
+- **`Host:` carries a non-default port** (RFC 9110 §7.2). A bare host made
+  virtual-host routing on a non-default port resolve to the wrong site.
+- **`-i` emits a decoded body.** With `-i` the whole receive buffer was written
+  verbatim, so every chunked response carried raw hex chunk framing into stdout
+  — and into the `-o` file. Headers and decoded body are now joined and written
+  **once**: `output_write` truncates a file sink on each call, so the obvious
+  two-call fix would have left `-i -o` containing only the body. There is a
+  regression check for exactly that.
+- **`--retry` fires on a zero-byte response.** The retry loop treated `total >= 0`
+  as success, and a zero-byte read is `total == 0` — so `--retry` never fired on
+  a peer that accepted the connection and sent nothing, which is precisely the
+  transient failure it exists for. No valid HTTP response is empty.
+- **An oversized request is no longer sent malformed.** `_http_puts` clamps at
+  `bufmax` and returns as though it wrote, so a request that did not fit (many
+  `-H` headers, a long crawl path) went out with a half-written header line and
+  no terminating CRLFCRLF, and no caller could tell. `http_build_request` now
+  returns `HTTP_REQ_TOOBIG`; all three call sites check it.
+- **AGNOS `-C` resume no longer destroys the file it is resuming.** The agnos
+  append path read-modify-writes (no `O_APPEND` in the frozen FS surface) with a
+  1 MiB read cap, so a *larger* file was read to 1 MiB and written back at
+  1 MiB + len — silently discarding everything past the cap. It now refuses, and
+  the caller reports it. (Linux uses real `O_APPEND` and was never affected.)
+
+### Hardening
+- **`_agnos_ca_hook` no longer leaks 1 MiB per TLS connect.** It allocated a
+  fresh 1 MiB bundle buffer on every connection against a bump allocator with no
+  `free` — ~1 MiB per redirect hop and per crawled resource. The bundle is now
+  loaded once and cached. It also checks the allocation instead of storing into
+  address 0 on failure, and probes the four common trust-store layouts rather
+  than only `/etc/ssl/cert.pem` (an image with a Debian/RHEL layout had no roots
+  at all, so every handshake failed closed — correct, but for the wrong reason).
+- **Integer-overflow bounds on the three numeric parsers.** `_url_parse_uint`
+  rejects more than 10 digits — a long run wrapped i64 and could land back
+  inside 1..65535, defeating the port range check. `http_content_length` rejects
+  more than 18 digits, since a wrapped-negative length would sail through the
+  0.6.6 "body shorter than promised" comparison. `_cli_atoi` clamps, so a
+  wrapped-negative `--retry` cannot silently disable retries or `-l` recursion.
+
+### Refactor
+- **`src/crawl.cyr`** — link resolution, path confinement and robots.txt parsing
+  carved out of `main.cyr` (which drops ~230 lines). Not tidying: this is where
+  the 0.6.6 security fixes live, and while it sat inside `main.cyr` the only way
+  to exercise any of it was end-to-end through a real binary and a real server.
+  It is now reachable from `tests/whirl.tcyr`, which is what took the unit suite
+  from 69 to 107 assertions. `_save_tree`'s pure half became `tree_relpath`, so
+  the confinement boundary itself is directly testable.
+- **One response read loop, not two.** `transport_fetch` and
+  `transport_fetch_tls` each carried a copy, and 0.6.6 had to fix the same
+  error-vs-EOF bug in both. `_transport_read_all` now holds the policy once. It
+  selects the reader with a **direct call on a mode flag rather than a function
+  pointer** — the AGNOS arm has no executed test coverage, so its hot path stays
+  on the mechanism it already ships.
+
+### Tests
+- **69 → 107 assertions** in `tests/whirl.tcyr`. New groups: `tree-relpath` (the
+  confinement boundary, including the `//tmp/x` form that defeated the original
+  one-slash strip, and `..hidden` which must *not* be treated as traversal),
+  `authority`, `abs-location`, `same-origin` and `resolve-link-port`.
+- **`tests/behavior.py` 12 → 19 standalone checks**, covering origin
+  confinement, crawling on a non-default port, the `Host` port, `-i` decoding
+  (including `-i -o`), and `--retry` on an empty response.
+- **Controls are now version-aware.** Each is tagged with the release that fixed
+  its defect, and the baseline's version is read off the `User-Agent` it puts on
+  the wire. A control whose fix the baseline already has is *skipped* rather
+  than failed — without this, every future release would report phantom failures
+  for every fix older than its baseline. Against 0.6.6: 23/23 with 7 skipped.
+  Against a pre-0.6.6 binary: 30/30 with all 11 controls reproducing.
+
+### Known latent (still open, deliberately)
+- `_save_tree` follows symlinks and truncates pre-existing files. Fixing it
+  properly needs `O_NOFOLLOW` (or an `lstat` pre-check) on Linux and has no
+  clean equivalent in the frozen agnos FS surface, so it would mean a behavioural
+  split between targets — more than a hardening cut should take on unannounced.
+- `alloc()` failure is still unchecked at most `src/` call sites. The CA hook is
+  now guarded because it had a concrete NULL-write; a general sweep is its own
+  change with its own failure-mode design.
+- The crawl's 64-resource cap, dedup and depth bound are unchanged.
+
+### Not validated here
+- **AGNOS runtime**, again. This release touches the shared read loop, the
+  agnos-only CA hook and the agnos-only resume path — the last two are
+  `#ifdef CYRIUS_TARGET_AGNOS` and are therefore **compile-verified only**; no
+  test in this repo executes them. The resume guard and the CA cache in
+  particular want a QEMU run against a re-staged rootfs before being trusted.
+- Everything in the behavioral suite runs over plain HTTP against local servers.
+  The TLS arm is covered only by live fetches and a fail-closed check.
+
 ## [0.6.6] — 2026-08-27 (P-1 security + correctness sweep; CI compiles the AGNOS arm)
 
 A hardening cut. A multi-lens audit of `src/` produced findings that were then

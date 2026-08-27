@@ -27,7 +27,13 @@ fn output_append(buf, len, outfile): i64 {
     return 0;
 #endif
 #ifdef CYRIUS_TARGET_AGNOS
+    # Read-modify-write, because the frozen agnos FS surface has no O_APPEND.
+    # That makes the read cap load-bearing: a file LARGER than the cap used to
+    # be read to `cap` bytes and then written back at cap+len, silently
+    # DESTROYING everything past the cap — a -C resume that ate the download it
+    # was resuming. Refuse instead; the caller reports it.
     var cap = 1048576;
+    if (output_file_size(outfile) > cap) { return 0 - 1; }
     var old = alloc(cap);
     var on = file_read_all(outfile, old, cap);
     if (on < 0) { on = 0; }

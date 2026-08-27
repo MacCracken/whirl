@@ -7,6 +7,7 @@
 include "src/url.cyr"
 include "src/http.cyr"
 include "src/links.cyr"
+include "src/crawl.cyr"
 
 # === URL ===
 
@@ -183,6 +184,80 @@ fn test_credential_headers() {
     assert_eq(http_hdr_is_credential(""), 0, "empty line does not overrun");
 }
 
+# === crawl logic (0.6.7: reachable now that it lives in src/crawl.cyr) ===
+
+# The confinement boundary behind the 0.6.6 remote-arbitrary-file-write fix.
+fn test_tree_relpath() {
+    test_group("tree-relpath");
+    assert_eq(streq(tree_relpath("/docs/g.html"), "docs/g.html"), 1, "leading slash stripped");
+    assert_eq(streq(tree_relpath("/a/b/c.txt"), "a/b/c.txt"), 1, "nested path kept");
+    assert_eq(streq(tree_relpath("/"), "index.html"), 1, "root -> index.html");
+    assert_eq(streq(tree_relpath("/d/"), "d/index.html"), 1, "dir -> index.html");
+    assert_eq(streq(tree_relpath("/p.html?x=1"), "p.html"), 1, "query stripped");
+    # Escapes must be refused, not sanitized into something plausible.
+    assert_eq(tree_relpath("/../../etc/passwd"), 0, "dotdot refused");
+    assert_eq(tree_relpath("/a/../../../b"), 0, "interior dotdot refused");
+    assert_eq(tree_relpath("/.."), 0, "trailing dotdot refused");
+    # The variant that survived a single leading-slash strip as an absolute path.
+    assert_eq(streq(tree_relpath("//tmp/x"), "tmp/x"), 1, "all leading slashes stripped");
+    assert_eq(streq(tree_relpath("////tmp/x"), "tmp/x"), 1, "many leading slashes stripped");
+    # "..text" is a normal name, not a traversal segment.
+    assert_eq(streq(tree_relpath("/..hidden"), "..hidden"), 1, "dotdot prefix is not a segment");
+}
+
+# A non-default port must survive into the authority, or Host and every
+# resolved link point at the wrong service.
+fn test_authority() {
+    test_group("authority");
+    assert_eq(streq(_authority("example.com", 0, 80), "example.com"), 1, "http default port omitted");
+    assert_eq(streq(_authority("example.com", 1, 443), "example.com"), 1, "https default port omitted");
+    assert_eq(streq(_authority("example.com", 0, 8080), "example.com:8080"), 1, "http odd port kept");
+    assert_eq(streq(_authority("example.com", 1, 8443), "example.com:8443"), 1, "https odd port kept");
+    assert_eq(streq(_authority("example.com", 0, 443), "example.com:443"), 1, "443 kept on http");
+}
+
+fn test_abs_location() {
+    test_group("abs-location");
+    # Absolute passes through.
+    assert_eq(streq(_abs_location("http://other.test/x", 0, "a.test", 80, "/p"), "http://other.test/x"), 1, "absolute unchanged");
+    # Root-relative and relative resolve against the base, KEEPING the port.
+    assert_eq(streq(_abs_location("/docs/", 0, "a.test", 80, "/p"), "http://a.test/docs/"), 1, "root-relative");
+    assert_eq(streq(_abs_location("/docs/", 0, "a.test", 8080, "/p"), "http://a.test:8080/docs/"), 1, "root-relative keeps port");
+    assert_eq(streq(_abs_location("b.html", 0, "a.test", 8080, "/d/a.html"), "http://a.test:8080/d/b.html"), 1, "relative keeps port");
+    assert_eq(streq(_abs_location("/x", 1, "a.test", 8443, "/p"), "https://a.test:8443/x"), 1, "https keeps port");
+    # Protocol-relative inherits the scheme.
+    assert_eq(streq(_abs_location("//h.test/x", 1, "a.test", 443, "/p"), "https://h.test/x"), 1, "protocol-relative");
+    # Non-http schemes are not followed.
+    assert_eq(_abs_location("mailto:x@y.z", 0, "a.test", 80, "/p"), 0, "mailto refused");
+    assert_eq(_abs_location("javascript:alert(1)", 0, "a.test", 80, "/p"), 0, "javascript refused");
+}
+
+# Origin = scheme + host + port. Anything less let an https crawl follow a
+# cleartext link, or leak a credential to another port on the same host.
+fn test_same_origin() {
+    test_group("same-origin");
+    var u = url_new();
+    assert_eq(url_parse("http://a.test/x", u), URL_PARSE_OK, "parse base");
+    assert_eq(_same_origin(0, "a.test", 80, u), 1, "identical origin");
+    assert_eq(_same_origin(0, "A.TEST", 80, u), 1, "host compare is case-insensitive");
+    assert_eq(_same_origin(0, "b.test", 80, u), 0, "different host");
+    assert_eq(_same_origin(1, "a.test", 80, u), 0, "different scheme");
+    assert_eq(_same_origin(0, "a.test", 8080, u), 0, "different port");
+    var v = url_new();
+    assert_eq(url_parse("https://a.test:8443/x", v), URL_PARSE_OK, "parse https base");
+    assert_eq(_same_origin(1, "a.test", 8443, v), 1, "https odd port matches");
+    assert_eq(_same_origin(1, "a.test", 443, v), 0, "https port mismatch");
+}
+
+fn test_resolve_link_port() {
+    test_group("resolve-link-port");
+    assert_eq(streq(_resolve_link("/a.html", 0, "h.test", 8080, "/i.html"), "http://h.test:8080/a.html"), 1, "root-relative keeps port");
+    assert_eq(streq(_resolve_link("a.html", 0, "h.test", 8080, "/d/i.html"), "http://h.test:8080/d/a.html"), 1, "relative keeps port");
+    assert_eq(streq(_resolve_link("/a.html", 0, "h.test", 80, "/i.html"), "http://h.test/a.html"), 1, "default port omitted");
+    assert_eq(_resolve_link("#frag", 0, "h.test", 80, "/i.html"), 0, "fragment skipped");
+    assert_eq(_resolve_link("mailto:a@b.c", 0, "h.test", 80, "/i.html"), 0, "mailto skipped");
+}
+
 fn main() {
     alloc_init();
     test_links();
@@ -200,6 +275,11 @@ fn main() {
     test_http_custom_headers();
     test_url_rejects_injection();
     test_credential_headers();
+    test_tree_relpath();
+    test_authority();
+    test_abs_location();
+    test_same_origin();
+    test_resolve_link_port();
     return assert_summary();
 }
 

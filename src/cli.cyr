@@ -30,6 +30,9 @@ var CLI_HELP = 1;
 var CLI_ERR  = 2;
 
 # Parse a non-negative decimal cstr → i64 (stops at the first non-digit).
+# Clamped so a long digit run cannot wrap i64 negative: a negative --retry made
+# the retry loop run zero times, and a negative -l silently disabled recursion.
+var _CLI_ATOI_MAX = 1000000;
 fn _cli_atoi(s): i64 {
     var v = 0;
     var i = 0;
@@ -37,6 +40,7 @@ fn _cli_atoi(s): i64 {
         var c = load8(s + i);
         if ((c < 48) || (c > 57)) { return v; }
         v = v * 10 + (c - 48);
+        if (v > _CLI_ATOI_MAX) { return _CLI_ATOI_MAX; }
         i = i + 1;
     }
     return v;
