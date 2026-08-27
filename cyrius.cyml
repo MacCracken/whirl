@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "whirl — curl + wget unified: HTTP / HTTPS transfer in one verb (sovereign Cyrius)"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.4.25"
+cyrius = "6.5.35"
 
 [build]
 entry = "src/main.cyr"
@@ -16,21 +16,30 @@ output = "whirl"
 # below — sovereign raw-syscall, no stdlib net. HTTPS opts in to the crypto/TLS
 # libs (vendored via `cyrius lib sync`): tls_native is transport-agnostic, wired
 # over taar's socket. ct/keccak/random/bayan are sigil's crypto deps.
-# `dynlib`+`fdlopen` back the `tls` facade's libssl.so.3 bridge — cyrius 6.4.x
-# resolves tls.cyr's `fdlopen_*` refs from the explicit include list (no longer
-# auto-pulled), so the Linux build needs them named or it fails reachable-undef.
-# On --agnos they compile (Linux path is `#ifdef CYRIUS_TARGET_LINUX`-gated) and
-# stay unreachable (the agnos TLS path uses tls_native directly) → DCE'd.
+# `dynlib`+`fdlopen` back the `tls` facade's libssl.so.3 bridge — since cyrius
+# v5.6.37 tls.cyr's `fdlopen_*` refs resolve from the explicit include list (no
+# longer auto-pulled), so the Linux build needs them named or it fails
+# reachable-undef. Still true at 6.5.35 (dropping them fails the build with 4
+# reachable undefined fns). On --agnos they compile (the Linux path is
+# `#ifndef CYRIUS_TARGET_AGNOS`-gated) and stay unreachable (the agnos TLS path
+# calls tls_native directly) → DCE'd.
 stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags", "chrono", "ct", "keccak", "random", "bayan", "sigil", "dynlib", "fdlopen", "tls_native", "tls"]
 
 # Network-probe substrate — whirl is the third consumer (after yo + dig). taar's
-# socket (taar_tcp_*) + dns (taar_resolve_ipv4) modules back whirl's transport.
-# `path` drives local dev; `git`+`tag` is the published fallback. The socket+dns
-# socket+dns ship at 0.2.0; the AGNOS sovereign backend lands at taar 0.3.0.
+# socket (taar_tcp_*) + dns (taar_resolve_ipv4) modules back whirl's transport;
+# unlike yo's, whirl's half is live on both targets, not DCE'd.
+# `path` drives local dev; `git`+`tag` is the published fallback — keep the tag
+# current or CI (which has no ../taar) silently builds an older substrate.
+# socket+dns shipped at 0.2.0; the AGNOS sovereign backend landed at 0.3.0.
+# 0.5.0 is the current floor: fail-closed DNS query-ID entropy (0.3.1 ignored
+# the /dev/urandom read result), RFC 5452 reply acceptance, TC→TCP-53 fallback
+# (0.4.0), and arch-dispatched `sys_*` wrappers in place of hardcoded x86_64
+# syscall numbers. Its AGNOS `taar_tcp_recv` returns _TAAR_ERR_TIMEOUT (-11)
+# rather than 0 on deadline expiry — whirl's `n <= 0` read loops already absorb it.
 [deps.taar]
 git = "https://github.com/MacCracken/taar.git"
 path = "../taar"
-tag = "0.3.1"
+tag = "0.5.0"
 modules = ["dist/taar.cyr"]
 
 # --- HTTPS deps land with the TLS bite ---

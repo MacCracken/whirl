@@ -71,7 +71,7 @@ fn http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, buf, bufma
     p = _http_puts(buf, p, bufmax, host);
     p = _http_puts(buf, p, bufmax, "\r\nUser-Agent: ");
     if (_http_ua != 0) { p = _http_puts(buf, p, bufmax, _http_ua); }
-    else { p = _http_puts(buf, p, bufmax, "whirl/0.5.3"); }
+    else { p = _http_puts(buf, p, bufmax, "whirl/0.6.5"); }
     p = _http_puts(buf, p, bufmax, "\r\nAccept: */*\r\nConnection: close\r\n");
 
     var has_ct = 0;

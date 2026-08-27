@@ -5,6 +5,106 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-08-26 (toolchain 6.5.35; taar 0.5.0; vendored stdlib re-cut)
+
+Housekeeping cut: toolchain, substrate and vendored stdlib all move to the
+family-current versions. **No transport, HTTP or CLI logic changed** — the only
+source edit is the default User-Agent string. Both targets build, the suite is
+green, and the Linux binary drops ~86%.
+
+### Changed
+- **Toolchain pin `6.4.25` → `6.5.35`** — realigns with the family (`yo` and
+  `taar` are both on 6.5.35) and clears the `manifest-pin: 6.4.25 (drift —
+  wrapper is 6.5.35)` warning the local toolchain has been emitting. Required
+  **zero** source changes: `src/` builds untouched on both targets. Note this is
+  a deliberate, substantively-motivated bump, not drift-chasing — the 6.2.6 →
+  6.4.25 move at 0.6.3 set the same precedent.
+- **`[deps.taar]` `0.3.1` → `0.5.0`.** The load-bearing dep edit: `path =
+  "../taar"` wins locally, so local builds were already on 0.5.0 while **CI —
+  which has no `../taar` sibling — was still resolving 0.3.1**. What the shipped
+  artifact gains:
+  - **Fail-closed DNS query-ID entropy.** taar 0.3.1's Linux
+    `_taar_plat_random_u16` opened `/dev/urandom` and *discarded the read
+    result*, so a short or failed read left the query ID as uninitialised stack
+    (RFC 5452). 0.5.0 zero-inits, uses `sys_getrandom`, checks the count, and
+    fails the resolve rather than querying with a guessable ID. whirl hits this
+    on every hostname fetch (`src/transport.cyr` `transport_fetch` /
+    `transport_fetch_tls`).
+  - RFC 5452 reply acceptance, TC→TCP-53 fallback (from taar 0.4.0), empty-host
+    rejection, and an IPv4-literal fast path that skips DNS entirely.
+  - Linux socket primitives moved off hardcoded x86_64 syscall numbers onto
+    arch-dispatched `sys_*` wrappers (`sys_openat` in place of x86-only
+    `open(2)`) — aarch64 correctness for free.
+- **Default User-Agent `whirl/0.5.3` → `whirl/0.6.5`** (`src/http.cyr`). It had
+  been stale since 0.5.3 and misreported the version on the wire. `-A` /
+  `--user-agent` still overrides it; no test asserts the value.
+- **Vendored stdlib snapshot re-cut against 6.5.35.** `lib/` was rebuilt from
+  scratch (`rm -rf lib && cyrius lib sync && cyrius deps`) rather than overlaid,
+  which prunes 37 undeclared modules that had accumulated from the 6.2.x era —
+  including `lib/agnosys.cyr`, which exists in no 6.4.x or 6.5.x snapshot at
+  all. `cyrius.lock` 98 → 61 entries; the `./lib/ shadows version-pinned …`
+  warning (9 stale modules: `sandhi`, `mabda`, `sankoch`, `patra`, `yukti`,
+  `vani`, `sakshi`, `ganita`, `niyama`) is gone. `lib/` is gitignored, so only
+  the lock appears in the diff.
+
+### Fixed (inherited from the toolchain, no whirl code change)
+- **Silent HTTPS body truncation on the `tls_native` backend.** 6.4.25's
+  `tls_native_read` returned `TLS_ERR_BUFFER_FULL` — a *negative* — when a
+  decrypted record exceeded the caller's remaining buffer. whirl's read loop
+  treats any `n <= 0` as clean EOF (`src/transport.cyr`), so a truncated body
+  was reported as a **successful** fetch. Reachable as the 256 KB response cap
+  fills and the remaining ask drops below one 16 KB record. 6.5.35 adds a ctx
+  read-hold (`TLS_CTX_OFF_READ_HOLD*`) and returns a partial read instead.
+  Applies wherever `tls_native` is the active backend — the AGNOS path always
+  (it calls `tls_native_*` directly since 0.6.3), and the Linux path whenever
+  libssl.so.3 is absent and the facade falls back to native.
+
+### Performance
+- **Linux binary 13,935,360 → 2,013,744 bytes (−85.6%)**; static data
+  12,980,976 → 726,752 (−94.4%). AGNOS binary 2,002,352 bytes. Attributed to
+  the **toolchain pin alone**, verified by experiment: holding `lib/` and
+  `cyrius.lock` fixed at the 0.6.4 snapshot and changing only the pin reproduces
+  2,013,744 bytes exactly. The `lib/` prune is hygiene, not the cause.
+
+### Validated
+- `cyrius build` (Linux) and `cyrius build --agnos` both `OK`; the two images
+  differ, so the `#ifdef CYRIUS_TARGET_AGNOS` arm is genuinely taken.
+- `cyrius test` → **52 passed, 0 failed** (13 groups: url, http framing, links,
+  path-normalize).
+- Live over the new stack: `http://example.com` and `https://example.com` both
+  return `HTTP/1.1 200 OK`, exit 0.
+- **TLS still fails closed**: a *reachable* local `openssl s_server` presenting a
+  self-signed cert on `127.0.0.1:18443` is rejected (exit 9), while
+  `https://example.com` succeeds. (The usual `*.badssl.com` probes are not
+  reachable from this network — a valid-cert control against `badssl.com` also
+  fails — so they were not used as evidence.)
+
+### Not validated here
+- **AGNOS runtime.** Both `--agnos` results above are **compile-only**; the
+  `#ifdef CYRIUS_TARGET_AGNOS` arms are not executed. The QEMU smoke needs a
+  re-run against a re-staged 0.6.5 `rootfs/bin/whirl`.
+- **CI on a fresh checkout.** Every local build resolves taar through
+  `path = "../taar"`; only a real CI run exercises the `git`+`tag` path this
+  release fixes.
+- **taar's TC→TCP-53 fallback on AGNOS** — no executed coverage anywhere; the
+  QEMU smoke will not reach it (example.com's A RRset never sets TC).
+- **Iron on archaemenid** — still open, unchanged by this cut.
+
+### Known latent (found while verifying; deliberately not fixed here)
+- **CI never compiles the AGNOS arm.** `.github/workflows/` has no `--agnos`
+  step, so a hard break inside an agnos-only block lands green. `yo` gates this;
+  whirl should adopt it in its own commit.
+- `transport_fetch`'s `taar_tcp_send(fd, req, reqlen)` discards the return and
+  never loops on a partial write. Reachable with a large `-d @file` body; real
+  exposure is the AGNOS backend (`sock_send`#48 may accept `< len`). The TLS
+  path is unaffected — `tls_write` / `tls_native_write` already send-all.
+- `_agnos_ca_hook` (`src/transport.cyr`) may now be redundant: the upstream
+  `tls_native_set_ca_system` agnos-ABI defect it works around was fixed at
+  cyrius v6.2.23 and that fix is in the vendored snapshot. Needs its own
+  investigation on real agnos before removal.
+- `-L https://github.com` fails with `whirl: malformed chunked body` (exit 9) on
+  both a taar-0.3.1 baseline and this build — pre-existing, unrelated.
+
 ## [0.6.4] — 2026-07-08 (validation re-cut — HTTPS confirmed under mirshi)
 
 ### Validated

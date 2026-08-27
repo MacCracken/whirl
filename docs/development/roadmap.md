@@ -62,17 +62,31 @@ platform split: taar's `socket` + `dns` modules (driven by this work) abstract i
 - [x] Fixed HTTPS-on-agnos: `_agnos_ca_hook` loads the staged CA bundle with the correct agnos `sys_open` ABI (cyrius `tls_native_set_ca_system` uses the Linux ABI — issue filed). CA staging wired into `stage-tools.sh`.
 - [ ] **Iron** on archaemenid: same run over the r8169 NIC. Parity benchmark vs `curl` (latency / RSS / binary size).
 
+### 0.6.3 — AGNOS off the libssl bridge ✅ (2026-07-08)
+- [x] Toolchain pin 6.2.6 → 6.4.25; stdlib list gains `dynlib` + `fdlopen` (the `tls` facade's `fdlopen_*` refs must be named explicitly or the Linux build fails reachable-undef).
+- [x] agnos HTTPS calls `tls_native_*` **directly** (`_agnos_tls_native_connect`) instead of the `tls.cyr` facade — agnos binaries are static, so `ld.so`/`fdlopen` is both unbuildable and structurally unusable. Linux path byte-identical. HTTP + HTTPS re-validated on QEMU.
+
+### 0.6.4 — validation re-cut ✅ (2026-07-08)
+- [x] HTTPS under mirshi confirmed working; the transient 0.6.3 segfault root-caused to a stale pre-6.4.25 `sigil` snapshot, not a whirl or mirshi defect. No code change.
+
+### 0.6.5 — toolchain + substrate re-cut ✅ (2026-08-26)
+- [x] Pin 6.4.25 → **6.5.35**; `[deps.taar]` 0.3.1 → **0.5.0** (CI had been resolving the old tag — `path = "../taar"` only wins locally). Fail-closed DNS query-ID entropy; TC→TCP-53 fallback; arch-dispatched `sys_*` wrappers.
+- [x] Vendored stdlib re-cut from scratch — 37 undeclared 6.2.x-era modules pruned (incl. the orphan `agnosys.cyr`); lock 98 → 61.
+- [x] Inherited fix: `tls_native_read` no longer returns `TLS_ERR_BUFFER_FULL` for an over-length record (whirl read it as clean EOF → silent body truncation reported as success).
+- [x] Linux binary 13.9 MB → 2.0 MB (−85.6%), attributable to the pin alone. Default UA `whirl/0.5.3` → `whirl/0.6.5`.
+- [ ] *Follow-up:* add a `cyrius build --agnos` step to CI — the AGNOS arm is currently never compiled there.
+
 ## v1.0 criteria
-- [ ] GET + POST + arbitrary methods + custom headers; redirects; chunked; HTTPS with cert verification (`tls_native_client_verify_hostname`).
-- [ ] **No POSIX `socket()`** anywhere in the AGNOS backend — sovereign syscalls only.
-- [ ] AGNOS backend resolves + fetches `https://` end-to-end (DNS → TCP → TLS → HTTP), iron-validated.
-- [ ] Consumes `taar` (`tcp` / `tls` / `http` modules added by whirl) — no network primitives vendored locally.
+- [x] GET + POST + arbitrary methods + custom headers; redirects; chunked; HTTPS with cert verification — shipped 0.3.0–0.5.3, fail-closed verify proven against a reachable bad-cert server.
+- [x] **No POSIX `socket()`** anywhere in the AGNOS backend — sovereign syscalls only. The agnos arm binds `sock_*`#47-50 / `udp_*`#51-54 exclusively.
+- [ ] AGNOS backend resolves + fetches `https://` end-to-end (DNS → TCP → TLS → HTTP) — **QEMU-validated at 0.6.2**; the remaining half is **iron** on archaemenid.
+- [ ] Consumes `taar` — `tcp` shipped at taar 0.2.0 and whirl runs on it; `tls` / `http` modules are still unwritten. No network primitives vendored locally either way.
 
 ---
 
 ## AGNOS call surface (the calls to lock down)
 
-whirl's `platform_agnos.cyr` binds **only** the calls below. **The kernel half of every one already landed** — the remaining work is the cyrius-side `CYRIUS_TARGET_AGNOS` wiring (the language agent's job; mirrors the dig/yo client-band peer at cyrius 6.2.3+).
+whirl's AGNOS arm binds **only** the calls below. Unlike dig/yo there is **no `platform_agnos.cyr`** — the dispatch is inline `#ifdef CYRIUS_TARGET_AGNOS` in `src/transport.cyr`, `src/main.cyr` and `src/output.cyr`. **The kernel half of every call landed**, and the cyrius-side wiring landed too: composed at 0.6.1, proven end-to-end on QEMU at **0.6.2**, and rebuilt onto the direct `tls_native_*` path at 0.6.3.
 
 | Need | AGNOS kernel syscall | Status (kernel) | cyrius peer |
 |---|---|---|---|
@@ -84,7 +98,12 @@ whirl's `platform_agnos.cyr` binds **only** the calls below. **The kernel half o
 | TLS / nonce entropy | `getrandom`#45 (buf, len, flags) — Zen RDRAND | ✅ landed agnos 1.45.0 | `random.cyr` / `SYS_GETRANDOM=45` ✅ |
 | DNS resolve | UDP-53 `udp_bind`#51 / `udp_send`#52 / `udp_recv`#53 / `udp_unbind`#54 | ✅ landed agnos 1.45.3 | `taar.dns` (to grow) over the UDP wrappers; dig already drives this path |
 | Monotonic clock / sleep | `uptime_ms`#40 / `sleep_ms`#41 | ✅ landed | `sys_uptime_ms` / `sys_sleep_ms` wrappers (cyrius ≥ 6.2.6) ✅ |
+| Kernel-leased resolver | `net_config`#61 field 3 (DHCP option-6 nameserver) | ✅ landed agnos 1.45.16 | `sys_net_dns_server()` wrapper ✅ — reached via `taar_resolve_ipv4` → `_taar_resolv_discover`, tried **before** `/etc/resolv.conf`. Hard dependency since 0.6.2: the off-subnet `8.8.8.8` fallback needs gateway routing the kernel can't guarantee on iron. |
 
-**Net:** whirl needs **zero new kernel syscalls** — every call is already exposed and (for the client band) already wired in the cyrius peer. The only genuinely new cyrius-side work is composing `tls_native` over the agnos socket transport for the **server-cert-verifying HTTPS client** path, which the dig/yo client-band peer already proved transport-side. This is the lock-down: when the transport src lands, the language agent confirms `tls_native` builds + verifies for `CYRIUS_TARGET_AGNOS` and whirl's `https://` fetch runs end-to-end.
+**Net:** whirl needed **zero new kernel syscalls**, and the lock-down is closed. Composing `tls_native` over the agnos socket transport for the server-cert-verifying HTTPS client — the one genuinely new cyrius-side item — landed at 0.6.1 and was proven end-to-end on QEMU at 0.6.2 (0.6.2 also corrected 0.6.1's premature "correct-by-construction" claim). What remains is **not** transport composition:
+
+- **Iron validation** on archaemenid (above) — the only open item on the critical path.
+- **taar's `tls` / `http` modules**, still unwritten.
+- Whether `_agnos_ca_hook` is now redundant, given cyrius v6.2.23 fixed the `tls_native_set_ca_system` agnos-ABI defect it works around. Needs a run on real agnos, not a code read.
 
 > Cross-refs: [agnos net-syscall arc](https://github.com/MacCracken/agnosticos/blob/main/docs/development/state.md) (#45-#57) · [taar](https://github.com/MacCracken/taar) (substrate) · [dig `platform_agnos.cyr`](https://github.com/MacCracken/dig) (the UDP backend pattern to mirror for TCP).
