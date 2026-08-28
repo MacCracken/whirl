@@ -114,11 +114,148 @@ fn probe_ca_system(): i64 {
     p_int(rc);
     p_out("\n");
     if (rc == 0) {
-        p_info("b3-verdict set_ca_system SUCCEEDS on agnos -- _agnos_ca_hook is REDUNDANT, retire it");
+        p_info("b3-abi set_ca_system SUCCEEDS on agnos -- the v6.2.23 ABI fix is effective");
+        p_info("b3-abi NOTE this settles the ABI only; see b3-cost before retiring anything");
     } else {
-        p_info("b3-verdict set_ca_system STILL FAILS on agnos -- _agnos_ca_hook must stay");
+        p_info("b3-abi set_ca_system STILL FAILS on agnos -- the hook's ABI workaround is load-bearing");
     }
     tls_native_close(nctx);
+    return 0;
+#endif
+}
+
+# --- 2b. B3, decisively: does set_ca_system actually VERIFY? ------------------
+#
+# `set_ca_system` returning 0 proves it loaded *something*. It does not prove the
+# roots are real, and it does not prove verification still enforces. Retiring
+# `_agnos_ca_hook` on a return code alone could swap a working trust path for an
+# empty store (everything fails closed) or, far worse, a permissive one.
+#
+# So do the only test that settles it: two real handshakes, using ONLY
+# set_ca_system for roots — no hook anywhere in the path.
+#   good: a public host with a valid chain      MUST reach TLS_OK
+#   bad:  a self-signed server on the QEMU host MUST NOT reach TLS_OK
+# Both are needed. `good` alone cannot distinguish a real trust store from a
+# permissive one; `bad` alone cannot distinguish enforcement from an empty store.
+
+# Open a TCP connection to host:port over taar and hand back the fd, or -1.
+fn _probe_connect(host, port): i64 {
+    var ip = taar_resolve_ipv4(host);
+    if (ip < 0) { return 0 - 1; }
+    var fd = taar_tcp_open();
+    if (fd < 0) { return 0 - 1; }
+    taar_tcp_set_timeout_ms(fd, 10000);
+    if (taar_tcp_connect(fd, ip, port) < 0) { taar_sock_close(fd); return 0 - 1; }
+    return fd;
+}
+
+# Handshake with roots from set_ca_system ONLY. Returns tls_native_connect's
+# code, or a sentinel: -900 connect failed, -901 ctx alloc failed,
+# -902 set_ca_system failed.
+fn _probe_handshake(host, port): i64 {
+    var fd = _probe_connect(host, port);
+    if (fd < 0) { return 0 - 900; }
+    tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0);
+    var nctx = tls_native_new_client(host, strlen(host));   # TLS_VERIFY_PEER default
+    if (nctx == 0) { taar_sock_close(fd); return 0 - 901; }
+    if (tls_native_set_ca_system(nctx) != 0) {
+        tls_native_close(nctx); taar_sock_close(fd); return 0 - 902;
+    }
+    var rc = tls_native_connect(nctx, fd);
+    tls_native_close(nctx);
+    taar_sock_close(fd);
+    return rc;
+}
+
+fn probe_b3_verify(): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    p_info("b3-verify SKIPPED (agnos-only; this is a host build)");
+    return 0;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    var good = _probe_handshake("example.com", 443);
+    p_out("PROBE: INFO b3-good-rc ");
+    p_int(good);
+    p_out("\n");
+    p_check("b3-good-verifies (valid chain reaches TLS_OK on set_ca_system roots)",
+            good == TLS_OK);
+
+    # 10.0.2.2 is the QEMU host under SLIRP. The harness runs a self-signed
+    # server there whose cert names 10.0.2.2, so a rejection is due to the
+    # UNTRUSTED ISSUER and not a hostname mismatch — which is precisely the
+    # property the trust store is responsible for.
+    var bad = _probe_handshake("10.0.2.2", 18443);
+    p_out("PROBE: INFO b3-bad-rc ");
+    p_int(bad);
+    p_out("\n");
+    if (bad == (0 - 900)) {
+        p_info("b3-bad SKIPPED (no self-signed server reachable at 10.0.2.2:18443)");
+        p_fail("b3-bad-inconclusive -- cannot retire the hook without a negative result");
+        return 0;
+    }
+    p_check("b3-bad-rejected (self-signed chain does NOT reach TLS_OK)", bad != TLS_OK);
+    return 0;
+#endif
+}
+
+# --- 2c. B3 cost: what does retiring the hook actually cost? ------------------
+#
+# The premise of B3 was that `_agnos_ca_hook` exists ONLY to work around the
+# agnos sys_open ABI defect, so a fixed ABI makes it dead weight. 2b proved the
+# ABI is fixed. But the hook acquired a SECOND job at 0.6.8 that the premise did
+# not account for: it caches the bundle, because the allocator is a bump
+# allocator with no free and re-reading 1 MiB per TLS connect is a permanent
+# leak — ~1 MiB per redirect hop and per crawled resource.
+#
+# `tls_native_set_ca_system` allocates its own 1 MiB buffer on EVERY call
+# (lib/tls_native_hs12.cyr) and caches nothing. So this measures the difference
+# instead of assuming it: heap growth across repeated calls, hook vs set_ca_system.
+fn probe_b3_cost(): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    p_info("b3-cost SKIPPED (agnos-only; this is a host build)");
+    return 0;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    var rounds = 4;
+
+    # The hook: bundle already loaded, so each call should add ~nothing.
+    var host = "example.com";
+    var h0 = alloc_used();
+    var i = 0;
+    while (i < rounds) {
+        var c1 = tls_native_new_client(host, strlen(host));
+        if (c1 != 0) { _agnos_ca_hook(0, c1); tls_native_close(c1); }
+        i = i + 1;
+    }
+    var hook_cost = alloc_used() - h0;
+
+    # set_ca_system: a fresh 1 MiB read every time.
+    var s0 = alloc_used();
+    var j = 0;
+    while (j < rounds) {
+        var c2 = tls_native_new_client(host, strlen(host));
+        if (c2 != 0) { tls_native_set_ca_system(c2); tls_native_close(c2); }
+        j = j + 1;
+    }
+    var sys_cost = alloc_used() - s0;
+
+    p_out("PROBE: INFO b3-cost-rounds ");
+    p_int(rounds);
+    p_out("\n");
+    p_out("PROBE: INFO b3-cost-hook-bytes ");
+    p_int(hook_cost);
+    p_out("\n");
+    p_out("PROBE: INFO b3-cost-set-ca-system-bytes ");
+    p_int(sys_cost);
+    p_out("\n");
+
+    # Both paths allocate a TLS ctx per round; only set_ca_system adds a 1 MiB
+    # bundle read on top. If it does not, the premise holds and the hook can go.
+    if (sys_cost > (hook_cost + 1048576)) {
+        p_info("b3-cost-verdict set_ca_system leaks ~1 MiB PER CONNECT -- the hook's CACHE is still load-bearing, do NOT retire");
+    } else {
+        p_info("b3-cost-verdict set_ca_system costs no more than the hook -- retiring is free");
+    }
     return 0;
 #endif
 }
@@ -231,6 +368,8 @@ fn main() {
 
     probe_ca();
     probe_ca_system();
+    probe_b3_verify();
+    probe_b3_cost();
     probe_resume();
     probe_resume_guard();
     probe_symlink();

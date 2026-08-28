@@ -88,6 +88,27 @@ mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext2 -F -q -L AGNOS-PROBE -b 4096 -m 0 -O "$EXT2_FEATURES" \
     -d "$ROOTFS" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
+# --- self-signed TLS server for the B3 negative check -------------------------
+# Under SLIRP the guest reaches this host at 10.0.2.2, so a server here is a
+# reachable bad-cert endpoint for the guest — the public *.badssl.com hosts are
+# NOT reachable from this network, and a probe that cannot connect proves
+# nothing. The cert NAMES 10.0.2.2, so a rejection is attributable to the
+# untrusted issuer rather than a hostname mismatch.
+BADSSL_PORT=18443
+BADPID=""
+if command -v openssl >/dev/null 2>&1; then
+    openssl req -x509 -newkey rsa:2048 -keyout "$WORK/bad-key.pem" -out "$WORK/bad-cert.pem" \
+        -days 2 -nodes -subj "/CN=10.0.2.2" -addext "subjectAltName=IP:10.0.2.2" >/dev/null 2>&1
+    if [ -f "$WORK/bad-cert.pem" ]; then
+        openssl s_server -quiet -cert "$WORK/bad-cert.pem" -key "$WORK/bad-key.pem" \
+            -accept "$BADSSL_PORT" -naccept 4 -www >/dev/null 2>&1 &
+        BADPID=$!
+        sleep 1
+        echo "  self-signed server up on :$BADSSL_PORT (guest sees 10.0.2.2:$BADSSL_PORT)"
+    fi
+fi
+[ -z "$BADPID" ] && echo "  WARNING: no self-signed server — the B3 negative check is inconclusive"
+
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"; : > "$SER"; rm -f "$MON"
 KVM_ARGS="-cpu max"; [ -e /dev/kvm ] && KVM_ARGS="-enable-kvm -cpu host"
 
@@ -110,13 +131,14 @@ SER = sys.argv[1]
 def ser():
     try: return open(SER, "rb").read().decode("latin1")
     except OSError: return ""
-for _ in range(240):          # up to 120s
+for _ in range(600):          # up to 300s — the B3 handshakes add real time
     d = ser()
     if "PROBE: END" in d: break
     time.sleep(0.5)
 PYEOF
 
 sleep 1; kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
+[ -n "$BADPID" ] && { kill "$BADPID" 2>/dev/null; wait "$BADPID" 2>/dev/null; }
 
 echo ""
 echo "=== probe output ==="
@@ -140,7 +162,8 @@ else
         rc=1
     fi
     # B3 is a question, not a gate — surface the answer either way.
-    grep -a 'b3-verdict' "$SER" | sed 's/^PROBE: INFO /  B3: /'
+    grep -aE 'b3-verdict|b3-good|b3-bad' "$SER" \
+        | sed 's/^PROBE: INFO /  B3: /; s/^PROBE: PASS /  B3 PASS: /; s/^PROBE: FAIL /  B3 FAIL: /'
 fi
 echo "  full serial: $SER"
 [ $KEEP -eq 0 ] && rm -rf "$ROOTFS" "$IMG"

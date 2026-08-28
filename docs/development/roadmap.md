@@ -30,6 +30,7 @@ One line per release; detail in the [CHANGELOG](../../CHANGELOG.md).
 | 0.6.6 | **P-1 security sweep** — remote arbitrary file write via `-r`, request splitting via `Location`, cross-origin credential replay, silent truncation. CI compiles the AGNOS arm; `tests/behavior.py` added |
 | 0.6.7 | **P-2 tier** — crawl confined to an origin, port correctness throughout, overflow bounds; `src/crawl.cyr` extracted |
 | 0.6.8 | **P-3 tier** — checked allocation, Linux symlink refusal, both crawl caps reported; `src/util.cyr` + `src/version.cyr` |
+| 0.6.11 | **B3 closed as "won't do"** — the hook's ABI rationale is obsolete but its *cache* is load-bearing: `set_ca_system` leaks 1 MiB per connect (measured). Rationale rewritten in code; upstream ask raised as B4 |
 | 0.6.10 | **A2** — probe covering the agnos-only trust-store, resume and symlink paths (11 checks on a real kernel); fixed `output_append`'s agnos return contract; answered B3 |
 | 0.6.9 | **QEMU-revalidated on AGNOS** — HTTP + HTTPS end-to-end on a real kernel; fixed the defect that run found (a complete response reported truncated because whirl waited for a socket close it did not need) |
 
@@ -72,12 +73,20 @@ From the 0.6.6 audit; full detail in [`state.md`](state.md) § *Open defects*.
 - [ ] **B2 — `_save_tree` TOCTOU on Linux.** The `lstat` runs before the write.
       Closing the race needs `O_NOFOLLOW` on the write itself, i.e. a private
       open/write path instead of `file_write_all`.
-- [ ] **B3 — Retire `_agnos_ca_hook`.** **Answered at 0.6.10, not yet done.**
-      The probe calls `tls_native_set_ca_system` directly on agnos and it returns
-      **0** — cyrius v6.2.23's ABI fix is effective and the hook is redundant.
-      Retiring it is now a mechanical change plus one validation: an agnos HTTPS
-      fetch with the hook disabled, proving `set_ca_system` alone establishes the
-      trust roots. Kept separate because the hook is the HTTPS trust path.
+- [x] **B3 — Retire `_agnos_ca_hook`** ✅ **closed at 0.6.11 as "won't do".**
+      The premise was that the hook only works around the agnos `sys_open` ABI
+      defect. That defect *is* fixed, and the probe confirmed on a real kernel
+      that `set_ca_system` verifies a valid chain and rejects a self-signed one.
+      But the hook picked up a second job at 0.6.8 — it **caches** the bundle —
+      and cyrius's `set_ca_system` re-reads 1 MiB per call against a bump
+      allocator with no free. Measured: 1 MiB leaked **per TLS connect**
+      (~64 MiB on an HTTPS crawl). Retiring it would have reintroduced the leak
+      0.6.8 removed. The hook stays; its rationale in the code now says so.
+- [ ] **B4 — Upstream: cyrius should cache the system trust bundle.**
+      `tls_native_set_ca_system` allocates 1 MiB on every call and caches
+      nothing. Every agnos TLS consumer pays that, not just whirl. Fixing it
+      upstream is what makes B3 genuinely doable — at which point
+      `_agnos_ca_hook` becomes deletable in a one-line change.
 
 ### C. Substrate — `taar` `tls` / `http` modules
 

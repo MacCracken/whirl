@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-08-27 (0.6.10 — **A2 complete**: the agnos-only trust-store, `-C` resume and symlink paths now execute on a real kernel (11 checks, 0 failures) via `tests/agnos_probe.cyr`, which found a latent `output_append` contract defect and answered B3. Previously 0.6.9 — **QEMU-revalidated on AGNOS**, the first execution of the agnos arm since 0.6.2. It found a real defect on the first run: whirl waited for a socket close it did not need, so a complete chunked body was reported truncated. Fixed — the response framing is now the authority. Iron on archaemenid still the open validation step.)
+> **Last refresh**: 2026-08-27 (0.6.11 — **B3 closed as "won't do"**: the ca-hook's ABI rationale is obsolete, but its *cache* is load-bearing — `set_ca_system` leaks a measured 1 MiB per TLS connect. Raised upstream as B4. Previously 0.6.10 — **A2 complete**: the agnos-only trust-store, `-C` resume and symlink paths now execute on a real kernel (11 checks, 0 failures) via `tests/agnos_probe.cyr`, which found a latent `output_append` contract defect and answered B3. Previously 0.6.9 — **QEMU-revalidated on AGNOS**, the first execution of the agnos arm since 0.6.2. It found a real defect on the first run: whirl waited for a socket close it did not need, so a complete chunked body was reported truncated. Fixed — the response framing is now the authority. Iron on archaemenid still the open validation step.)
 
 ---
 
@@ -10,7 +10,7 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.6.10** (HTTP/1.1 + HTTPS; GET/POST/methods + headers + `-A` UA; `-i`/`-I`/`-f`; **`-r` recursive** w/ tree-mirroring + robots.txt `Allow`/`Disallow` precedence, `-O`, `-C` **resume**, `--retry` — over the taar transport; **HTTP + HTTPS both run on AGNOS**, QEMU-validated at 0.6.2, rebuilt at 0.6.3 onto the sovereign `tls_native_*` path) |
+| Current version | **0.6.11** (HTTP/1.1 + HTTPS; GET/POST/methods + headers + `-A` UA; `-i`/`-I`/`-f`; **`-r` recursive** w/ tree-mirroring + robots.txt `Allow`/`Disallow` precedence, `-O`, `-C` **resume**, `--retry` — over the taar transport; **HTTP + HTTPS both run on AGNOS**, QEMU-validated at 0.6.2, rebuilt at 0.6.3 onto the sovereign `tls_native_*` path) |
 | Status | Working. `whirl [-X M] [-d DATA\|@file\|@-] [--data-binary D] [-H 'H: v'] [-A UA] [-i] [-I] [-f] [-r [-l N]] [-O\|-o FILE] [-C] [-L] [--retry N] http(s)://…` — resolve + connect (+ TLS) + request + emit/save; redirects (`-L`); recursive same-host crawl (`-r`); cert chain + hostname verified fail-closed. |
 | Module footprint | `src/{version,util,url,http,cli,crawl,transport,output,links,main}.cyr` (+ `test.cyr`) — 11 modules, ~2,100 lines. `crawl.cyr` (0.6.7) holds link resolution, path confinement and robots parsing as pure logic, so the security-critical half is reachable from the unit suite. url / http / links / path-normalize pure-tested; transport rides taar (TCP+DNS), with TLS for https. |
 | Cyrius pin | **6.5.35** (family-aligned with yo + taar; `dig` is the outlier at 6.2.24) |
@@ -26,7 +26,7 @@
 
 whirl needs **zero new kernel syscalls** — the full call surface (`sock_*`#47-50, `getrandom`#45, UDP-53 #51-54, `net_config`#61, `uptime_ms`#40/`sleep_ms`#41, `stat`#33/`mkdir`) is landed, and the client band + `tls_native` are wired in the cyrius peer. **0.6.0**: the plain-HTTP path runs on agnos (taar 0.3.0's sovereign backend; `CYRIUS_TARGET_AGNOS=1` compiles the whole tool). **0.6.1**: composed `tls_native` over the taar socket via `tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0)` (the agnos TCP "fd" is a sentinel, so the default raw-fd path won't route; `now_fn=0` keeps the `sys_time_unix`#46 cert clock). **0.6.2**: **QEMU-validated** (virtio-net + SLIRP) — real example.com fetched over HTTP *and* HTTPS, which also proved 0.6.1's "correct-by-construction" claim had been wrong; needed `_agnos_ca_hook` for trust roots. **0.6.3**: dropped the `tls.cyr` facade on agnos for direct `tls_native_*` calls (static binaries have no `ld.so`, so `fdlopen` is both unbuildable and unusable). **0.6.4**: confirmed under mirshi. **Iron on archaemenid is the remaining step.** Full table in [`roadmap.md`](roadmap.md) § *AGNOS call surface*.
 
-> **Note (0.6.10):** the cyrius-peer defect `_agnos_ca_hook` works around — `tls_native_set_ca_system` opening the CA bundle with the Linux `sys_open` ABI — was fixed upstream at cyrius v6.2.23. `tests/agnos_probe.cyr` calls `set_ca_system` directly on a real agnos kernel and it returns **0**, so the hook is **proven redundant**, not merely suspected. Retiring it is roadmap **B3**: mechanical, plus one HTTPS fetch with the hook disabled to prove `set_ca_system` alone establishes the roots.
+> **Note (0.6.11):** the cyrius-peer defect `_agnos_ca_hook` was written for — `set_ca_system` opening the CA bundle with the Linux `sys_open` ABI — is fixed (cyrius v6.2.23). `tests/agnos_probe.cyr` proves it on a real kernel: `set_ca_system` returns 0, verifies a valid chain, and rejects a self-signed one. **The hook still stays.** It became the bundle cache at 0.6.8, and `set_ca_system` re-reads 1 MiB per call against a bump allocator with no free — measured at 1 MiB leaked per TLS connect, ~64 MiB on an HTTPS crawl. Retiring it is correct only once cyrius caches upstream (**B4**).
 
 ## Carry-forward (dependent on other repos)
 
@@ -43,7 +43,7 @@ Carried from the 0.6.6 audit — see [`../../CHANGELOG.md`](../../CHANGELOG.md) 
 |---|---|
 | `-r` symlink write on **AGNOS** | refused on Linux since 0.6.8 via `lstat`; agnos has no `lstat` peer and its `sys_stat`#33 follows the final symlink, so the check cannot be expressed there. Needs a kernel-side `lstat` or `O_NOFOLLOW` |
 | `_save_tree` TOCTOU | the Linux `lstat` runs before the write; closing the race needs `O_NOFOLLOW` on the write itself, i.e. bypassing `file_write_all` |
-| `_agnos_ca_hook` | **proven redundant at 0.6.10** — `tls_native_set_ca_system` returns 0 on real agnos, so cyrius v6.2.23's ABI fix is effective. Retiring it is a mechanical change plus one validating HTTPS fetch with the hook disabled (roadmap **B3**) |
+| `_agnos_ca_hook` | **resolved at 0.6.11 — keep it.** The ABI defect it was written for is fixed (verified on a real kernel: valid chain → TLS_OK, self-signed → rejected), but the hook is now the bundle **cache**, and `set_ca_system` leaks a measured **1 MiB per connect** without it. Retirable only once cyrius caches upstream (roadmap **B4**) |
 | crawl caps | the 64-resource and 64-per-page caps are reported since 0.6.8, but there is no flag to raise them |
 
 > The 0.6.6 audit is now closed out. Cleared at 0.6.7: origin confinement,

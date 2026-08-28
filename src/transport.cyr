@@ -109,17 +109,35 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
 }
 
 #ifdef CYRIUS_TARGET_AGNOS
-# CA-trust hook for agnos. cyrius's `tls_native_set_ca_system` opens the bundle
-# with the Linux `sys_open(path, flags, mode)` ABI, but agnos `sys_open` is
-# `(name, namelen, flags)` — so it passes namelen=0 → empty path → the CA file
-# never opens → TLS_ERR_IO → fail-closed (no roots). Filed upstream as cyrius
-# issue 2026-06-18-tls-native-set-ca-system-agnos-sys-open-abi. Until that lands,
-# this hook (called by _agnos_tls_native_connect AFTER new_client) reads the
-# staged /etc/ssl/cert.pem with the correct agnos ABI and installs it via
-# tls_native_set_ca_bundle — the roots the chain then verifies against.
-# The loaded bundle, cached across connects. The allocator is a bump allocator
-# with no free, so the old per-connect xalloc(1 MiB) was permanently retained on
-# every TLS connection — ~1 MiB leaked per redirect hop and per crawled resource.
+# CA-trust hook for agnos: read the system trust bundle ONCE and install it into
+# each new TLS ctx. Called by _agnos_tls_native_connect after new_client.
+#
+# ⚠ WHY IT STILL EXISTS (re-examined at 0.6.11 — roadmap B3).
+#
+# It was written at 0.6.2 to work around a cyrius defect: `set_ca_system` opened
+# the bundle with the Linux `sys_open(path, flags, mode)` ABI while agnos
+# `sys_open` is `(name, namelen, flags)`, so namelen=0 opened an empty path,
+# every candidate failed, and the ctx was built with NO roots (filed as
+# 2026-06-18-tls-native-set-ca-system-agnos-sys-open-abi). **That defect is
+# fixed.** cyrius v6.2.23 routes through `file_open`, and tests/agnos_probe.cyr
+# confirms on a real kernel that `set_ca_system` returns 0, verifies a valid
+# chain (TLS_OK), and still rejects a self-signed one. The original reason is gone.
+#
+# It stays for a reason it acquired later, at 0.6.8: **it is the cache.**
+# cyrius's `set_ca_system` allocates a fresh 1 MiB buffer on every call and
+# caches nothing (lib/tls_native_hs12.cyr), and this allocator is a bump
+# allocator with no free — so calling it per connect leaks 1 MiB per TLS
+# connection, permanently. The probe measures exactly that: over 4 handshakes,
+# 1,072,320 bytes through this hook vs 5,266,624 through `set_ca_system` — a
+# difference of 4,194,304, i.e. 1 MiB per connect. An HTTPS `-r` crawl at the
+# 64-resource cap would leak ~64 MiB.
+#
+# Retiring this becomes correct once cyrius caches the system bundle itself.
+# Until then the hook IS the cache — do not remove it on the strength of the ABI
+# fix alone. That was B3's premise, and it was incomplete.
+#
+# The four candidate paths below are the same four, in the same order, as
+# cyrius's `set_ca_system`. The difference is that these are read once.
 var _agnos_ca_buf = 0;
 var _agnos_ca_len = 0;
 var _agnos_ca_path = 0;   # the trust-store path that actually opened (0 = none)
@@ -186,8 +204,9 @@ fn _agnos_tls_native_connect(fd, host): i64 {
     while (load8(host + hl) != 0) { hl = hl + 1; }
     var nctx = tls_native_new_client(host, hl);   # TLS_VERIFY_PEER by default
     if (nctx == 0) { return 0; }
-    # tls_native_set_ca_system opens the bundle with the Linux sys_open ABI (fails
-    # on agnos), so install the staged roots directly with the correct agnos ABI.
+    # Install roots from the cached bundle rather than calling
+    # tls_native_set_ca_system, which re-reads 1 MiB per connect and never frees
+    # it. NOT an ABI workaround any more — see the comment on _agnos_ca_hook.
     _agnos_ca_hook(0, nctx);
     # CVE-18: tls_native_connect verifies chain + hostname fail-closed before TLS_OK.
     if (tls_native_connect(nctx, fd) != TLS_OK) { tls_native_close(nctx); return 0; }

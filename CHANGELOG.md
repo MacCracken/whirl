@@ -5,6 +5,86 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.11] — 2026-08-27 (B3 resolved: the hook stays, and now we know why)
+
+Roadmap **B3** was "retire `_agnos_ca_hook`". Investigating it properly says
+**don't** — and the reason is not the one B3 assumed. No functional change to
+whirl; the deliverable is a measurement, a corrected rationale in the code, and
+a closed roadmap item.
+
+### The premise, and why it was incomplete
+B3 rested on one claim: the hook exists *only* to work around a cyrius defect
+where `tls_native_set_ca_system` opened the trust bundle with the Linux
+`sys_open(path, flags, mode)` ABI while agnos `sys_open` is
+`(name, namelen, flags)` — so every candidate path opened an empty filename and
+the TLS ctx was built with no roots. Fix the ABI, retire the hook.
+
+The ABI **is** fixed (cyrius v6.2.23 routes through `file_open`), and 0.6.10's
+probe confirmed `set_ca_system` returns 0 on a real kernel. What the premise
+missed is that the hook picked up a **second job at 0.6.8**: it caches the
+bundle. That job is still load-bearing.
+
+### Measured on real AGNOS
+`set_ca_system` allocates a fresh 1 MiB buffer on every call and caches nothing
+(`lib/tls_native_hs12.cyr`), against a bump allocator with no `free`. Over 4
+handshakes:
+
+| path | 4 rounds | per connect |
+|---|---|---|
+| `_agnos_ca_hook` (cached) | 1,072,320 B | TLS ctx only |
+| `tls_native_set_ca_system` | 5,266,624 B | ctx **+ 1 MiB bundle** |
+
+The difference is 4,194,304 bytes — exactly 1 MiB per connect, permanently
+retained. An HTTPS `-r` crawl at the 64-resource cap would leak ~64 MiB.
+**Retiring the hook would have reintroduced the leak 0.6.8 removed.**
+
+### Verified before deciding
+Retiring on a return code alone would have been unsound — `set_ca_system`
+returning 0 proves it loaded *something*, not that the roots are real or that
+verification still enforces. So the probe now does two real handshakes on agnos
+using **only** `set_ca_system` for roots, with the hook out of the path:
+
+- **valid chain** (`example.com:443`) → `TLS_OK`. Roots are real.
+- **self-signed chain** → **rejected** (`-6`). Verification still enforces.
+
+Both were needed: the positive alone cannot distinguish a real trust store from
+a permissive one, and the negative alone cannot distinguish enforcement from an
+empty store. The bad-cert endpoint is a self-signed `openssl s_server` on the
+QEMU **host**, reached by the guest at `10.0.2.2` through SLIRP — the public
+`*.badssl.com` hosts are unreachable from this network, and a probe that cannot
+connect proves nothing. Its cert **names** `10.0.2.2`, so the rejection is
+attributable to the untrusted issuer rather than a hostname mismatch.
+
+So the conclusion is not "the hook might still be needed" — it is: the trust
+path would have worked, and the memory cost is what makes retiring wrong.
+
+### Changed
+- **`src/transport.cyr` — the hook's rationale rewritten.** Its comment still
+  said it existed because `set_ca_system` fails on agnos. That is now false, and
+  a false comment on a security-relevant path is worse than no comment: it would
+  send the next reader to delete the hook the moment they noticed the ABI was
+  fixed. It now records what is true — the ABI is fixed, the hook is the cache,
+  here is the measurement, and here is the condition under which retiring
+  becomes correct (cyrius caching the bundle itself).
+- **`tests/agnos_probe.cyr`** gained `b3-verify` (the two handshakes) and
+  `b3-cost` (the allocation measurement, via `alloc_used()`). Its old verdict
+  line asserted "REDUNDANT, retire it" from the return code alone; that was the
+  incomplete conclusion this release corrects, so it now reports the ABI result
+  and defers the decision to the cost check.
+- **`tests/agnos-probe.sh`** stands up the self-signed server on the host before
+  boot and tears it down after. If `openssl` is absent it says so and the
+  negative check reports **inconclusive rather than passing** — a bad-cert test
+  that cannot reach its endpoint must never read as a pass.
+
+### Validated on AGNOS (QEMU + KVM) — 13 checks, 0 failures
+The 11 checks from 0.6.10 plus the two B3 handshakes.
+
+### Roadmap
+**B3 closes as "won't do", with evidence.** It is replaced by an upstream ask:
+*cyrius should cache the system trust bundle in `set_ca_system`* — the same
+defect exists for every agnos TLS consumer, not just whirl, and fixing it there
+is what makes the hook genuinely retirable.
+
 ## [0.6.10] — 2026-08-27 (A2: the AGNOS paths the smoke never reached — and B3 answered)
 
 Roadmap **A2**. The QEMU smoke drives three typed commands, so three
