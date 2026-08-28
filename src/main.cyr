@@ -234,7 +234,6 @@ fn _mkdir(path): i64 {
 fn _save_tree(path, buf, len): i64 {
     var rp = tree_relpath(path);      # 0 = refuses to escape cwd (see crawl.cyr)
     if (rp == 0) { return 0 - 1; }
-    if (fs_is_symlink(rp) == 1) { return 0 - 1; }
     var w = strlen(rp);
     var j = 0;
     while (j < w) {
@@ -245,7 +244,9 @@ fn _save_tree(path, buf, len): i64 {
         }
         j = j + 1;
     }
-    var wr = file_write_all(rp, buf, len);
+    # Symlink refusal happens INSIDE the write now (O_NOFOLLOW on Linux), not as
+    # a separate pre-check — that ordering was the TOCTOU window.
+    var wr = fs_write_no_follow(rp, buf, len);
     if (wr < 0) { return wr; }
     return 0;
 }

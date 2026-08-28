@@ -68,6 +68,12 @@ echo "  /bin/agnsh <- whirl-agnos-probe ($(stat -c%s "$ROOTFS/bin/agnsh") bytes)
 # A real system has one; the agnos rootfs does not. The probe writes its scratch
 # files to / for that reason, but create it anyway so the image is less surprising.
 mkdir -p "$ROOTFS/tmp"
+# Plant a real symlink so the probe can prove fs_is_symlink DETECTS one on
+# agnos, not merely that it returns without faulting. mkfs.ext2 -d preserves
+# symlinks, and the rootfs is ext2 — which readlink#70 requires.
+ln -sfn /etc/ssl/cert.pem "$ROOTFS/probe-symlink"
+printf 'notalink' > "$ROOTFS/probe-regular"
+echo "  planted /probe-symlink -> /etc/ssl/cert.pem, and /probe-regular"
 [ -f "$ROOTFS/etc/ssl/cert.pem" ] \
     && echo "  trust store present: $(stat -c%s "$ROOTFS/etc/ssl/cert.pem") bytes" \
     || echo "  WARNING: no /etc/ssl/cert.pem staged — the ca-load probe will report FAIL"

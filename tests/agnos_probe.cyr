@@ -348,11 +348,22 @@ fn probe_symlink(): i64 {
     p_int(r1);
     p_out("\n");
 #ifdef CYRIUS_TARGET_AGNOS
-    # On agnos the answer is 0 BY CONSTRUCTION, whatever the file really is.
-    p_check("symlink-agnos-returns-zero", r1 == 0);
+    # 0.6.12: agnos detects symlinks for real now, via readlink#70. The harness
+    # plants a known link and a known regular file, so this proves DETECTION —
+    # a check that only asserted "returns 0 without faulting" would have passed
+    # just as happily against the old stub that could never say yes.
+    var lnk = fs_is_symlink("/probe-symlink");
+    var reg = fs_is_symlink("/probe-regular");
+    p_out("PROBE: INFO symlink-planted-link ");
+    p_int(lnk);
+    p_out(" planted-regular ");
+    p_int(reg);
+    p_out("\n");
+    p_check("symlink-detects-real-link (readlink#70 says yes)", lnk == 1);
+    p_check("symlink-regular-not-a-link (no false positive)", reg == 0);
 #endif
 #ifdef CYRIUS_TARGET_AGNOS
-    p_info("symlink-gap agnos returns 0 by construction -- no lstat peer (roadmap B1)");
+    p_info("symlink agnos detection is live via readlink#70 (roadmap B1 closed at 0.6.12)");
 #endif
 #ifndef CYRIUS_TARGET_AGNOS
     p_info("symlink host build: lstat is real here, so 0 means 'not a symlink', not 'cannot tell'");

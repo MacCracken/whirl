@@ -5,6 +5,122 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.13] — 2026-08-27 (B2, Linux half: the symlink refusal moved inside the open)
+
+Roadmap **B2** — the check-then-write race in `_save_tree`. Since 0.6.8 whirl has
+refused to write through a symlink by *checking first* (`lstat` on Linux,
+`readlink`#70 on agnos since 0.6.12) and then writing. That ordering is the
+window: between the check and the open, anything that can write to the output
+directory can replace the path with a symlink, and the write lands wherever it
+points. `-r` writes many files into a directory whirl does not own, so an
+attacker gets unlimited retries.
+
+### Security
+- **Linux: the race is closed.** `fs_write_no_follow` opens with `O_NOFOLLOW`,
+  making the refusal part of the open itself — there is no window to lose. The
+  separate pre-check is gone on that target; keeping both would have left the
+  slower path deciding.
+- **AGNOS: unchanged, and cannot be fixed here.** `open`(7) has no no-follow flag
+  and no `O_EXCL` either, so the pre-check remains the best available and the
+  race remains. Filed as agnos issue
+  `2026-08-27-open-ao-nofollow-flag` — the kernel already has the machinery
+  (`ext2_path_lookup_ex(..., follow_last=0)`, `kernel/core/ext2.cyr:3032`, used
+  by `readlink`#70); the ask is to expose it on `open`.
+- `O_NOFOLLOW` is **not exported** by `lib/syscalls_*.cyr` — sigil writes the
+  x86_64 literal inline and says so. Its Linux value is **arch-dependent**
+  (`0400000` = 131072 on x86_64, `0100000` = 32768 on aarch64), so it is defined
+  per-arch here under `CYRIUS_ARCH_AARCH64` rather than copied as a single
+  constant. Getting that wrong would not fail loudly: it would pass some *other*
+  flag and silently drop the guarantee the call exists for.
+
+### Residual, stated rather than papered over
+`O_NOFOLLOW` guards only the **final** path component — POSIX's semantics, and
+`readlink`#70's too (*"mid-path symlinks still resolve"*). A symlinked
+*intermediate directory* inside the output tree is still followed. `tree_relpath`
+rejects `..` segments, so reaching that state means planting a symlinked
+directory in the crawl output — narrower than the case this closes, and **not**
+claimed as covered.
+
+### Tests
+- **`tests/behavior.py` check [13] now exercises `O_NOFOLLOW` directly.** With
+  the Linux pre-check removed, nothing else would catch a wrong or dropped flag —
+  if the per-arch value were incorrect, that check fails and no other test would
+  notice.
+- Added a **dangling-symlink** case: the target does not exist, so a plain
+  `O_CREAT` would *create* it at the attacker's chosen path rather than merely
+  overwrite. Tagged **0.6.8**, not 0.6.13 — the pre-check already covered it, and
+  claiming it as evidence for this release would be false. It is a regression
+  guard. (Tagging it 0.6.13 first made the control fail against a 0.6.11
+  baseline, which is what that machinery is for.)
+- **What is not demonstrated:** the atomicity itself. Both the planted and
+  dangling cases pass on 0.6.12 too, because the pre-check caught them. What
+  changed is the *mechanism*, and the absence of a race is not something a
+  deterministic test can show. The evidence here is that the refusal still holds
+  with the pre-check removed — i.e. that `O_NOFOLLOW` is genuinely doing it.
+
+### Still open
+- **B2's AGNOS half** — blocked on the agnos flag above.
+- The mid-path residual, above.
+- **Iron on archaemenid** — the critical path to 1.0.
+
+## [0.6.12] — 2026-08-27 (B1 closed: `-r` detects symlinks on AGNOS too)
+
+Roadmap **B1** — "`-r` writes through a symlink on AGNOS" — was recorded since
+0.6.8 as a gap that needed a **kernel change**: agnos has no `lstat`, and
+`stat`#33 follows the final component, so whirl's `fs_is_symlink` returned 0 by
+construction there and the crawl could be redirected through a planted link.
+
+That framing was wrong, and filing it upstream would have compounded the error.
+**agnos already shipped the primitive.** `readlink`#70 resolves the final path
+component **no-follow** and returns -1 when it is not a symlink — so success
+*is* the detection. The ABI documents choosing it over an `lstat` variant of #33
+deliberately: *"`readlink` alone gives a symlink manager BOTH what it needs —
+detect (success vs -1) and the target text to byte-compare — in one call"*.
+cyrius ships the `sys_readlink` peer (`lib/syscalls_x86_64_agnos.cyr:728`), the
+issue requesting it is archived, and `hapi` already uses it as a no-follow
+pre-check. Nothing was blocked; whirl was calling the wrong syscall.
+
+### Security
+- **`-r` now refuses to write through a symlink on AGNOS**, closing the last
+  target-specific hole from the 0.6.6 path-traversal work. `fs_is_symlink`'s
+  agnos branch calls `sys_readlink` and treats success as "is a link". Linux
+  (via `lstat`, 0.6.8) is unchanged. The behaviour is now the same on both
+  targets, so the crawl's confinement no longer depends on which one it runs on.
+- The readlink scratch buffer is allocated **once** and reused. `fs_is_symlink`
+  runs per saved file in a crawl, and this allocator has no `free` — the same
+  trap 0.6.11 measured in `set_ca_system`. One block is the kernel's own ceiling
+  for an ext2 symlink target, so a real target cannot be truncated into a false
+  "not a symlink".
+
+### Validated on AGNOS (QEMU + KVM) — 14 checks, 0 failures
+The harness plants a real symlink and a real regular file in the image before
+boot, so the probe proves **detection**, not merely that the call returns:
+
+```
+PROBE: INFO symlink-planted-link 1 planted-regular 0
+PROBE: PASS symlink-detects-real-link (readlink#70 says yes)
+PROBE: PASS symlink-regular-not-a-link (no false positive)
+```
+
+Both halves matter. The previous check only asserted the call returned 0 without
+faulting — which the old stub, incapable of ever saying yes, passed just as
+happily. A detection test that cannot fail on a broken implementation is not a
+test, and this one now fails on the 0.6.11 binary.
+
+### Not filed upstream, deliberately
+The plan was to file B1 against agnos as an `lstat` ask. It was not filed: the
+kernel already provides `readlink`#70, chose it over `lstat` on the record, and
+the cyrius peer for it is done. Filing would have been a wrong ask duplicating a
+resolved one, against a bar that asks whether anyone is actually blocked. Nobody
+was.
+
+### Still open
+- **`_save_tree` TOCTOU** (both targets): the check runs before the write.
+  Closing it needs `O_NOFOLLOW` on the write itself — and note agnos's `open`
+  has no no-follow flag at all, which is a genuine kernel gap if that race ever
+  needs closing. Recorded, not filed: nothing is working around it today.
+- **Iron on archaemenid** — the critical path to 1.0.
+
 ## [0.6.11] — 2026-08-27 (B3 resolved: the hook stays, and now we know why)
 
 Roadmap **B3** was "retire `_agnos_ca_hook`". Investigating it properly says

@@ -545,7 +545,13 @@ def check_retry_on_empty(run, rep, new, old):
 
 
 def check_symlink_write(run, rep, new, old):
-    """0.6.8: -r must not write THROUGH a symlink planted in the crawl directory."""
+    """-r must not write THROUGH a symlink planted in the crawl directory.
+
+    0.6.8 did this with an lstat pre-check. 0.6.13 removed that pre-check on
+    Linux and made the refusal part of the open itself (O_NOFOLLOW), so this
+    check now exercises O_NOFOLLOW directly — if the flag were wrong or dropped,
+    nothing else would catch it and this would fail.
+    """
     print("\n[13] -r refuses to write through a symlink")
 
     def h(conn, req):
@@ -575,6 +581,33 @@ def check_symlink_write(run, rep, new, old):
                     attempt(old, "sym_baseline") == "PAYLOAD", (0, 6, 8))
 
     rep.check("symlink target left untouched", attempt(new, "sym") == "ORIGINAL")
+
+    # A DANGLING symlink is the sharper case: the target does not exist, so a
+    # plain O_CREAT would CREATE it at the attacker's chosen path rather than
+    # merely overwriting something. O_NOFOLLOW refuses on -ELOOP either way.
+    def dangling(binary, tag):
+        d = os.path.join(run.workdir, tag)
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+        victim = os.path.join(run.workdir, "%s-victim.txt" % tag)
+        if os.path.exists(victim):
+            os.remove(victim)
+        os.symlink(victim, os.path.join(d, "target.html"))   # points at nothing yet
+        p = newport()
+        serve(p, h, n=8)
+        subprocess.run([binary, "-r", "-l", "0", "http://127.0.0.1:%d/target.html" % p],
+                       cwd=d, capture_output=True, timeout=25)
+        return os.path.exists(victim)
+
+    # Tagged 0.6.8, NOT 0.6.13: the dangling case was already covered by the
+    # lstat pre-check that landed then. 0.6.13 changes the MECHANISM (the refusal
+    # moved inside the open, closing the check-then-write window) without
+    # changing this outcome — so this is a regression guard, not evidence for
+    # 0.6.13. Mislabelling it 0.6.13 made the control fail against a 0.6.11
+    # baseline, which is exactly what that machinery is for.
+    if old:
+        rep.control("baseline creates the dangling target", dangling(old, "dang_baseline"), (0, 6, 8))
+    rep.check("dangling symlink target not created", not dangling(new, "dang"))
 
 
 def check_crawl_cap_reported(run, rep, new, old):

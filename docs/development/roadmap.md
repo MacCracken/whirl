@@ -30,6 +30,8 @@ One line per release; detail in the [CHANGELOG](../../CHANGELOG.md).
 | 0.6.6 | **P-1 security sweep** — remote arbitrary file write via `-r`, request splitting via `Location`, cross-origin credential replay, silent truncation. CI compiles the AGNOS arm; `tests/behavior.py` added |
 | 0.6.7 | **P-2 tier** — crawl confined to an origin, port correctness throughout, overflow bounds; `src/crawl.cyr` extracted |
 | 0.6.8 | **P-3 tier** — checked allocation, Linux symlink refusal, both crawl caps reported; `src/util.cyr` + `src/version.cyr` |
+| 0.6.13 | **B2 Linux half closed** — symlink refusal moved inside the open (`O_NOFOLLOW`, per-arch); agnos half filed upstream |
+| 0.6.12 | **B1 closed** — `-r` detects symlinks on AGNOS via `readlink`#70; the "needs a kernel lstat" framing was wrong, the primitive already shipped |
 | 0.6.11 | **B3 closed as "won't do"** — the hook's ABI rationale is obsolete but its *cache* is load-bearing: `set_ca_system` leaks 1 MiB per connect (measured). Rationale rewritten in code; upstream ask raised as B4 |
 | 0.6.10 | **A2** — probe covering the agnos-only trust-store, resume and symlink paths (11 checks on a real kernel); fixed `output_append`'s agnos return contract; answered B3 |
 | 0.6.9 | **QEMU-revalidated on AGNOS** — HTTP + HTTPS end-to-end on a real kernel; fixed the defect that run found (a complete response reported truncated because whirl waited for a socket close it did not need) |
@@ -65,14 +67,20 @@ the others can proceed in parallel.
 
 From the 0.6.6 audit; full detail in [`state.md`](state.md) § *Open defects*.
 
-- [ ] **B1 — `-r` writes through a symlink on AGNOS.** Refused on Linux since
-      0.6.8 via `lstat`; agnos has no `lstat` peer and its `sys_stat`#33 follows
-      the final symlink, so the check cannot be expressed there. Needs a
-      kernel-side `lstat` or an `O_NOFOLLOW` open — **a kernel ask, not a whirl
-      change.** File it against agnos.
-- [ ] **B2 — `_save_tree` TOCTOU on Linux.** The `lstat` runs before the write.
-      Closing the race needs `O_NOFOLLOW` on the write itself, i.e. a private
-      open/write path instead of `file_write_all`.
+- [x] **B1 — `-r` writes through a symlink on AGNOS** ✅ **closed at 0.6.12.**
+      Not a kernel ask after all: `readlink`#70 resolves the final component
+      no-follow and returns -1 when it is not a symlink, so success is the
+      detection. The ABI chose it over an `lstat` variant of #33 on the record,
+      and the cyrius `sys_readlink` peer already ships. whirl was calling the
+      wrong syscall. Detection proven on a real kernel against a planted link
+      and a planted regular file.
+- [~] **B2 — `_save_tree` TOCTOU.** **Linux half closed at 0.6.13**:
+      `fs_write_no_follow` opens with `O_NOFOLLOW`, so the refusal is part of the
+      open and there is no check-then-write window. **AGNOS half open**: `open`(7)
+      has no no-follow flag and no `O_EXCL`, so the pre-check and its race remain
+      — filed as agnos `2026-08-27-open-ao-nofollow-flag`. ⚠ Residual on both:
+      `O_NOFOLLOW` guards only the final component, so a symlinked *intermediate
+      directory* in the output tree is still followed.
 - [x] **B3 — Retire `_agnos_ca_hook`** ✅ **closed at 0.6.11 as "won't do".**
       The premise was that the hook only works around the agnos `sys_open` ABI
       defect. That defect *is* fixed, and the probe confirmed on a real kernel

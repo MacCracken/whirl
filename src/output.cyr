@@ -9,6 +9,20 @@
 
 var SEEK_END = 2;
 
+# O_NOFOLLOW is not exported by lib/syscalls_*.cyr — sigil writes it numerically
+# inline and says so (lib/sigil.cyr:3521). Its Linux value is ARCH-dependent, so
+# it is defined per-arch here rather than copied as sigil's x86_64 literal:
+#   x86_64  0400000 = 131072
+#   aarch64 0100000 =  32768
+# Getting this wrong would not fail loudly — it would pass some *other* flag and
+# silently drop the no-follow guarantee, which is the whole point of the call.
+#ifdef CYRIUS_ARCH_AARCH64
+var O_NOFOLLOW = 32768;
+#endif
+#ifndef CYRIUS_ARCH_AARCH64
+var O_NOFOLLOW = 131072;
+#endif
+
 # Write `len` bytes to stdout (outfile == 0) or to `outfile` (created/truncated).
 # Returns 0 on success, < 0 on a file error.
 fn output_write(buf, len, outfile): i64 {
@@ -82,16 +96,65 @@ fn output_file_size(path): i64 {
 #endif
 }
 
+var _fs_link_buf = 0;   # readlink scratch, allocated once (see fs_is_symlink)
+
+# Write buf[0..len) to `path`, refusing to follow a symlink at the FINAL path
+# component. Returns 0, or < 0.
+#
+# This exists to close the check-then-write race that `fs_is_symlink` + a plain
+# write leaves open: between the check and the open, anything that can write to
+# the directory can replace the path with a symlink, and the write lands wherever
+# it points. `-r` writes many files into a directory whirl does not own, so the
+# attacker gets unlimited retries.
+#
+# LINUX: closed properly — `O_NOFOLLOW` makes the refusal part of the open
+# itself, so there is no window. The kernel returns -ELOOP when the final
+# component is a link, and that includes a DANGLING link, which a plain
+# `O_CREAT` would otherwise happily create at the attacker's chosen path.
+#
+# AGNOS: cannot be closed here — `open`(7) has no no-follow flag (and no
+# O_EXCL either), so the pre-check is still the best available and the race
+# remains. Filed as agnos issue 2026-08-27-open-ao-nofollow-flag; the kernel
+# already has the machinery (`ext2_path_lookup_ex(..., follow_last=0)`, used by
+# readlink#70) and the ask is to expose it on open.
+#
+# ⚠ RESIDUAL on both targets: O_NOFOLLOW guards only the FINAL component, which
+# is POSIX's semantics and agnos readlink#70's too ("mid-path symlinks still
+# resolve"). A symlinked *intermediate directory* inside the output tree is still
+# followed. `tree_relpath` already rejects `..` segments, so reaching that state
+# requires planting a symlinked directory in the crawl output — narrower than the
+# final-component case this closes, and not claimed as covered.
+fn fs_write_no_follow(path, buf, len): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 420);   # 0644
+    if (fd < 0) { return fd; }          # -ELOOP if the final component is a link
+    var off = 0;
+    while (off < len) {
+        var w = sys_write(fd, buf + off, len - off);
+        if (w <= 0) { sys_close(fd); return 0 - 1; }
+        off = off + w;
+    }
+    sys_close(fd);
+    return 0;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    # Racy by necessity — see the note above.
+    if (fs_is_symlink(path) == 1) { return 0 - 1; }
+    var wr = file_write_all(path, buf, len);
+    if (wr < 0) { return wr; }
+    return 0;
+#endif
+}
+
 # Is `path` an existing symlink? `-r` would otherwise follow it and write THROUGH
 # it, so a symlink planted in the crawl directory redirects a mirrored file
 # anywhere the user can write — the same outcome as the 0.6.6 traversal bug by a
 # different route.
 #
-# Linux only, and deliberately so: agnos has no lstat peer, and its path-based
-# sys_stat#33 FOLLOWS the final symlink (lib/syscalls_x86_64_agnos.cyr), so the
-# check cannot be expressed there. The agnos arm therefore still writes through
-# a symlink; that gap is real and is recorded in state.md rather than papered
-# over with a stat call that would silently answer about the target.
+# Implemented on BOTH targets as of 0.6.12 — Linux via lstat, agnos via
+# readlink#70. The earlier claim that agnos "cannot express" this check was
+# wrong: it was true only of stat#33, and the kernel had already shipped the
+# no-follow primitive that answers it.
 #
 # A pre-write lstat is also TOCTOU-racy against an attacker who can create the
 # link between the check and the open. Closing that needs O_NOFOLLOW on the
@@ -106,6 +169,20 @@ fn fs_is_symlink(path): i64 {
     return 0;
 #endif
 #ifdef CYRIUS_TARGET_AGNOS
-    return 0;   # no lstat peer — see the comment above
+    # agnos has no lstat, and stat#33 follows the final component — but it does
+    # not need one. readlink#70 resolves the FINAL component NO-FOLLOW and
+    # returns -1 when that component is not a symlink, so success IS the
+    # detection. The ABI picked it over an lstat variant of #33 deliberately
+    # ("readlink alone gives a symlink manager BOTH what it needs — detect and
+    # the target text — in one call"), and cyrius ships the sys_readlink peer.
+    #
+    # The scratch buffer is allocated once and reused: this runs per saved file
+    # in a crawl, and the allocator is a bump allocator with no free. One block
+    # is the kernel's own ceiling for a symlink target (ext2: fast-inline < 60
+    # bytes, else exactly one block), so a real target can never be truncated
+    # into a false "not a symlink".
+    if (_fs_link_buf == 0) { _fs_link_buf = xalloc(4096); }
+    if (sys_readlink(path, strlen(path), _fs_link_buf, 4096) >= 0) { return 1; }
+    return 0;   # -1 = not a symlink, absent, or not an ext2 mount
 #endif
 }
