@@ -122,6 +122,7 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
 # every TLS connection — ~1 MiB leaked per redirect hop and per crawled resource.
 var _agnos_ca_buf = 0;
 var _agnos_ca_len = 0;
+var _agnos_ca_path = 0;   # the trust-store path that actually opened (0 = none)
 
 fn _agnos_ca_load(): i64 {
     if (_agnos_ca_buf != 0) { return 0; }      # already loaded
@@ -139,6 +140,7 @@ fn _agnos_ca_load(): i64 {
         var nl = 0;
         while (load8(path + nl) != 0) { nl = nl + 1; }
         fd = sys_open(path, nl, 0);
+        if (fd >= 0) { _agnos_ca_path = path; }
         i = i + 1;
     }
     if (fd < 0) { return 0 - 1; }              # no bundle staged → leave roots empty

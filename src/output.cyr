@@ -50,7 +50,15 @@ fn output_append(buf, len, outfile): i64 {
     while (i < on)  { store8(merged + i, load8(old + i)); i = i + 1; }
     var j = 0;
     while (j < len) { store8(merged + on + j, load8(buf + j)); j = j + 1; }
-    return file_write_all(outfile, merged, on + len);
+    # Normalize to the documented contract: 0 on success, < 0 on error.
+    # file_write_all returns the BYTE COUNT, so returning it raw made the agnos
+    # arm answer 8 where the Linux arm answers 0 for the same success. No caller
+    # is broken by it today (main.cyr tests `< 0`), but the two arms disagreeing
+    # about their own contract is exactly what a future `== 0` check would trip
+    # over. Found by tests/agnos_probe.cyr — the arm had never been executed.
+    var wr = file_write_all(outfile, merged, on + len);
+    if (wr < 0) { return wr; }
+    return 0;
 #endif
 }
 
@@ -71,5 +79,33 @@ fn output_file_size(path): i64 {
     var sb = xalloc(STAT_BUFSZ);
     if (sys_stat(path, nl, sb) < 0) { return 0; }
     return load64(sb + STAT_SIZE);
+#endif
+}
+
+# Is `path` an existing symlink? `-r` would otherwise follow it and write THROUGH
+# it, so a symlink planted in the crawl directory redirects a mirrored file
+# anywhere the user can write — the same outcome as the 0.6.6 traversal bug by a
+# different route.
+#
+# Linux only, and deliberately so: agnos has no lstat peer, and its path-based
+# sys_stat#33 FOLLOWS the final symlink (lib/syscalls_x86_64_agnos.cyr), so the
+# check cannot be expressed there. The agnos arm therefore still writes through
+# a symlink; that gap is real and is recorded in state.md rather than papered
+# over with a stat call that would silently answer about the target.
+#
+# A pre-write lstat is also TOCTOU-racy against an attacker who can create the
+# link between the check and the open. Closing that needs O_NOFOLLOW on the
+# write itself, which means bypassing file_write_all — out of scope here. This
+# still removes the whole class of pre-planted-symlink cases.
+fn fs_is_symlink(path): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    var sb = xalloc(STAT_BUFSZ);
+    if (sys_lstat(path, sb) < 0) { return 0; }       # missing → nothing to follow
+    var mode = load64(sb + STAT_MODE) & 0xFFFFFFFF;  # st_mode is a u32 field
+    if ((mode & 0xF000) == 0xA000) { return 1; }     # S_IFLNK
+    return 0;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # no lstat peer — see the comment above
 #endif
 }

@@ -1,0 +1,246 @@
+# whirl — AGNOS path probe.
+#
+# Roadmap A2. The QEMU smoke (`agnos/scripts/smoke/whirl-smoke.sh`) drives three
+# commands — `--help`, an HTTP fetch, an HTTPS fetch — so three `#ifdef
+# CYRIUS_TARGET_AGNOS` regions ship without ever being executed:
+#
+#   1. `_agnos_ca_load` / `_agnos_ca_hook` — the multi-path trust-store probe and
+#      the load-once cache (0.6.7/0.6.8). The HTTPS fetch *reaches* the hook, but
+#      nothing checks which path opened, that the cache actually holds, or what
+#      `tls_native_set_ca_system` would do on its own.
+#   2. `output_append`'s agnos read-modify-write and its >1 MiB refusal (0.6.7) —
+#      the guard that stops a `-C` resume from destroying the file it resumes.
+#   3. `fs_is_symlink`'s agnos branch (0.6.8), which returns 0 because agnos has
+#      no `lstat` peer. That gap is documented; this observes it.
+#
+# It also settles roadmap **B3**: whether `_agnos_ca_hook` is still needed, by
+# asking `tls_native_set_ca_system` directly.
+#
+# HOW IT RUNS: staged as `/bin/agnsh`, so kybernet execs it at boot and it prints
+# to the console unattended. That is deliberate — the smoke drives agnsh through
+# an xHCI keyboard that drops characters, and every result here would otherwise
+# depend on a command line surviving that. No keyboard, no retries, no typos.
+#
+# Every line starts `PROBE:` so the harness can grep them out of the serial log,
+# and each is PASS / FAIL / INFO. INFO records an observation with no pass-fail
+# meaning (a documented gap, or a value worth having on the record).
+
+include "src/version.cyr"
+include "src/util.cyr"
+include "src/url.cyr"
+include "src/http.cyr"
+include "src/links.cyr"
+include "src/crawl.cyr"
+include "src/cli.cyr"
+include "lib/taar.cyr"
+include "src/transport.cyr"
+include "src/output.cyr"
+
+var _fails = 0;
+
+fn p_out(s): i64 { sys_write(1, s, strlen(s)); return 0; }
+fn p_int(n): i64 {
+    var b[24];
+    var len = fmt_int_buf(n, &b);
+    sys_write(1, &b, len);
+    return 0;
+}
+
+fn p_pass(name): i64 { p_out("PROBE: PASS "); p_out(name); p_out("\n"); return 0; }
+fn p_fail(name): i64 { p_out("PROBE: FAIL "); p_out(name); p_out("\n"); _fails = _fails + 1; return 0; }
+fn p_info(name): i64 { p_out("PROBE: INFO "); p_out(name); p_out("\n"); return 0; }
+
+fn p_check(name, ok): i64 {
+    if (ok == 1) { return p_pass(name); }
+    return p_fail(name);
+}
+
+# --- 1. trust store: multi-path probe + load-once cache -----------------------
+
+fn probe_ca(): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    p_info("ca-load SKIPPED (agnos-only path; this is a host build)");
+    return 0;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    var rc = _agnos_ca_load();
+    if (rc < 0) {
+        p_fail("ca-load (no trust store opened at any probed path)");
+        return 0;
+    }
+    p_check("ca-load", 1);
+
+    p_out("PROBE: INFO ca-path ");
+    if (_agnos_ca_path != 0) { p_out(_agnos_ca_path); } else { p_out("(none)"); }
+    p_out("\n");
+    p_out("PROBE: INFO ca-bytes ");
+    p_int(_agnos_ca_len);
+    p_out("\n");
+
+    # A plausible bundle, not just a non-empty read.
+    p_check("ca-size-sane", (_agnos_ca_len > 1000) && (_agnos_ca_len < 1048576));
+
+    # The cache is the 0.6.8 fix: a second load must NOT re-read or re-allocate.
+    # Same pointer AND same length is the observable form of that.
+    var buf1 = _agnos_ca_buf;
+    var len1 = _agnos_ca_len;
+    _agnos_ca_load();
+    p_check("ca-cached (second load reuses the buffer)",
+            (_agnos_ca_buf == buf1) && (_agnos_ca_len == len1));
+    return 0;
+#endif
+}
+
+# --- 2. B3: is _agnos_ca_hook still necessary? --------------------------------
+#
+# cyrius v6.2.23 fixed the agnos-ABI defect in `tls_native_set_ca_system` that
+# the hook exists to work around. If set_ca_system now succeeds here, the hook is
+# redundant and can be retired; if it still fails, the hook stays and B3 closes
+# as "no". Either answer is progress — the point is to stop guessing.
+fn probe_ca_system(): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    p_info("b3 SKIPPED (the question is about the agnos ABI; this is a host build)");
+    return 0;
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    var host = "example.com";
+    var nctx = tls_native_new_client(host, strlen(host));
+    if (nctx == 0) {
+        p_fail("b3-new-client (could not build a TLS client ctx)");
+        return 0;
+    }
+    var rc = tls_native_set_ca_system(nctx);
+    p_out("PROBE: INFO b3-set-ca-system-rc ");
+    p_int(rc);
+    p_out("\n");
+    if (rc == 0) {
+        p_info("b3-verdict set_ca_system SUCCEEDS on agnos -- _agnos_ca_hook is REDUNDANT, retire it");
+    } else {
+        p_info("b3-verdict set_ca_system STILL FAILS on agnos -- _agnos_ca_hook must stay");
+    }
+    tls_native_close(nctx);
+    return 0;
+#endif
+}
+
+# --- 3. -C resume: append path and the >1 MiB refusal -------------------------
+
+fn probe_resume(): i64 {
+    # Root, not /tmp: the agnos rootfs is bin/ + etc/ + fw/ with no /tmp, and the
+    # first run of this probe failed on exactly that. Root always exists.
+    var path = "/whirl-probe-resume";
+    var head = "HEAD";
+    if (file_write_all(path, head, 4) < 0) {
+        p_fail("resume-setup (could not write the scratch file)");
+        return 0;
+    }
+    p_check("resume-file-size", output_file_size(path) == 4);
+
+    var tail = "TAIL";
+    var ar = output_append(tail, 4, path);
+    p_check("resume-append-rc", ar == 0);
+    p_check("resume-append-grew", output_file_size(path) == 8);
+
+    # Read it back: the append must PRESERVE the original bytes, not just extend
+    # the length. The agnos path rebuilds the whole file, so a bug here silently
+    # rewrites what was already downloaded.
+    var rb = xalloc(64);
+    var n = file_read_all(path, rb, 64);
+    var intact = 0;
+    if (n == 8) {
+        if ((load8(rb) == 72) && (load8(rb + 1) == 69) && (load8(rb + 2) == 65) && (load8(rb + 3) == 68)) {
+            if ((load8(rb + 4) == 84) && (load8(rb + 5) == 65) && (load8(rb + 6) == 73) && (load8(rb + 7) == 76)) {
+                intact = 1;
+            }
+        }
+    }
+    p_check("resume-append-content (HEAD preserved, TAIL added)", intact);
+    return 0;
+}
+
+# The guard: a file larger than the 1 MiB read cap must be REFUSED, and must
+# survive the refusal intact. Before 0.6.7 it was read to the cap and written
+# back at cap+len, discarding everything past it.
+fn probe_resume_guard(): i64 {
+    var cap = 1048576;
+    var big = cap + 4096;
+    var buf = xalloc(big);
+    var i = 0;
+    while (i < big) { store8(buf + i, 65); i = i + 1; }   # 'A'
+    var path = "/whirl-probe-big";
+    if (file_write_all(path, buf, big) < 0) {
+        p_info("resume-guard SKIPPED (could not stage a >1 MiB file on this fs)");
+        return 0;
+    }
+    var before = output_file_size(path);
+    if (before != big) {
+        p_info("resume-guard SKIPPED (fs did not store the full >1 MiB file)");
+        return 0;
+    }
+    var tail = "TAIL";
+    var ar = output_append(tail, 4, path);
+#ifdef CYRIUS_TARGET_AGNOS
+    # agnos read-modify-writes (no O_APPEND in the frozen FS surface), so a file
+    # larger than the read cap MUST be refused rather than rebuilt short.
+    p_check("resume-guard-refuses", ar < 0);
+    p_check("resume-guard-preserves-file", output_file_size(path) == before);
+#endif
+#ifndef CYRIUS_TARGET_AGNOS
+    # Linux has real O_APPEND and no cap — the large file is appended to
+    # normally. Asserting the agnos refusal here would be asserting a bug.
+    p_check("resume-large-append-ok (host: O_APPEND, no cap)", ar == 0);
+    p_check("resume-large-append-grew", output_file_size(path) == (before + 4));
+#endif
+    return 0;
+}
+
+# --- 4. symlink predicate on agnos --------------------------------------------
+#
+# agnos has no lstat peer and its path-based sys_stat#33 follows the final
+# symlink, so fs_is_symlink cannot answer here and returns 0 by construction.
+# Recorded as INFO, not FAIL: the gap is known and deliberate (roadmap B1). What
+# would be a defect is the call not being reachable, or faulting.
+fn probe_symlink(): i64 {
+    var r1 = fs_is_symlink("/etc/ssl/cert.pem");
+    var r2 = fs_is_symlink("/no/such/path/at/all");
+    # r1 is whatever the filesystem says (on a host it may genuinely BE a
+    # symlink); only the shape of the answer is asserted here.
+    p_check("symlink-callable (returns 0/1 without faulting)",
+            ((r1 == 0) || (r1 == 1)) && (r2 == 0));
+    p_out("PROBE: INFO symlink-cert-pem ");
+    p_int(r1);
+    p_out("\n");
+#ifdef CYRIUS_TARGET_AGNOS
+    # On agnos the answer is 0 BY CONSTRUCTION, whatever the file really is.
+    p_check("symlink-agnos-returns-zero", r1 == 0);
+#endif
+#ifdef CYRIUS_TARGET_AGNOS
+    p_info("symlink-gap agnos returns 0 by construction -- no lstat peer (roadmap B1)");
+#endif
+#ifndef CYRIUS_TARGET_AGNOS
+    p_info("symlink host build: lstat is real here, so 0 means 'not a symlink', not 'cannot tell'");
+#endif
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    p_out("PROBE: BEGIN whirl agnos path probe v");
+    p_out(WHIRL_VERSION);
+    p_out("\n");
+
+    probe_ca();
+    probe_ca_system();
+    probe_resume();
+    probe_resume_guard();
+    probe_symlink();
+
+    p_out("PROBE: FAILURES ");
+    p_int(_fails);
+    p_out("\n");
+    p_out("PROBE: END\n");
+    return _fails;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

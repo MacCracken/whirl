@@ -6,4 +6,4 @@
 # (.github/workflows/ci.yml, "Verify version consistency"). Before 0.6.8 the
 # only copy lived inline in the User-Agent, where it went stale for six
 # releases before anyone noticed.
-var WHIRL_VERSION = "0.6.9";
+var WHIRL_VERSION = "0.6.10";

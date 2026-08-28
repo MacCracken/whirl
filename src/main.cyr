@@ -228,41 +228,13 @@ fn _mkdir(path): i64 {
 #endif
 }
 
-# Is `path` an existing symlink? -r would otherwise follow it and write THROUGH
-# it, so a symlink planted in the crawl directory redirects a mirrored file
-# anywhere the user can write — the same outcome as the 0.6.6 traversal bug by a
-# different route.
-#
-# Linux only, and deliberately so: agnos has no lstat peer, and its path-based
-# sys_stat#33 FOLLOWS the final symlink (lib/syscalls_x86_64_agnos.cyr), so the
-# check cannot be expressed there. The agnos arm therefore still writes through
-# a symlink; that gap is real and is recorded in state.md rather than papered
-# over with a stat call that would silently answer about the target.
-#
-# A pre-write lstat is also TOCTOU-racy against an attacker who can create the
-# link between the check and the open. Closing that needs O_NOFOLLOW on the
-# write itself, which means bypassing file_write_all — out of scope here. This
-# still removes the whole class of pre-planted-symlink cases.
-fn _path_is_symlink(path): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
-    var sb = xalloc(STAT_BUFSZ);
-    if (sys_lstat(path, sb) < 0) { return 0; }       # missing → nothing to follow
-    var mode = load64(sb + STAT_MODE) & 0xFFFFFFFF;  # st_mode is a u32 field
-    if ((mode & 0xF000) == 0xA000) { return 1; }     # S_IFLNK
-    return 0;
-#endif
-#ifdef CYRIUS_TARGET_AGNOS
-    return 0;   # no lstat peer — see the comment above
-#endif
-}
-
 # Save buf[0..len) to a file mirroring `path` as a directory tree under cwd:
 # "/docs/g.html" -> docs/g.html (mkdir docs); "/" or "/d/" -> .../index.html.
 # Returns 0 on success, or < 0 if the path is unsafe or the write failed.
 fn _save_tree(path, buf, len): i64 {
     var rp = tree_relpath(path);      # 0 = refuses to escape cwd (see crawl.cyr)
     if (rp == 0) { return 0 - 1; }
-    if (_path_is_symlink(rp) == 1) { return 0 - 1; }
+    if (fs_is_symlink(rp) == 1) { return 0 - 1; }
     var w = strlen(rp);
     var j = 0;
     while (j < w) {

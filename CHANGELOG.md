@@ -5,6 +5,77 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.10] — 2026-08-27 (A2: the AGNOS paths the smoke never reached — and B3 answered)
+
+Roadmap **A2**. The QEMU smoke drives three typed commands, so three
+`#ifdef CYRIUS_TARGET_AGNOS` regions had shipped for several releases without
+ever being *executed*. They are executed now, on a real kernel: **11 checks, 0
+failures.** Doing so found a latent defect and settled roadmap **B3**.
+
+### Added
+- **`tests/agnos_probe.cyr`** — a probe that exercises the agnos-only paths
+  directly: the trust-store multi-path search and its load-once cache, the
+  `-C` resume append and its >1 MiB refusal, and `fs_is_symlink`'s agnos branch.
+  It builds for **both** targets — the agnos-only sections are `#ifdef`-guarded
+  and report `SKIPPED` on a host build — so the target-independent logic can be
+  checked locally before committing a QEMU run to it. That paid for itself
+  twice: the host run caught two probe bugs (an assertion that `/etc/ssl/cert.pem`
+  is not a symlink — on the host it is — and one asserting the agnos >1 MiB
+  refusal on Linux, which has real `O_APPEND` and no cap, where asserting the
+  refusal would have been asserting a bug).
+- **`tests/agnos-probe.sh`** — the QEMU harness for it. **It uses no keyboard.**
+  The agnos smoke types into agnsh through a USB-xHCI HID that drops characters,
+  so it retries and judges only attempts whose command line echoed intact —
+  right for a shell, unnecessary here. The probe takes no input, so it is staged
+  **as `/bin/agnsh`** in a *throwaway copy* of the rootfs, which makes kybernet
+  exec it at boot. No keyboard, no retries, no typos, deterministic pass/fail.
+  The agnos repo's own staged rootfs is never modified.
+
+### Fixed
+- **`output_append`'s agnos arm violated its own contract.** It returned
+  `file_write_all`'s **byte count** where the documented contract — and the
+  Linux arm — return `0` on success. No caller was broken (`main.cyr` tests
+  `< 0`), but the two arms disagreeing about their own return contract is
+  precisely what a future `== 0` check would trip over. Found by executing the
+  path for the first time; the probe reported the append as *correct* (file grew,
+  original bytes preserved) while its return code was wrong, which is the sort of
+  split only a real run surfaces.
+
+### Changed
+- `_path_is_symlink` moved from `main.cyr` to `output.cyr` as **`fs_is_symlink`** —
+  it is a filesystem predicate and `output.cyr` owns the fs `#ifdef` split. This
+  is also what made it reachable from the probe.
+- `_agnos_ca_load` now records **which** trust-store path opened
+  (`_agnos_ca_path`), so the probe can report it rather than infer it.
+
+### Validated on AGNOS (QEMU + KVM) — 11 checks, 0 failures
+- **Trust store**: opens `/etc/ssl/cert.pem` (the first probed path) and reads
+  **185,311 bytes** — byte-for-byte the staged bundle. Size sanity-checked.
+- **Trust-store cache** (the 0.6.8 fix): a second `_agnos_ca_load()` reuses the
+  same buffer pointer and length — the ~1 MiB-per-connect leak is confirmed gone
+  **on the target it was fixed for**, not just by reading the code.
+- **`-C` resume**: `output_file_size` correct; append returns 0, grows the file,
+  and **preserves the original bytes** (the agnos arm rebuilds the whole file, so
+  a bug there would silently rewrite what was already downloaded).
+- **`-C` resume >1 MiB guard** (the 0.6.7 fix): a file larger than the read cap
+  is refused **and survives the refusal intact**.
+- **`fs_is_symlink` agnos branch**: reachable, returns without faulting, and
+  answers 0 by construction — the documented B1 gap, now observed rather than
+  assumed.
+
+### Roadmap B3 — answered
+`tls_native_set_ca_system` returns **0 (success)** on agnos. cyrius v6.2.23's fix
+for the agnos `sys_open` ABI is real and effective, so **`_agnos_ca_hook` is
+redundant** and can be retired. Not retired here: it is the trust-root path for
+HTTPS on agnos, and removing it deserves its own change with its own validation
+(an agnos HTTPS fetch with the hook disabled, proving `set_ca_system` alone
+establishes the roots). B3 moves from "unanswered" to "answered, ready to do".
+
+### Still not validated
+- **Iron on archaemenid** — unchanged; the critical path to 1.0.
+- The probe covers the agnos paths *as units*. It does not prove the resume path
+  end-to-end through a real `-C` download on agnos, only that its pieces behave.
+
 ## [0.6.9] — 2026-08-27 (QEMU validation on AGNOS — and the defect it found)
 
 **The first execution of the AGNOS arm since 0.6.2.** Six releases of

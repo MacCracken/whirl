@@ -30,6 +30,7 @@ One line per release; detail in the [CHANGELOG](../../CHANGELOG.md).
 | 0.6.6 | **P-1 security sweep** — remote arbitrary file write via `-r`, request splitting via `Location`, cross-origin credential replay, silent truncation. CI compiles the AGNOS arm; `tests/behavior.py` added |
 | 0.6.7 | **P-2 tier** — crawl confined to an origin, port correctness throughout, overflow bounds; `src/crawl.cyr` extracted |
 | 0.6.8 | **P-3 tier** — checked allocation, Linux symlink refusal, both crawl caps reported; `src/util.cyr` + `src/version.cyr` |
+| 0.6.10 | **A2** — probe covering the agnos-only trust-store, resume and symlink paths (11 checks on a real kernel); fixed `output_append`'s agnos return contract; answered B3 |
 | 0.6.9 | **QEMU-revalidated on AGNOS** — HTTP + HTTPS end-to-end on a real kernel; fixed the defect that run found (a complete response reported truncated because whirl waited for a socket close it did not need) |
 
 ---
@@ -49,10 +50,13 @@ the others can proceed in parallel.
       close it did not need, so a complete chunked body was reported truncated.
       Fixed in the same release; the response framing is now the authority.
       **The lesson worth keeping: compile-verified is not verified.**
-- [ ] **A2 — Exercise the agnos-only paths the smoke does not reach.** The CA
-      hook's multi-path probe and cache (0.6.7), the resume guard (0.6.7) and
-      `_path_is_symlink`'s agnos branch (0.6.8) are each `#ifdef`-gated and
-      untested. Decide per path: cover it, or record it as knowingly unexercised.
+- [x] **A2 — Exercise the agnos-only paths the smoke does not reach** ✅ 0.6.10.
+      `tests/agnos_probe.cyr` + `tests/agnos-probe.sh` cover the trust-store
+      search and cache, the `-C` resume append and its >1 MiB guard, and
+      `fs_is_symlink`'s agnos branch — **11 checks, 0 failures** on a real
+      kernel. The harness stages the probe **as `/bin/agnsh`** so kybernet execs
+      it at boot: no keyboard, so no dropped-character retries. Found a latent
+      contract defect in `output_append`'s agnos arm, and answered B3.
 - [ ] **A3 — Iron on archaemenid.** Same run over the r8169 NIC. Parity
       benchmark vs `curl` (latency / RSS / binary size). **The critical path to 1.0.**
 
@@ -68,11 +72,12 @@ From the 0.6.6 audit; full detail in [`state.md`](state.md) § *Open defects*.
 - [ ] **B2 — `_save_tree` TOCTOU on Linux.** The `lstat` runs before the write.
       Closing the race needs `O_NOFOLLOW` on the write itself, i.e. a private
       open/write path instead of `file_write_all`.
-- [ ] **B3 — Retire `_agnos_ca_hook` if it is redundant.** cyrius v6.2.23 fixed
-      the `set_ca_system` agnos-ABI defect it works around. A1 did not settle it:
-      the hook runs on the HTTPS path that now passes, so it is *reachable*, but
-      nothing proves `set_ca_system` would work without it. Needs A2 — a run with
-      the hook disabled.
+- [ ] **B3 — Retire `_agnos_ca_hook`.** **Answered at 0.6.10, not yet done.**
+      The probe calls `tls_native_set_ca_system` directly on agnos and it returns
+      **0** — cyrius v6.2.23's ABI fix is effective and the hook is redundant.
+      Retiring it is now a mechanical change plus one validation: an agnos HTTPS
+      fetch with the hook disabled, proving `set_ca_system` alone establishes the
+      trust roots. Kept separate because the hook is the HTTPS trust path.
 
 ### C. Substrate — `taar` `tls` / `http` modules
 
