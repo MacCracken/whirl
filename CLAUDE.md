@@ -21,11 +21,11 @@
 
 Own the **HTTP/HTTPS transfer surface** in the AGNOS network-tools family: fetch a URL (GET → stdout or file), follow redirects, POST (`-d`), arbitrary methods (`-X`), recursive fetch (`-r`, the wget side) — one tool, combined curl+wget feature set, smart defaults. Cyrius-native, **no POSIX `socket()` on the AGNOS backend** — consumes the kernel's sovereign `sock_*` (#47-50) + `getrandom` (#45) + UDP-53 (#51-54) primitives and `tls_native` for HTTPS, per the kernel-grows-for-native-workloads rule.
 
-**Strategic position — third `taar` consumer.** After `yo` (ICMP) and `dig` (DNS), whirl is the consumer that adds `taar`'s `tcp` / `tls` / `http` modules. taar is already extracted (0.1.0, ipv4 module); whirl drives its socket/tcp/tls/http growth.
+**Strategic position — third `taar` consumer.** After `yo` (ICMP) and `dig` (DNS), whirl is the consumer that adds `taar`'s `tcp` / `tls` / `http` modules. taar is at **0.5.0** (ipv4 + socket + dns); whirl drove its socket/dns growth, and its `tls` / `http` modules remain unwritten.
 
 ## Conventions
 
-- **Per-backend sovereignty**: `src/platform.cyr` `#ifdef CYRIUS_TARGET_AGNOS`-dispatches to `platform_agnos.cyr` (sovereign syscalls) or `platform_linux.cyr` (POSIX). Same shape as yo / dig.
+- **Per-backend sovereignty**: unlike yo / dig there is **no `src/platform.cyr` split** — the dispatch is inline `#ifdef CYRIUS_TARGET_AGNOS` in `src/transport.cyr`, `src/output.cyr` and `src/main.cyr`. Sovereign syscalls on AGNOS, POSIX-via-taar on Linux.
 - **No POSIX `socket()` on the AGNOS backend** — the v1.0 gate enforces this.
 - **`tls_native` is transport-agnostic**: wire `tls_native_set_transport(read, write, now)` over `sock_send`#48 / `sock_recv`#49 / `uptime_ms`#40 on agnos; over POSIX read/write on Linux.
 - **CI/Release toolchain install MUST use the upstream `install.sh`** (reads the `cyrius.cyml [package].cyrius` pin) — never a hand-rolled curl+cp, which fails the `cyrius deps` pin-check (it lays files in a flat `~/.cyrius/lib` instead of `~/.cyrius/versions/<v>/`). patra is the reference.

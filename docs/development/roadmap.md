@@ -3,93 +3,35 @@
 > **The path to 1.0.0, and the AGNOS call surface.** Per-release history lives in
 > [`../../CHANGELOG.md`](../../CHANGELOG.md) — this file does not repeat it.
 > Current version, surface area and open defects live in [`state.md`](state.md).
->
-> Restructured at 0.6.8: the milestone-by-milestone record that used to fill this
-> file was a second copy of the changelog, and it had gone stale in three places
-> (a superseded toolchain pin, an old assertion count, and follow-ups ticked as
-> open after they shipped). What survives is the part a roadmap is for: **what is
-> left, in what order, and what "done" means.**
-
----
-
-## Shipped
-
-One line per release; detail in the [CHANGELOG](../../CHANGELOG.md).
-
-| Version | What landed |
-|---|---|
-| 0.1.0 | Scaffold: manifest, CI/release workflows, docs skeleton |
-| 0.2.0 | HTTP/1.1 GET over the taar substrate — url / http / transport / output modules |
-| 0.3.0 | HTTPS with fail-closed cert + hostname verification; redirect UX |
-| 0.4.0 | `-d` / `-X` / `-H` — methods, bodies, custom headers |
-| 0.5.0–0.5.3 | The wget side: `-r` recursive fetch, tree mirroring, robots.txt, `-O`, `-C` resume, `--retry`, `-A`/`-i`/`-I`/`-f` |
-| 0.6.0–0.6.1 | HTTP then HTTPS running on AGNOS over taar's sovereign backend |
-| 0.6.2 | First QEMU validation on a real agnos kernel; `_agnos_ca_hook` trust-root fix |
-| 0.6.3–0.6.4 | AGNOS off the libssl/`fdlopen` bridge onto direct `tls_native_*`; mirshi re-cut |
-| 0.6.5 | Toolchain 6.5.35, taar 0.5.0, vendored stdlib re-cut; binary 13.9 MB → 2.0 MB |
-| 0.6.6 | **P-1 security sweep** — remote arbitrary file write via `-r`, request splitting via `Location`, cross-origin credential replay, silent truncation. CI compiles the AGNOS arm; `tests/behavior.py` added |
-| 0.6.7 | **P-2 tier** — crawl confined to an origin, port correctness throughout, overflow bounds; `src/crawl.cyr` extracted |
-| 0.6.8 | **P-3 tier** — checked allocation, Linux symlink refusal, both crawl caps reported; `src/util.cyr` + `src/version.cyr` |
-| 0.6.13 | **B2 Linux half closed** — symlink refusal moved inside the open (`O_NOFOLLOW`, per-arch); agnos half filed upstream |
-| 0.6.12 | **B1 closed** — `-r` detects symlinks on AGNOS via `readlink`#70; the "needs a kernel lstat" framing was wrong, the primitive already shipped |
-| 0.6.11 | **B3 closed as "won't do"** — the hook's ABI rationale is obsolete but its *cache* is load-bearing: `set_ca_system` leaks 1 MiB per connect (measured). Rationale rewritten in code; upstream ask raised as B4 |
-| 0.6.10 | **A2** — probe covering the agnos-only trust-store, resume and symlink paths (11 checks on a real kernel); fixed `output_append`'s agnos return contract; answered B3 |
-| 0.6.9 | **QEMU-revalidated on AGNOS** — HTTP + HTTPS end-to-end on a real kernel; fixed the defect that run found (a complete response reported truncated because whirl waited for a socket close it did not need) |
 
 ---
 
 ## Remaining for 1.0.0
 
-Four workstreams. **A3 (iron) is the critical path** now that A1 has landed;
-the others can proceed in parallel.
+Four workstreams. **A3 (iron) is the critical path**; the others can proceed in
+parallel. Completed items are not listed here — per-release history is in the
+[CHANGELOG](../../CHANGELOG.md).
 
 ### A. AGNOS validation
 
-- [x] **A1 — QEMU re-validation** ✅ 0.6.9. HTTP and HTTPS both fetch the
-      complete Example Domain page on a real agnos kernel over the sovereign
-      stack (virtio-net + SLIRP, KVM), cert-verified. Six releases of
-      agnos-affecting change had accumulated behind compile-only checking, and
-      the run found a defect on the first attempt — whirl waited for a socket
-      close it did not need, so a complete chunked body was reported truncated.
-      Fixed in the same release; the response framing is now the authority.
-      **The lesson worth keeping: compile-verified is not verified.**
-- [x] **A2 — Exercise the agnos-only paths the smoke does not reach** ✅ 0.6.10.
-      `tests/agnos_probe.cyr` + `tests/agnos-probe.sh` cover the trust-store
-      search and cache, the `-C` resume append and its >1 MiB guard, and
-      `fs_is_symlink`'s agnos branch — **11 checks, 0 failures** on a real
-      kernel. The harness stages the probe **as `/bin/agnsh`** so kybernet execs
-      it at boot: no keyboard, so no dropped-character retries. Found a latent
-      contract defect in `output_append`'s agnos arm, and answered B3.
 - [ ] **A3 — Iron on archaemenid.** Same run over the r8169 NIC. Parity
       benchmark vs `curl` (latency / RSS / binary size). **The critical path to 1.0.**
 
 ### B. Open defects
 
-From the 0.6.6 audit; full detail in [`state.md`](state.md) § *Open defects*.
+Full detail in [`state.md`](state.md) § *Open defects*.
 
-- [x] **B1 — `-r` writes through a symlink on AGNOS** ✅ **closed at 0.6.12.**
-      Not a kernel ask after all: `readlink`#70 resolves the final component
-      no-follow and returns -1 when it is not a symlink, so success is the
-      detection. The ABI chose it over an `lstat` variant of #33 on the record,
-      and the cyrius `sys_readlink` peer already ships. whirl was calling the
-      wrong syscall. Detection proven on a real kernel against a planted link
-      and a planted regular file.
-- [~] **B2 — `_save_tree` TOCTOU.** **Linux half closed at 0.6.13**:
-      `fs_write_no_follow` opens with `O_NOFOLLOW`, so the refusal is part of the
-      open and there is no check-then-write window. **AGNOS half open**: `open`(7)
-      has no no-follow flag and no `O_EXCL`, so the pre-check and its race remain
-      — filed as agnos `2026-08-27-open-ao-nofollow-flag`. ⚠ Residual on both:
-      `O_NOFOLLOW` guards only the final component, so a symlinked *intermediate
-      directory* in the output tree is still followed.
-- [x] **B3 — Retire `_agnos_ca_hook`** ✅ **closed at 0.6.11 as "won't do".**
-      The premise was that the hook only works around the agnos `sys_open` ABI
-      defect. That defect *is* fixed, and the probe confirmed on a real kernel
-      that `set_ca_system` verifies a valid chain and rejects a self-signed one.
-      But the hook picked up a second job at 0.6.8 — it **caches** the bundle —
-      and cyrius's `set_ca_system` re-reads 1 MiB per call against a bump
-      allocator with no free. Measured: 1 MiB leaked **per TLS connect**
-      (~64 MiB on an HTTPS crawl). Retiring it would have reintroduced the leak
-      0.6.8 removed. The hook stays; its rationale in the code now says so.
+- [ ] **B2 — `_save_tree` TOCTOU, AGNOS half.** Closed on Linux at 0.6.13
+      (`O_NOFOLLOW` makes the refusal part of the open). agnos `open`(7) has no
+      no-follow flag and no `O_EXCL`, so the pre-check and its race remain.
+      **Blocked on the kernel** — filed as agnos
+      `2026-08-27-open-ao-nofollow-flag`; the machinery exists
+      (`ext2_path_lookup_ex(..., follow_last=0)`), the ask is to expose it.
+- [ ] **B5 — Symlinked intermediate directory.** `O_NOFOLLOW` guards only the
+      FINAL component (POSIX semantics, and readlink#70's), so a symlinked
+      *directory* planted inside the crawl output is still followed. Needs
+      per-component `openat` walking, on both targets. Narrower than B2 and
+      unblocked — no kernel change required on Linux.
 - [ ] **B4 — Upstream: cyrius should cache the system trust bundle.**
       `tls_native_set_ca_system` allocates 1 MiB on every call and caches
       nothing. Every agnos TLS consumer pays that, not just whirl. Fixing it
@@ -136,8 +78,12 @@ Not defects, but each is a place where whirl's behaviour is bounded in a way a
       against a reachable bad-cert server.
 - [x] **No POSIX `socket()`** anywhere in the AGNOS backend — the agnos arm binds
       `sock_*`#47-50 / `udp_*`#51-54 exclusively.
-- [x] No known unfixed security defect. The 0.6.6 audit's P-1/P-2/P-3 tiers are
-      closed; B1/B2 are the residue and are recorded, bounded and understood.
+- [~] Security. The 0.6.6 audit's P-1/P-2/P-3 tiers are closed and B1 is fixed
+      on both targets. **Two symlink-write races remain open and are not
+      hand-waved**: B2's AGNOS half (blocked on a kernel flag) and B5 (mid-path
+      symlink, both targets, unblocked). Both are bounded — each needs write
+      access to the crawl output directory — but "no known unfixed security
+      defect" would be false today, so this is not ticked.
 - [x] AGNOS backend resolves + fetches `https://` end-to-end (DNS → TCP → TLS →
       HTTP) on a current build — QEMU-validated at 0.6.9.
 - [ ] The same, **iron-validated** on archaemenid — A3.
@@ -175,9 +121,12 @@ end-to-end on QEMU at 0.6.2, rebuilt onto the direct `tls_native_*` path at 0.6.
 | DNS resolve | UDP-53 `udp_bind`#51 / `udp_send`#52 / `udp_recv`#53 / `udp_unbind`#54 | ✅ landed agnos 1.45.3 | `taar.dns` over the UDP wrappers; dig drives the same path |
 | Monotonic clock / sleep | `uptime_ms`#40 / `sleep_ms`#41 | ✅ landed | `sys_uptime_ms` / `sys_sleep_ms` wrappers (cyrius ≥ 6.2.6) ✅ |
 | Kernel-leased resolver | `net_config`#61 field 3 (DHCP option-6 nameserver) | ✅ landed agnos 1.45.16 | `sys_net_dns_server()` ✅ — reached via `taar_resolve_ipv4` → `_taar_resolv_discover`, tried **before** `/etc/resolv.conf`. Hard dependency since 0.6.2: the off-subnet `8.8.8.8` fallback needs gateway routing the kernel cannot guarantee on iron |
+| Symlink detection (`-r` safety) | `readlink`#70 (no-follow final component) | ✅ landed agnos 1.5x | `sys_readlink()` ✅ — `fs_is_symlink` treats success as "is a link" (0.6.12). Chosen by the kernel over an `lstat` variant of `stat`#33 |
 
 **Net:** whirl needs **zero new kernel syscalls**, and the transport lock-down is
-closed. The one open kernel ask is **B1** — an `lstat` peer (or `O_NOFOLLOW`), and
-that is a filesystem concern, not a network one.
+closed. The one open kernel ask is **B2** — an `AO_NOFOLLOW` flag on `open`(7),
+filed as agnos `2026-08-27-open-ao-nofollow-flag`. Like the old B1 ask it is a
+filesystem concern, not a network one — and B1 turned out not to need a kernel
+change at all, since `readlink`#70 already answered it.
 
 > Cross-refs: [agnos net-syscall arc](https://github.com/MacCracken/agnosticos/blob/main/docs/development/state.md) (#45-#57) · [taar](https://github.com/MacCracken/taar) (substrate) · [yo](https://github.com/MacCracken/yo) · [dig](https://github.com/MacCracken/dig)
