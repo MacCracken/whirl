@@ -5,6 +5,14 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-09-11
+
+### Changed
+
+- **Toolchain `6.5.35` → `6.6.2`.** No source change; the value form needed none.
+  Build, tests, and any bench/fuzz/distlib target the repo ships re-verified at the new pin.
+
+
 ## [0.6.13] — 2026-08-27 (B2, Linux half: the symlink refusal moved inside the open)
 
 Roadmap **B2** — the check-then-write race in `_save_tree`. Since 0.6.8 whirl has

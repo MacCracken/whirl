@@ -218,14 +218,14 @@ fn _warn_truncated(what): i64 {
 # mkdir; EEXIST ignored by the caller. The two targets' sys_mkdir signatures
 # differ (Linux (path, mode) vs agnos (path, pathlen)), so branch on the target.
 fn _mkdir(path): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     return sys_mkdir(path, 493);   # 0755
-#endif
-#ifdef CYRIUS_TARGET_AGNOS
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
     var nl = 0;
     while (load8(path + nl) != 0) { nl = nl + 1; }
     return sys_mkdir(path, nl);
-#endif
+    #endif
 }
 
 # Save buf[0..len) to a file mirroring `path` as a directory tree under cwd:
@@ -492,7 +492,7 @@ fn main() {
         # default. A bare host made virtual-host routing on a non-default port
         # resolve to the wrong site.
         var reqlen = http_build_request(meth, _authority(host, is_https, port), path,
-                                        hdrs, nhdrs, bdy, blen, req, reqsz);
+          hdrs, nhdrs, bdy, blen, req, reqsz);
         if (reqlen < 0) { _eputs("whirl: request too large to build\n"); return 2; }
         # Fetch with up to --retry N retries (linear backoff) on transient failure.
         var total = 0 - 1;
@@ -524,19 +524,19 @@ fn main() {
                 var loc = _abs_location(_dup_location(rbuf, total, lv), is_https, host, port, path);
                 var u2 = url_new();
                 if (loc != 0) {
-                if (url_parse(loc, u2) == URL_PARSE_OK) {
-                    # Cross-origin hop: drop caller-supplied credentials. They
-                    # were previously replayed verbatim, so a 302 from any site
-                    # whirl was given an -H 'Authorization: ...' for could
-                    # harvest that credential by pointing at a host it controls.
-                    if (_same_origin(is_https, host, port, u2) == 0) { drop_creds = 1; }
-                    is_https = url_is_https(u2);
-                    host = url_host(u2);
-                    port = url_port(u2);
-                    path = url_path(u2);
-                    hops = hops + 1;
-                    redirect = 1;
-                }
+                    if (url_parse(loc, u2) == URL_PARSE_OK) {
+                        # Cross-origin hop: drop caller-supplied credentials. They
+                        # were previously replayed verbatim, so a 302 from any site
+                        # whirl was given an -H 'Authorization: ...' for could
+                        # harvest that credential by pointing at a host it controls.
+                        if (_same_origin(is_https, host, port, u2) == 0) { drop_creds = 1; }
+                        is_https = url_is_https(u2);
+                        host = url_host(u2);
+                        port = url_port(u2);
+                        path = url_path(u2);
+                        hops = hops + 1;
+                        redirect = 1;
+                    }
                 }
             }
         }

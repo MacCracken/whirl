@@ -40,15 +40,15 @@ fn output_write(buf, len, outfile): i64 {
 # O_APPEND/flock in the frozen FS surface, so it read-modify-writes the file
 # (≤1 MB resume cap there — fine for the MVP).
 fn output_append(buf, len, outfile): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     var fd = sys_open(outfile, O_WRONLY | O_APPEND | O_CREAT, 420);   # 0644
     if (fd < 0) { return fd; }
     var w = sys_write(fd, buf, len);
     sys_close(fd);
     if (w < 0) { return w; }
     return 0;
-#endif
-#ifdef CYRIUS_TARGET_AGNOS
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
     # Read-modify-write, because the frozen agnos FS surface has no O_APPEND.
     # That makes the read cap load-bearing: a file LARGER than the cap used to
     # be read to `cap` bytes and then written back at cap+len, silently
@@ -73,27 +73,27 @@ fn output_append(buf, len, outfile): i64 {
     var wr = file_write_all(outfile, merged, on + len);
     if (wr < 0) { return wr; }
     return 0;
-#endif
+    #endif
 }
 
 # Size of an existing file, or 0 if missing/empty (for -C resume offset). The
 # targets diverge: Linux lseek(SEEK_END) vs agnos sys_stat (STAT_SIZE=16).
 fn output_file_size(path): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     var fd = sys_open(path, O_RDONLY, 0);
     if (fd < 0) { return 0; }
     var sz = syscall(SYS_LSEEK, fd, 0, SEEK_END);
     sys_close(fd);
     if (sz < 0) { return 0; }
     return sz;
-#endif
-#ifdef CYRIUS_TARGET_AGNOS
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
     var nl = 0;
     while (load8(path + nl) != 0) { nl = nl + 1; }
     var sb = xalloc(STAT_BUFSZ);
     if (sys_stat(path, nl, sb) < 0) { return 0; }
     return load64(sb + STAT_SIZE);
-#endif
+    #endif
 }
 
 var _fs_link_buf = 0;   # readlink scratch, allocated once (see fs_is_symlink)
@@ -125,7 +125,7 @@ var _fs_link_buf = 0;   # readlink scratch, allocated once (see fs_is_symlink)
 # requires planting a symlinked directory in the crawl output — narrower than the
 # final-component case this closes, and not claimed as covered.
 fn fs_write_no_follow(path, buf, len): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 420);   # 0644
     if (fd < 0) { return fd; }          # -ELOOP if the final component is a link
     var off = 0;
@@ -136,14 +136,14 @@ fn fs_write_no_follow(path, buf, len): i64 {
     }
     sys_close(fd);
     return 0;
-#endif
-#ifdef CYRIUS_TARGET_AGNOS
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
     # Racy by necessity — see the note above.
     if (fs_is_symlink(path) == 1) { return 0 - 1; }
     var wr = file_write_all(path, buf, len);
     if (wr < 0) { return wr; }
     return 0;
-#endif
+    #endif
 }
 
 # Is `path` an existing symlink? `-r` would otherwise follow it and write THROUGH
@@ -161,14 +161,14 @@ fn fs_write_no_follow(path, buf, len): i64 {
 # write itself, which means bypassing file_write_all — out of scope here. This
 # still removes the whole class of pre-planted-symlink cases.
 fn fs_is_symlink(path): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     var sb = xalloc(STAT_BUFSZ);
     if (sys_lstat(path, sb) < 0) { return 0; }       # missing → nothing to follow
     var mode = load64(sb + STAT_MODE) & 0xFFFFFFFF;  # st_mode is a u32 field
     if ((mode & 0xF000) == 0xA000) { return 1; }     # S_IFLNK
     return 0;
-#endif
-#ifdef CYRIUS_TARGET_AGNOS
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
     # agnos has no lstat, and stat#33 follows the final component — but it does
     # not need one. readlink#70 resolves the FINAL component NO-FOLLOW and
     # returns -1 when that component is not a symlink, so success IS the
@@ -184,5 +184,5 @@ fn fs_is_symlink(path): i64 {
     if (_fs_link_buf == 0) { _fs_link_buf = xalloc(4096); }
     if (sys_readlink(path, strlen(path), _fs_link_buf, 4096) >= 0) { return 1; }
     return 0;   # -1 = not a symlink, absent, or not an ext2 mount
-#endif
+    #endif
 }
