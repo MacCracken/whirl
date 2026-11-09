@@ -9,13 +9,18 @@
 
 var SEEK_END = 2;
 
-# O_NOFOLLOW is not exported by lib/syscalls_*.cyr — sigil writes it numerically
-# inline and says so (lib/sigil.cyr:3521). Its Linux value is ARCH-dependent, so
-# it is defined per-arch here rather than copied as sigil's x86_64 literal:
+# O_NOFOLLOW's Linux value is ARCH-dependent:
 #   x86_64  0400000 = 131072
-#   aarch64 0100000 =  32768
-# Getting this wrong would not fail loudly — it would pass some *other* flag and
-# silently drop the no-follow guarantee, which is the whole point of the call.
+#   aarch64 0100000 =  32768   (131072 there is O_LARGEFILE)
+# When this was written (0.6.13, cyrius 6.5.35) the stdlib did not export it.
+# Since cyrius 6.6.4 lib/syscalls_{x86_64,aarch64}_linux.cyr does, per arch, with
+# these same values. whirl keeps its own definitions anyway: they are what
+# tests/behavior.py check [13] and its negative control pin down. A value that
+# disagrees with the stdlib's now draws "duplicate symbol 'O_NOFOLLOW' redefined
+# with conflicting value" at build time (checked at 6.7.18 by planting 131072 in
+# the aarch64 arm). CI builds no aarch64 image, though, so that warning only
+# shows up locally. A wrong value would pass some *other* flag and silently drop
+# the no-follow guarantee, which is the whole point of the call.
 #ifdef CYRIUS_ARCH_AARCH64
 var O_NOFOLLOW = 32768;
 #endif

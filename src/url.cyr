@@ -17,6 +17,7 @@ var URL_STRUCT_SZ = 32;
 var URL_PARSE_OK   = 0;
 var URL_PARSE_FAIL = 0 - 1;
 
+# Allocate a zeroed URL struct (URL_STRUCT_SZ bytes) for url_parse to fill.
 fn url_new(): i64 {
     var u = xalloc(URL_STRUCT_SZ);
     store64(u + URL_OFF_HTTPS, 0);
@@ -26,9 +27,13 @@ fn url_new(): i64 {
     return u;
 }
 
+# 1 for an https:// URL, 0 for http://.
 fn url_is_https(u): i64 { return load64(u + URL_OFF_HTTPS); }
+# The port: explicit, or the scheme default (80 / 443).
 fn url_port(u): i64     { return load64(u + URL_OFF_PORT); }
+# The host (cstr).
 fn url_host(u): i64     { return load64(u + URL_OFF_HOST); }
+# The path (cstr); "/" when the URL has none.
 fn url_path(u): i64     { return load64(u + URL_OFF_PATH); }
 
 # Derive a download filename from a path (cstr): the last '/'-segment with any

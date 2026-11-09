@@ -77,6 +77,7 @@ var CLI_BODY_OK      = 0;
 var CLI_BODY_ENOENT  = 1;
 var CLI_BODY_TOOBIG  = 2;
 var _cli_bodyerr = 0;
+# Why the last -d/--data-binary body failed to load: a CLI_BODY_* value.
 fn cli_bodyerr(): i64 { return _cli_bodyerr; }
 
 var _CLI_BODY_MAX = 1048576;   # 1 MiB request-body cap
@@ -197,21 +198,39 @@ fn cli_parse(ac, av): i64 {
     return CLI_OK;
 }
 
+# --- accessors for the parsed result (valid after cli_parse returns CLI_OK) ---
+
+# The positional URL (cstr).
 fn cli_url(): i64     { return _cli_url; }
+# -o FILE (cstr), or 0 for stdout.
 fn cli_outfile(): i64 { return _cli_out; }
+# 1 when -L (follow redirects) was given.
 fn cli_follow(): i64  { return _cli_follow; }
+# The request body from -d/--data-binary, or 0 for none. Binary-safe: use cli_bodylen.
 fn cli_body(): i64    { return _cli_body; }
+# Length in bytes of cli_body().
 fn cli_bodylen(): i64 { return _cli_bodylen; }
+# Array of the -H header cstrs, in argv order; cli_nhdrs() entries are set.
 fn cli_hdrs(): i64    { return _cli_hdrs; }
+# Number of -H headers given (at most 16).
 fn cli_nhdrs(): i64   { return _cli_nhdrs; }
+# 1 when -O (save under the URL's own filename) was given.
 fn cli_remote(): i64    { return _cli_remote; }
+# --retry N for transient failures (0 = no retry).
 fn cli_retries(): i64   { return _cli_retries; }
+# 1 when -r (recursive same-host fetch) was given.
 fn cli_recursive(): i64 { return _cli_recursive; }
+# -l N recursion depth for -r (default 1).
 fn cli_depth(): i64     { return _cli_depth; }
+# 1 when -C (resume a partial download) was given.
 fn cli_resume(): i64    { return _cli_resume; }
+# -A/--user-agent value (cstr), or 0 for whirl's default.
 fn cli_useragent(): i64 { return _cli_useragent; }
+# 1 when -f (exit non-zero on HTTP >= 400) was given.
 fn cli_fail(): i64      { return _cli_fail; }
+# 1 when -i (include response headers in the output) was given.
 fn cli_include(): i64   { return _cli_include; }
+# 1 when -I (HEAD request) was given.
 fn cli_head(): i64      { return _cli_head; }
 
 # Effective method: -I (HEAD) wins, then explicit -X, then POST when a body was

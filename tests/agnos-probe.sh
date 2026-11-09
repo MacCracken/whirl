@@ -51,12 +51,18 @@ WORK="$WHIRL_ROOT/build/agnos-probe"; rm -rf "$WORK"; mkdir -p "$WORK"
 IMG="$WORK/agnos-probe.img"; SER="$WORK/serial.log"; MON="/tmp/whirl-agnos-probe-mon.sock"
 
 echo "=== building the probe (--agnos) ==="
-# cyrius writes progress to stderr, so 2>&1 is load-bearing: without it the
-# pipeline sees an empty stdout and the guard fires on a successful build.
-if ! ( cd "$WHIRL_ROOT" && CYRIUS_DCE=1 cyrius build --agnos tests/agnos_probe.cyr build/whirl-agnos-probe ) 2>&1 \
-     | grep -E "^OK$|error" ; then
+# Judge the build by cyrius's exit status, not its text (0.7.1). The old guard
+# grepped for a bare `OK` line or the word "error". cyrius has printed
+# `OK (<n> bytes)` since at least 6.6.2, so every successful build was rejected,
+# which kept this script from running at all from 0.6.14 to 0.7.0. And any line
+# containing "error" counted as SUCCESS, so a failed build would have passed.
+# The log is kept and printed in full on failure.
+if ! ( cd "$WHIRL_ROOT" && CYRIUS_DCE=1 cyrius build --agnos tests/agnos_probe.cyr build/whirl-agnos-probe ) \
+     > "$WORK/probe-build.log" 2>&1; then
+    cat "$WORK/probe-build.log"
     echo "ERROR: probe build failed"; exit 1
 fi
+grep -E '^OK' "$WORK/probe-build.log"
 
 echo "=== staging a throwaway rootfs (probe AS /bin/agnsh) ==="
 # A COPY. The probe replaces agnsh only in this copy, so the agnos repo's staged

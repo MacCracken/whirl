@@ -4,17 +4,19 @@
 # commands — `--help`, an HTTP fetch, an HTTPS fetch — so three `#ifdef
 # CYRIUS_TARGET_AGNOS` regions ship without ever being executed:
 #
-#   1. `_agnos_ca_load` / `_agnos_ca_hook` — the multi-path trust-store probe and
-#      the load-once cache (0.6.7/0.6.8). The HTTPS fetch *reaches* the hook, but
-#      nothing checks which path opened, that the cache actually holds, or what
-#      `tls_native_set_ca_system` would do on its own.
+#   1. the agnos trust store: `_agnos_ca_install` (tls_native_set_ca_system since
+#      0.7.1, replacing `_agnos_ca_hook`) loads a bundle, every ctx shares one
+#      parsed root set, whirl's own `_agnos_tls_native_connect` verifies a valid
+#      chain and refuses a self-signed one, and the per-connect heap cost stays
+#      bounded. The HTTPS fetch in the smoke *reaches* this path, but checks none
+#      of it.
 #   2. `output_append`'s agnos read-modify-write and its >1 MiB refusal (0.6.7) —
 #      the guard that stops a `-C` resume from destroying the file it resumes.
-#   3. `fs_is_symlink`'s agnos branch (0.6.8), which returns 0 because agnos has
-#      no `lstat` peer. That gap is documented; this observes it.
+#   3. `fs_is_symlink`'s agnos branch: readlink#70 detection since 0.6.12, checked
+#      against a link and a regular file the harness plants.
 #
-# It also settles roadmap **B3**: whether `_agnos_ca_hook` is still needed, by
-# asking `tls_native_set_ca_system` directly.
+# It settled roadmap B3/B4. At 0.7.1 its cost check showed the old hook had become
+# the expensive path (~272,720 B per connect vs ~656 B), and the hook was retired.
 #
 # HOW IT RUNS: staged as `/bin/agnsh`, so kybernet execs it at boot and it prints
 # to the console unattended. That is deliberate — the smoke drives agnsh through
@@ -38,7 +40,9 @@ include "src/output.cyr"
 
 var _fails = 0;
 
+# Write cstr `s` to stdout.
 fn p_out(s): i64 { sys_write(1, s, strlen(s)); return 0; }
+# Write `n` to stdout in decimal.
 fn p_int(n): i64 {
     var b[24];
     var len = fmt_int_buf(n, &b);
@@ -46,97 +50,71 @@ fn p_int(n): i64 {
     return 0;
 }
 
+# Report a passing check: `PROBE: PASS <name>`.
 fn p_pass(name): i64 { p_out("PROBE: PASS "); p_out(name); p_out("\n"); return 0; }
+# Report a failing check: `PROBE: FAIL <name>`, counted in the exit status.
 fn p_fail(name): i64 { p_out("PROBE: FAIL "); p_out(name); p_out("\n"); _fails = _fails + 1; return 0; }
+# Report a non-assertion line: `PROBE: INFO <name>`.
 fn p_info(name): i64 { p_out("PROBE: INFO "); p_out(name); p_out("\n"); return 0; }
 
+# PASS when `ok` is 1, FAIL otherwise.
 fn p_check(name, ok): i64 {
     if (ok == 1) { return p_pass(name); }
     return p_fail(name);
 }
 
-# --- 1. trust store: multi-path probe + load-once cache -----------------------
+# --- 1. trust store: what _agnos_ca_install loads -----------------------------
 
+# agnos only: whirl's `_agnos_ca_install` finds a system bundle (TLS_OK), and a
+# second ctx is handed the SAME parsed root set instead of parsing its own. That
+# sharing is the stdlib's once-per-process cache (cyrius 6.6.13), and it is what
+# made the old `_agnos_ca_hook` removable at 0.7.1.
 fn probe_ca(): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     p_info("ca-load SKIPPED (agnos-only path; this is a host build)");
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_AGNOS
-    var rc = _agnos_ca_load();
-    if (rc < 0) {
-        p_fail("ca-load (no trust store opened at any probed path)");
-        return 0;
-    }
-    p_check("ca-load", 1);
-
-    p_out("PROBE: INFO ca-path ");
-    if (_agnos_ca_path != 0) { p_out(_agnos_ca_path); } else { p_out("(none)"); }
-    p_out("\n");
-    p_out("PROBE: INFO ca-bytes ");
-    p_int(_agnos_ca_len);
-    p_out("\n");
-
-    # A plausible bundle, not just a non-empty read.
-    p_check("ca-size-sane", (_agnos_ca_len > 1000) && (_agnos_ca_len < 1048576));
-
-    # The cache is the 0.6.8 fix: a second load must NOT re-read or re-allocate.
-    # Same pointer AND same length is the observable form of that.
-    var buf1 = _agnos_ca_buf;
-    var len1 = _agnos_ca_len;
-    _agnos_ca_load();
-    p_check("ca-cached (second load reuses the buffer)",
-      (_agnos_ca_buf == buf1) && (_agnos_ca_len == len1));
-    return 0;
-    #endif
-}
-
-# --- 2. B3: is _agnos_ca_hook still necessary? --------------------------------
-#
-# cyrius v6.2.23 fixed the agnos-ABI defect in `tls_native_set_ca_system` that
-# the hook exists to work around. If set_ca_system now succeeds here, the hook is
-# redundant and can be retired; if it still fails, the hook stays and B3 closes
-# as "no". Either answer is progress — the point is to stop guessing.
-fn probe_ca_system(): i64 {
-    #ifndef CYRIUS_TARGET_AGNOS
-    p_info("b3 SKIPPED (the question is about the agnos ABI; this is a host build)");
-    return 0;
-    #endif
-    #ifdef CYRIUS_TARGET_AGNOS
     var host = "example.com";
-    var nctx = tls_native_new_client(host, strlen(host));
-    if (nctx == 0) {
-        p_fail("b3-new-client (could not build a TLS client ctx)");
+    var c1 = tls_native_new_client(host, strlen(host));
+    var c2 = tls_native_new_client(host, strlen(host));
+    if ((c1 == 0) || (c2 == 0)) {
+        p_fail("ca-new-client (could not build a TLS client ctx)");
         return 0;
     }
-    var rc = tls_native_set_ca_system(nctx);
-    p_out("PROBE: INFO b3-set-ca-system-rc ");
+    var rc = _agnos_ca_install(c1);
+    p_out("PROBE: INFO ca-install-rc ");
     p_int(rc);
     p_out("\n");
-    if (rc == 0) {
-        p_info("b3-abi set_ca_system SUCCEEDS on agnos -- the v6.2.23 ABI fix is effective");
-        p_info("b3-abi NOTE this settles the ABI only; see b3-cost before retiring anything");
-    } else {
-        p_info("b3-abi set_ca_system STILL FAILS on agnos -- the hook's ABI workaround is load-bearing");
-    }
-    tls_native_close(nctx);
+    p_check("ca-load (_agnos_ca_install found a system bundle)", rc == TLS_OK);
+    p_out("PROBE: INFO ca-skipped-blocks ");
+    p_int(tls_native_ca_skipped(c1));
+    p_out("\n");
+
+    var rc2 = _agnos_ca_install(c2);
+    var r1 = load64(c1 + TLS_CTX_OFF_CA_ROOT);
+    var r2 = load64(c2 + TLS_CTX_OFF_CA_ROOT);
+    p_check("ca-shared (a second ctx gets the same parsed root set)",
+      (rc2 == TLS_OK) && (r1 != 0) && (r1 == r2));
+    # Closing both must not disturb the shared set: section 2 handshakes on it,
+    # so a close that zeroised it would show up there as a failed good chain.
+    tls_native_close(c1);
+    tls_native_close(c2);
     return 0;
     #endif
 }
 
-# --- 2b. B3, decisively: does set_ca_system actually VERIFY? ------------------
+# --- 2. trust store: does whirl's agnos TLS connect actually VERIFY? ----------
 #
-# `set_ca_system` returning 0 proves it loaded *something*. It does not prove the
-# roots are real, and it does not prove verification still enforces. Retiring
-# `_agnos_ca_hook` on a return code alone could swap a working trust path for an
-# empty store (everything fails closed) or, far worse, a permissive one.
-#
-# So do the only test that settles it: two real handshakes, using ONLY
-# set_ca_system for roots — no hook anywhere in the path.
-#   good: a public host with a valid chain      MUST reach TLS_OK
-#   bad:  a self-signed server on the QEMU host MUST NOT reach TLS_OK
-# Both are needed. `good` alone cannot distinguish a real trust store from a
-# permissive one; `bad` alone cannot distinguish enforcement from an empty store.
+# ca-load proves a bundle loaded. It does not prove the roots are real, or that
+# verification still enforces. So run two real handshakes through whirl's own
+# `_agnos_tls_native_connect`, the function transport_fetch_tls calls:
+#   good: a public host with a valid chain      MUST connect
+#   bad:  a self-signed server on the QEMU host MUST be refused
+# Both are needed. `good` alone cannot tell a real trust store from a permissive
+# one; `bad` alone cannot tell enforcement from an empty store. (Through 0.7.0
+# this was roadmap B3's question, asked of set_ca_system in a probe-local
+# handshake rather than through whirl's connect.)
 
 # Open a TCP connection to host:port over taar and hand back the fd, or -1.
 fn _probe_connect(host, port): i64 {
@@ -149,119 +127,106 @@ fn _probe_connect(host, port): i64 {
     return fd;
 }
 
-# Handshake with roots from set_ca_system ONLY. Returns tls_native_connect's
-# code, or a sentinel: -900 connect failed, -901 ctx alloc failed,
-# -902 set_ca_system failed.
+# Handshake through whirl's agnos TLS connect. Returns 1 when it succeeded (chain
+# and hostname verified), 0 when it was refused, -900 when TCP could not connect.
 fn _probe_handshake(host, port): i64 {
+    #ifndef CYRIUS_TARGET_AGNOS
+    return 0 - 900;
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
     var fd = _probe_connect(host, port);
     if (fd < 0) { return 0 - 900; }
     tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0);
-    var nctx = tls_native_new_client(host, strlen(host));   # TLS_VERIFY_PEER default
-    if (nctx == 0) { taar_sock_close(fd); return 0 - 901; }
-    if (tls_native_set_ca_system(nctx) != 0) {
-        tls_native_close(nctx); taar_sock_close(fd); return 0 - 902;
-    }
-    var rc = tls_native_connect(nctx, fd);
-    tls_native_close(nctx);
+    var ctx = _agnos_tls_native_connect(fd, host);
+    var ok = 0;
+    if (ctx != 0) { ok = 1; tls_close(ctx); }
     taar_sock_close(fd);
-    return rc;
+    return ok;
+    #endif
 }
 
-fn probe_b3_verify(): i64 {
+# agnos only: whirl's TLS connect accepts example.com's valid chain and refuses
+# the harness's self-signed server at 10.0.2.2:18443.
+fn probe_verify(): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
-    p_info("b3-verify SKIPPED (agnos-only; this is a host build)");
+    p_info("verify SKIPPED (agnos-only; this is a host build)");
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_AGNOS
     var good = _probe_handshake("example.com", 443);
-    p_out("PROBE: INFO b3-good-rc ");
+    p_out("PROBE: INFO verify-good-result ");
     p_int(good);
     p_out("\n");
-    p_check("b3-good-verifies (valid chain reaches TLS_OK on set_ca_system roots)",
-      good == TLS_OK);
+    p_check("verify-good (valid chain: whirl's agnos TLS connect succeeds)", good == 1);
 
     # 10.0.2.2 is the QEMU host under SLIRP. The harness runs a self-signed
-    # server there whose cert names 10.0.2.2, so a rejection is due to the
+    # server there whose cert names 10.0.2.2, so a refusal is due to the
     # UNTRUSTED ISSUER and not a hostname mismatch — which is precisely the
     # property the trust store is responsible for.
     var bad = _probe_handshake("10.0.2.2", 18443);
-    p_out("PROBE: INFO b3-bad-rc ");
+    p_out("PROBE: INFO verify-bad-result ");
     p_int(bad);
     p_out("\n");
     if (bad == (0 - 900)) {
-        p_info("b3-bad SKIPPED (no self-signed server reachable at 10.0.2.2:18443)");
-        p_fail("b3-bad-inconclusive -- cannot retire the hook without a negative result");
+        p_info("verify-bad SKIPPED (no self-signed server reachable at 10.0.2.2:18443)");
+        p_fail("verify-bad-inconclusive -- no negative result, so enforcement is unproven");
         return 0;
     }
-    p_check("b3-bad-rejected (self-signed chain does NOT reach TLS_OK)", bad != TLS_OK);
+    p_check("verify-bad (self-signed chain: whirl's agnos TLS connect refuses)", bad == 0);
     return 0;
     #endif
 }
 
-# --- 2c. B3 cost: what does retiring the hook actually cost? ------------------
+# --- 3. trust store: what does each connect cost? -----------------------------
 #
-# The premise of B3 was that `_agnos_ca_hook` exists ONLY to work around the
-# agnos sys_open ABI defect, so a fixed ABI makes it dead weight. 2b proved the
-# ABI is fixed. But the hook acquired a SECOND job at 0.6.8 that the premise did
-# not account for: it caches the bundle, because the allocator is a bump
-# allocator with no free and re-reading 1 MiB per TLS connect is a permanent
-# leak — ~1 MiB per redirect hop and per crawled resource.
-#
-# `tls_native_set_ca_system` allocates its own 1 MiB buffer on EVERY call
-# (lib/tls_native_hs12.cyr) and caches nothing. So this measures the difference
-# instead of assuming it: heap growth across repeated calls, hook vs set_ca_system.
-fn probe_b3_cost(): i64 {
+# This allocator is a bump allocator with no free, so anything spent per connect
+# is permanent. An HTTPS `-r` crawl makes up to 64 connects, plus redirect hops.
+# It has gone wrong here twice:
+# - set_ca_system re-reading 1 MiB per call (cyrius before v6.5.36), measured at
+#   0.6.11 as 1 MiB per connect;
+# - the `_agnos_ca_hook` that cached it, parsing the bundle into every ctx:
+#   ~272,720 B per connect, measured at 0.7.1, which is why it was removed.
+# This pins the current behaviour. Once section 1 has warmed the stdlib's cache,
+# `_agnos_ca_install` plus its ctx must cost at most 16 KiB per connect. At 0.7.1
+# it measured ~656 B, and a TLS ctx alone is 640 B.
+var _PROBE_CA_COST_MAX = 16384;
+# agnos only: 8 rounds of new_client + _agnos_ca_install + close stay under the bound.
+fn probe_ca_cost(): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
-    p_info("b3-cost SKIPPED (agnos-only; this is a host build)");
+    p_info("ca-cost SKIPPED (agnos-only; this is a host build)");
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_AGNOS
-    var rounds = 4;
-
-    # The hook: bundle already loaded, so each call should add ~nothing.
+    var rounds = 8;
+    var made = 0;
     var host = "example.com";
     var h0 = alloc_used();
     var i = 0;
     while (i < rounds) {
-        var c1 = tls_native_new_client(host, strlen(host));
-        if (c1 != 0) { _agnos_ca_hook(0, c1); tls_native_close(c1); }
+        var c = tls_native_new_client(host, strlen(host));
+        if (c != 0) {
+            made = made + 1;
+            _agnos_ca_install(c);
+            tls_native_close(c);
+        }
         i = i + 1;
     }
-    var hook_cost = alloc_used() - h0;
-
-    # set_ca_system: a fresh 1 MiB read every time.
-    var s0 = alloc_used();
-    var j = 0;
-    while (j < rounds) {
-        var c2 = tls_native_new_client(host, strlen(host));
-        if (c2 != 0) { tls_native_set_ca_system(c2); tls_native_close(c2); }
-        j = j + 1;
-    }
-    var sys_cost = alloc_used() - s0;
-
-    p_out("PROBE: INFO b3-cost-rounds ");
+    var per = (alloc_used() - h0) / rounds;
+    p_out("PROBE: INFO ca-cost-rounds ");
     p_int(rounds);
     p_out("\n");
-    p_out("PROBE: INFO b3-cost-hook-bytes ");
-    p_int(hook_cost);
+    p_out("PROBE: INFO ca-cost-bytes-per-connect ");
+    p_int(per);
     p_out("\n");
-    p_out("PROBE: INFO b3-cost-set-ca-system-bytes ");
-    p_int(sys_cost);
-    p_out("\n");
-
-    # Both paths allocate a TLS ctx per round; only set_ca_system adds a 1 MiB
-    # bundle read on top. If it does not, the premise holds and the hook can go.
-    if (sys_cost > (hook_cost + 1048576)) {
-        p_info("b3-cost-verdict set_ca_system leaks ~1 MiB PER CONNECT -- the hook's CACHE is still load-bearing, do NOT retire");
-    } else {
-        p_info("b3-cost-verdict set_ca_system costs no more than the hook -- retiring is free");
-    }
+    p_check("ca-cost-bounded (<= 16 KiB of no-free heap per connect)",
+      (made == rounds) && (per <= _PROBE_CA_COST_MAX));
     return 0;
     #endif
 }
 
-# --- 3. -C resume: append path and the >1 MiB refusal -------------------------
+# --- 4. -C resume: append path and the >1 MiB refusal -------------------------
 
+# output_append extends a small file and keeps its original bytes.
 fn probe_resume(): i64 {
     # Root, not /tmp: the agnos rootfs is bin/ + etc/ + fw/ with no /tmp, and the
     # first run of this probe failed on exactly that. Root always exists.
@@ -331,12 +296,12 @@ fn probe_resume_guard(): i64 {
     return 0;
 }
 
-# --- 4. symlink predicate on agnos --------------------------------------------
+# --- 5. symlink predicate on agnos --------------------------------------------
 #
-# agnos has no lstat peer and its path-based sys_stat#33 follows the final
-# symlink, so fs_is_symlink cannot answer here and returns 0 by construction.
-# Recorded as INFO, not FAIL: the gap is known and deliberate (roadmap B1). What
-# would be a defect is the call not being reachable, or faulting.
+# fs_is_symlink answers 0/1 without faulting on both targets. On agnos it also
+# detects the harness's planted link via readlink#70 and does not flag the
+# planted regular file (roadmap B1, closed at 0.6.12; before that agnos had no
+# way to answer and the predicate returned 0 by construction).
 fn probe_symlink(): i64 {
     var r1 = fs_is_symlink("/etc/ssl/cert.pem");
     var r2 = fs_is_symlink("/no/such/path/at/all");
@@ -371,6 +336,7 @@ fn probe_symlink(): i64 {
     return 0;
 }
 
+# Run every probe and exit with the number of FAIL lines (0 = clean).
 fn main() {
     alloc_init();
     p_out("PROBE: BEGIN whirl agnos path probe v");
@@ -378,9 +344,8 @@ fn main() {
     p_out("\n");
 
     probe_ca();
-    probe_ca_system();
-    probe_b3_verify();
-    probe_b3_cost();
+    probe_verify();
+    probe_ca_cost();
     probe_resume();
     probe_resume_guard();
     probe_symlink();

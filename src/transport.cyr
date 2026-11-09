@@ -23,6 +23,8 @@ var TRANSPORT_ERR_SEND    = 0 - 6;
 # A flag rather than an error return: a peer that RSTs after sending a complete
 # Content-Length-delimited body is common, and must not become a hard failure.
 var _transport_incomplete = 0;
+# 1 when the last fetch's read ended on an error, timeout or full buffer rather
+# than a clean close or a complete response.
 fn transport_incomplete(): i64 { return _transport_incomplete; }
 
 # Send all of `len` bytes. taar_tcp_send is write(2) on Linux and sock_send#48
@@ -109,83 +111,26 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
 }
 
 #ifdef CYRIUS_TARGET_AGNOS
-# CA-trust hook for agnos: read the system trust bundle ONCE and install it into
-# each new TLS ctx. Called by _agnos_tls_native_connect after new_client.
+# Trust roots for an agnos TLS client ctx: the system bundle, through the stdlib.
+# Returns TLS_OK, or a TLS_ERR_* (TLS_ERR_IO when no bundle is readable at any of
+# /etc/ssl/cert.pem, /etc/ssl/certs/ca-certificates.crt,
+# /etc/pki/tls/certs/ca-bundle.crt, /etc/ssl/ca-bundle.pem). A function of its own
+# so tests/agnos_probe.cyr can measure exactly what whirl pays per connect.
 #
-# ⚠ WHY IT STILL EXISTS (re-examined at 0.6.11 — roadmap B3).
-#
-# It was written at 0.6.2 to work around a cyrius defect: `set_ca_system` opened
-# the bundle with the Linux `sys_open(path, flags, mode)` ABI while agnos
-# `sys_open` is `(name, namelen, flags)`, so namelen=0 opened an empty path,
-# every candidate failed, and the ctx was built with NO roots (filed as
-# 2026-06-18-tls-native-set-ca-system-agnos-sys-open-abi). **That defect is
-# fixed.** cyrius v6.2.23 routes through `file_open`, and tests/agnos_probe.cyr
-# confirms on a real kernel that `set_ca_system` returns 0, verifies a valid
-# chain (TLS_OK), and still rejects a self-signed one. The original reason is gone.
-#
-# It stays for a reason it acquired later, at 0.6.8: **it is the cache.**
-# cyrius's `set_ca_system` allocates a fresh 1 MiB buffer on every call and
-# caches nothing (lib/tls_native_hs12.cyr), and this allocator is a bump
-# allocator with no free — so calling it per connect leaks 1 MiB per TLS
-# connection, permanently. The probe measures exactly that: over 4 handshakes,
-# 1,072,320 bytes through this hook vs 5,266,624 through `set_ca_system` — a
-# difference of 4,194,304, i.e. 1 MiB per connect. An HTTPS `-r` crawl at the
-# 64-resource cap would leak ~64 MiB.
-#
-# Retiring this becomes correct once cyrius caches the system bundle itself.
-# Until then the hook IS the cache — do not remove it on the strength of the ABI
-# fix alone. That was B3's premise, and it was incomplete.
-#
-# The four candidate paths below are the same four, in the same order, as
-# cyrius's `set_ca_system`. The difference is that these are read once.
-var _agnos_ca_buf = 0;
-var _agnos_ca_len = 0;
-var _agnos_ca_path = 0;   # the trust-store path that actually opened (0 = none)
-
-fn _agnos_ca_load(): i64 {
-    if (_agnos_ca_buf != 0) { return 0; }      # already loaded
-    # Distributions disagree on where the bundle lives; probe the common layouts
-    # rather than assuming one. Previously only the first was tried, so an image
-    # with a Debian/RHEL trust store had no roots at all and every HTTPS
-    # handshake failed closed — correct, but for the wrong reason.
-    var fd = 0 - 1;
-    var i = 0;
-    while ((i < 4) && (fd < 0)) {
-        var path = "/etc/ssl/cert.pem";
-        if (i == 1) { path = "/etc/ssl/certs/ca-certificates.crt"; }
-        if (i == 2) { path = "/etc/pki/tls/certs/ca-bundle.crt"; }
-        if (i == 3) { path = "/etc/ssl/ca-bundle.pem"; }
-        var nl = 0;
-        while (load8(path + nl) != 0) { nl = nl + 1; }
-        fd = sys_open(path, nl, 0);
-        if (fd >= 0) { _agnos_ca_path = path; }
-        i = i + 1;
-    }
-    if (fd < 0) { return 0 - 1; }              # no bundle staged → leave roots empty
-    var cap = 1048576;
-    var buf = xalloc(cap);
-    if (buf == 0) { sys_close(fd); return 0 - 1; }   # never store into address 0
-    var total = 0;
-    var go = 1;
-    while (go == 1) {
-        var n = sys_read(fd, buf + total, cap - total);
-        if (n <= 0) { go = 0; }
-        else {
-            total = total + n;
-            if (total >= cap) { go = 0; }
-        }
-    }
-    sys_close(fd);
-    if (total <= 0) { return 0 - 1; }
-    _agnos_ca_buf = buf;
-    _agnos_ca_len = total;
-    return 0;
-}
-
-fn _agnos_ca_hook(hook_ctx, nctx): i64 {
-    if (_agnos_ca_load() < 0) { return 0; }
-    tls_native_set_ca_bundle(nctx, _agnos_ca_buf, _agnos_ca_len, 0);
-    return 0;
+# This replaced `_agnos_ca_hook` at 0.7.1. That hook read the bundle once into a
+# whirl-owned buffer and handed it to `tls_native_set_ca_bundle` for every ctx.
+# - 0.6.2: it worked around set_ca_system opening the bundle with the Linux
+#   sys_open ABI on agnos. Fixed upstream in cyrius v6.2.23.
+# - 0.6.8: it became a CACHE, because set_ca_system re-read 1 MiB per call and
+#   this allocator never frees. The probe measured that leak, 1 MiB per
+#   connect, on cyrius 6.5.35.
+# - cyrius v6.5.36 made set_ca_system read the bundle once per process, and
+#   6.6.13 made it share ONE parsed root set across every ctx.
+# - 0.7.1: on a real kernel at 6.7.18 the hook now cost ~272,720 B per connect,
+#   because set_ca_bundle parses the whole bundle into each ctx. set_ca_system
+#   costs ~656 B. The cache had become the leak, so it was removed.
+fn _agnos_ca_install(nctx): i64 {
+    return tls_native_set_ca_system(nctx);
 }
 
 # agnos TLS connect via the SOVEREIGN native stack (lib/tls_native.cyr), NOT the
@@ -194,8 +139,8 @@ fn _agnos_ca_hook(hook_ctx, nctx): i64 {
 # dynamic-loader bridge (fdlopen bootstraps ld.so to dlopen glibc). agnos
 # binaries are STATIC — no ld.so, no fdlopen — so that path is both unbuildable
 # (reachable-undef fdlopen_*) and structurally unusable. Wire the native client
-# directly instead: new_client (defaults to TLS_VERIFY_PEER) → CA roots via the
-# agnos-ABI hook → handshake over taar's socket (transport installed by caller).
+# directly instead: new_client (defaults to TLS_VERIFY_PEER) → system CA roots →
+# handshake over taar's socket (transport installed by caller).
 # Returns a facade-shaped native shim ctx [nctx@0, 0@8, sock@16, NATIVE@24] so the
 # shared tls_read/tls_write/tls_close below route to the native backend (they
 # dispatch on _tls_backend==1 and never touch fdlopen). 0 on any failure.
@@ -204,10 +149,10 @@ fn _agnos_tls_native_connect(fd, host): i64 {
     while (load8(host + hl) != 0) { hl = hl + 1; }
     var nctx = tls_native_new_client(host, hl);   # TLS_VERIFY_PEER by default
     if (nctx == 0) { return 0; }
-    # Install roots from the cached bundle rather than calling
-    # tls_native_set_ca_system, which re-reads 1 MiB per connect and never frees
-    # it. NOT an ABI workaround any more — see the comment on _agnos_ca_hook.
-    _agnos_ca_hook(0, nctx);
+    # No readable trust store → stop here, before any network I/O. The verifier
+    # would refuse the chain anyway (no roots = TLS_ERR_CERT_INVALID, fail
+    # closed), but the retired hook ignored a failed load and handshook anyway.
+    if (_agnos_ca_install(nctx) != TLS_OK) { tls_native_close(nctx); return 0; }
     # CVE-18: tls_native_connect verifies chain + hostname fail-closed before TLS_OK.
     if (tls_native_connect(nctx, fd) != TLS_OK) { tls_native_close(nctx); return 0; }
     var ctx = xalloc(40);
@@ -223,7 +168,7 @@ fn _agnos_tls_native_connect(fd, host): i64 {
 # stdlib (tls_connect handshakes + verifies the cert chain + hostname fail-closed,
 # CVE-18). On Linux tls_native's default transport does raw read/write on taar's
 # real socket fd; on agnos the fd is a sentinel so the transport + CA roots are
-# wired explicitly (set_transport + _agnos_ca_hook).
+# wired explicitly (set_transport + _agnos_ca_install).
 fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
     _transport_incomplete = 0;
     var ip = taar_resolve_ipv4(host);
@@ -244,7 +189,7 @@ fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
     # cert-window validation. On Linux the real fd works with the default path.
     tls_native_set_transport(&taar_tcp_recv, &taar_tcp_send, 0);
     # Sovereign native handshake — no libssl/fdlopen (agnos is static, no ld.so).
-    # _agnos_tls_native_connect wires new_client + agnos-ABI CA roots + connect and
+    # _agnos_tls_native_connect wires new_client + system CA roots + connect and
     # returns a native-backed shim the shared tls_* I/O below drives.
     var ctx = _agnos_tls_native_connect(fd, host);
     #endif

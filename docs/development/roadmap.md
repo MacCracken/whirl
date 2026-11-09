@@ -32,18 +32,21 @@ Full detail in [`state.md`](state.md) § *Open defects*.
       *directory* planted inside the crawl output is still followed. Needs
       per-component `openat` walking, on both targets. Narrower than B2 and
       unblocked — no kernel change required on Linux.
-- [ ] **B4 — Upstream: cyrius should cache the system trust bundle.**
-      `tls_native_set_ca_system` allocates 1 MiB on every call and caches
-      nothing. Every agnos TLS consumer pays that, not just whirl. Fixing it
-      upstream is what makes B3 genuinely doable — at which point
-      `_agnos_ca_hook` becomes deletable in a one-line change.
+- [x] **B4 — Upstream: cyrius should cache the system trust bundle. Done; hook retired at 0.7.1.**
+      cyrius caches it: the bundle is read once per process (v6.5.36), and one parsed
+      root set is shared by every ctx (6.6.13). On a real kernel at 6.7.18 the probe
+      measured `_agnos_ca_hook` at ~272,720 B per connect (it re-parsed the bundle
+      into each ctx) against `set_ca_system`'s ~656 B. So `_agnos_tls_native_connect`
+      now calls `_agnos_ca_install` → `tls_native_set_ca_system`, the hook is gone, and
+      the probe's `ca-cost-bounded` check (≤ 16 KiB per connect) guards against
+      either regression returning.
 
 ### C. Substrate — `taar` `tls` / `http` modules
 
 A standing v1.0 criterion: whirl vendors no network primitives locally, and is
 the consumer that grows taar's remaining modules. `tcp` shipped at taar 0.2.0 and
 whirl runs on it; `tls` and `http` are **still unwritten** (verified: zero
-`taar_tls_*` / `taar_http_*` symbols at taar 0.6.0).
+`taar_tls_*` / `taar_http_*` symbols at taar 0.6.2).
 
 - [ ] **C1 — Decide the split.** whirl's HTTP framing (`src/http.cyr`) and TLS
       composition (`src/transport.cyr`) are the candidate donors. Worth settling
@@ -172,7 +175,7 @@ the arm a PE build would compile, so the exposure appears the day someone builds
   everywhere from program start" flip and the new different-type-co-linked-global
   error do not touch it. The per-arch split and the reasoning above it are right
   as they stand.
-- **The `r` global at `src/main.cyr:587` and `src/test.cyr:9`** is the same:
+- **The `r` global at `src/main.cyr:590` and `src/test.cyr:10`** is the same:
   those are `[build].entry` and `[build].test`, two separate entry points that
   are never co-linked.
 
@@ -211,15 +214,15 @@ against cmdit 1.2.6 source on 2026-10-14. Nothing was built or run.
 **Hand-rolled today.** The parser is a `streq` if-chain, not stdlib `flags`. `"flags"` is in `[deps] stdlib`, but
 there are zero `flags_*` calls outside `lib/`.
 
-- `src/main.cyr:55-60` is `_materialize_argv`. `:420-426` parses and dispatches: `CLI_HELP` → `_print_help`, exit 0;
+- `src/main.cyr:55-60` is `_materialize_argv`. `:423-429` parses and dispatches: `CLI_HELP` → `_print_help`, exit 0;
   `CLI_ERR` → `whirl: usage: whirl [-o FILE] [-L] <url>`, exit 2.
-- `src/cli.cyr:103-198` is `cli_parse`. It takes short-only bools `-L -O -r -C -f -i -I`; `-o` and `-X`; `-d` and
-  `--data-binary` (one loader, last wins); `-A`/`--user-agent`; and `-H`, repeatable and capped at 16 (`:7`, `:156`).
+- `src/cli.cyr:104-199` is `cli_parse`. It takes short-only bools `-L -O -r -C -f -i -I`; `-o` and `-X`; `-d` and
+  `--data-binary` (one loader, last wins); `-A`/`--user-agent`; and `-H`, repeatable and capped at 16 (`:7`, `:157`).
   `--retry` (long-only) and `-l` (short-only, default 1) go through `_cli_atoi` (`:36-47`), which stops at the first
   non-digit and clamps at 1,000,000.
-- `src/cli.cyr:126-127` returns on `-h`/`--help` mid-loop. At `:191-194`, any other token is the URL, including an
+- `src/cli.cyr:127-128` returns on `-h`/`--help` mid-loop. At `:192-195`, any other token is the URL, including an
   unknown `-x`. A second such token is `CLI_ERR`.
-- `src/main.cyr:81-102` is `_print_help`, hand-written and on **stdout**. It has already drifted: `:83`, `:426` and
+- `src/main.cyr:81-102` is `_print_help`, hand-written and on **stdout**. It has already drifted: `:83`, `:429` and
   `src/cli.cyr:3` each list a different subset of flags. There is no `--version`, although `WHIRL_VERSION` exists
   (`src/version.cyr:9`).
 
@@ -230,13 +233,13 @@ there are zero `flags_*` calls outside `lib/`.
   could not tell which came last. Register `-A`/`--user-agent` the same way.
 - [ ] `-H` → `cmdit_repeat(h, 72, 0, …)`. Keep the fail-closed cap in whirl: `cmdit_repeat_count > 16` → error.
   This holds only while 16 stays below cmdit's silent 64-entry list cap. Build the `hdrs` array for
-  `src/main.cyr:477-478` from `cmdit_repeat_get`. Run `_cli_load_data` once, after the parse, on `cmdit_get_str`.
+  `src/main.cyr:480-481` from `cmdit_repeat_get`. Run `_cli_load_data` once, after the parse, on `cmdit_get_str`.
 - [ ] **Decide** `--retry`/`-l`. `cmdit_int` with `cmdit_range(h, f, 0, 1000000)` rejects (exit 2) the values that
   `_cli_atoi` truncates or clamps (`5x` → 5, `-1` → 0). For identity, register them as `cmdit_str` and keep
   `_cli_atoi`. Making them strict is a separate change.
 - [ ] URL → `cmdit_require_positionals_exact(h, 1)`. Map both the missing and the too-many case to today's usage
   line, exit 2.
-- [ ] `CMDIT_VERSION` → `cmdit_version(h, WHIRL_VERSION)`, which prints `whirl 0.7.0` on stdout. This is new
+- [ ] `CMDIT_VERSION` → `cmdit_version(h, WHIRL_VERSION)`, which prints `whirl 0.7.1` on stdout. This is new
   surface with no clash (curl's `-V` is also `--version`). Add its row to `_print_help`.
 - [ ] Keep `_print_help` hand-written. `cmdit_help_flags` writes `-X <str>\t…` rows to **stderr** and cannot carry
   whirl's metavars or wrapped lines. Generated help would be a separate, deliberate output change.
@@ -246,16 +249,16 @@ URL; `-LO` is `CMDIT_ERR_BUNDLED`; and `-h` no longer short-circuits, so `whirl 
 `--` and `--name=value` become accepted. Exit codes 9 and 22 stay whirl's own, because `CMDIT_EXIT_*` covers only
 0/1/2 (see D3).
 
-**`cyrius.cyml`:** drop the unused `"flags"`. Keep `"args"` (`src/main.cyr:420-423`) and `"io"`. Add the block
-below. At whirl's 6.7.9 pin (since 0.7.0) the matching tag is `1.4.0`, the last cmdit tag pinned to 6.7.9; 1.4.1 and
-later are pinned to 6.7.18. This note was read against 1.2.6, so re-check the calls it names against 1.4.0 first. dig's
+**`cyrius.cyml`:** drop the unused `"flags"`. Keep `"args"` (`src/main.cyr:423-426`) and `"io"`. Add the block
+below. At whirl's 6.7.18 pin (since 0.7.1) the matching tag is `1.5.1`, cmdit's latest, which is pinned to 6.7.18 (dig
+runs on it). This note was read against 1.2.6, so re-check the calls it names against 1.5.1 first. dig's
 0.5.0 records two user-visible changes that came in with 1.3.x: `--help=x` is now a usage error, and unknown-flag errors
 now name the token.
 
 ```
 [deps.cmdit]
 git = "https://github.com/MacCracken/cmdit.git"
-tag = "1.4.0"
+tag = "1.5.1"
 modules = ["dist/cmdit.cyr"]
 ```
 

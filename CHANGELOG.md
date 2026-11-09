@@ -5,6 +5,219 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-09
+
+**Toolchain `6.7.9` → `6.7.18` and taar `0.6.0` → `0.6.2`, the latest of each, which puts whirl
+back in line with yo, dig and taar. `cyrius audit` now passes, and `_agnos_ca_hook` is
+retired.** The 7 lint warnings and all 55 undocumented public fns are fixed. `tests/agnos-probe.sh` could not run at all from 0.6.14 to 0.7.0. With it fixed, AGNOS passes on a real kernel again. That run showed the AGNOS trust-store hook had become the costly path, so it was replaced by the stdlib's `tls_native_set_ca_system`. That is the one logic change, and it is AGNOS-only: the Linux binary is byte-identical without it. Two Linux-visible behaviours change, both from taar 0.6.2.
+
+### Changed (AGNOS): `_agnos_ca_hook` retired, trust roots from `tls_native_set_ca_system`
+
+The hook was kept so whirl would *not* leak memory on every connect. By 0.7.1 it was the thing
+leaking.
+
+- **History.**
+  - 0.6.2: written to work around `set_ca_system` opening the CA bundle with the Linux
+    `sys_open` ABI on agnos. cyrius fixed that in v6.2.23.
+  - 0.6.8: kept as a cache, because `set_ca_system` re-read 1 MiB per call and this allocator
+    never frees. Measured at 0.6.11 (cyrius 6.5.35) as 1 MiB leaked per connect.
+  - cyrius v6.5.36 made `set_ca_system` read the bundle once per process. 6.6.13 made it share
+    one parsed root set across every ctx.
+  - The hook still handed its cached bytes to `tls_native_set_ca_bundle`, which parses the
+    whole bundle into each ctx.
+- **Measured on a real kernel (QEMU + KVM, cyrius 6.7.18):** the hook cost **272,720 B** of
+  no-free heap per TLS connect; `set_ca_system` costs **656 B**. That is ~17 MiB over a
+  64-resource HTTPS crawl.
+- **The change** (`src/transport.cyr`):
+  - `_agnos_tls_native_connect` now calls `_agnos_ca_install(nctx)`, which is
+    `tls_native_set_ca_system`. It searches the same four bundle paths in the same order the
+    hook did.
+  - If no bundle is readable, the connect now stops *before* any network I/O. The hook ignored a
+    failed load and handshook anyway. That was still fail-closed (with no roots, the verifier
+    returns `TLS_ERR_CERT_INVALID`), but the failure was hidden.
+  - `_agnos_ca_load`, `_agnos_ca_hook` and their three globals are gone.
+  - The Linux binary is byte-identical. The agnos image is +4,072 B, because the stdlib's
+    shared-root-set code is now reachable there.
+- **Probe reworked** (`tests/agnos_probe.cyr`). The B3-era checks compared the hook with
+  `set_ca_system`. They now pin the behaviour whirl relies on:
+  - `ca-load`: `_agnos_ca_install` finds a bundle.
+  - `ca-shared`: a second ctx gets the same parsed root set.
+  - `verify-good` / `verify-bad`: whirl's own `_agnos_tls_native_connect` verifies
+    example.com's chain and refuses the harness's self-signed server. Before, this went through
+    a probe-local re-implementation of the handshake.
+  - `ca-cost-bounded`: 8 rounds of new ctx + `_agnos_ca_install` + close cost ≤ 16 KiB per
+    connect.
+- **Negative control:** a scratch copy with the hook's per-ctx `set_ca_bundle` put back into
+  `_agnos_ca_install` fails exactly `ca-shared` and `ca-cost-bounded`, at 272,720 B per
+  connect. Its verify checks still pass, as they should: the hook was correct, only costly.
+  The control's first QEMU attempt stopped at the UEFI boot menu without booting the image,
+  an environment flake, not a probe result. The re-run booted normally.
+
+### Changed (user-visible, from taar 0.6.2)
+
+- **A connect to an unreachable host now fails after about 10 s, not about 127 s.**
+  `taar_tcp_set_timeout_ms` now sets `SO_SNDTIMEO` as well as `SO_RCVTIMEO`. whirl's existing
+  10 s timeout therefore bounds the connect and the send too, where before it bounded only the
+  recv. Measured against 192.0.2.1 (TEST-NET-1, which drops SYNs here): 0.7.1 exits 9 after
+  **10.2 s**. 0.7.0 was still waiting when the harness killed it at 45 s, and the kernel's SYN
+  retries alone run about 127 s. A send that writes nothing now returns `_TAAR_ERR_TIMEOUT`.
+  `_transport_send_all`'s `w < 0` already maps that to `TRANSPORT_ERR_SEND`, so no whirl
+  change was needed.
+- **A resolv.conf that names only resolvers taar cannot use now fails the request.** Such a
+  file lists, for example, only an IPv6 resolver or `0.0.0.0`. Before, every lookup quietly
+  went to 8.8.8.8 instead, bypassing the host's chosen resolver. To check, a mount namespace
+  bound a resolv.conf holding only `nameserver ::1`. 0.7.0 still answered, via 8.8.8.8, while
+  0.7.1 exits 9. A missing resolv.conf, or one naming no nameserver, still falls back. This
+  machine's `127.0.0.53` is unaffected. The error still reads `whirl: connection failed` (see
+  *Still open*).
+- Also from 0.6.2, and invisible to whirl's calls: only class-IN A records are taken as
+  addresses, CRLF resolv.conf files parse, and on AGNOS UDP replies from anyone but the
+  nameserver are dropped.
+
+### Fixed: `cyrius audit` passes (it exited 1 on every earlier pin)
+
+- **7 lint warnings → 0.** All seven were lines over 120 columns in `tests/`. Six were
+  `assert_eq` calls in `tests/whirl.tcyr`, wrapped by moving the message argument to its own
+  line. One was a `p_info` string in `tests/agnos_probe.cyr`, split into two `p_out` calls
+  that emit the same bytes. CI's lint gate covers only `src/*.cyr`, which was already clean.
+- **55 undocumented public fns → 0.** In `src/`: the 17 `cli_*` accessors, `url_new` and the
+  four `url_*` field readers, `http_set_user_agent`, `http_set_no_body`, `links_found`,
+  `transport_incomplete`, and both `main`s. `whirl`'s `main` now lists its exit codes:
+  0, 2 usage or bad input, 9 transfer, response or write failure, 22 under `-f`. In `tests/`:
+  17 test groups in `whirl.tcyr` and 10 helpers and probes in `agnos_probe.cyr`. Each comment
+  was written against the function's body, not its name.
+- **Comments that were wrong, fixed in passing.**
+  - `probe_symlink`'s header still said AGNOS "cannot answer" and returns 0 by construction.
+    B1 closed that at 0.6.12, and the function body already says so.
+  - In `tests/whirl.tcyr`, the `# === HTTP ===` banner sat above `test_url_filename`, a URL
+    test.
+  - `src/output.cyr` said the stdlib does not export `O_NOFOLLOW`. That was true at 0.6.13
+    (cyrius 6.5.35), but `lib/syscalls_{x86_64,aarch64}_linux.cyr` have exported it per arch
+    since **6.6.4**, with the same values whirl defines. whirl keeps its own definitions, and
+    the comment now says why. It also records a new safety net: at 6.7.18 a value that
+    disagrees with the stdlib draws a build warning (`duplicate symbol 'O_NOFOLLOW' redefined
+    with conflicting value`). That was checked by planting 131072 in the aarch64 arm. CI builds
+    no aarch64 image, so the warning only appears locally.
+- `cyrius audit` now reports `format clean`, `lint clean`, `docs complete`, the tests passing
+  and the bench skipped, and exits **0**.
+- **`tests/agnos-probe.sh` could not run since 0.6.14.** Its build guard grepped for a bare
+  `OK` line, but cyrius has printed `OK (<n> bytes)` since at least 6.6.2, so every
+  successful build was rejected with `ERROR: probe build failed`. It was also broken the other
+  way: any line containing "error" counted as success, so a failed build would have passed.
+  The guard now uses cyrius's exit status (1 on failure, 0 on success, both checked), and the
+  full build log is printed on failure.
+
+### Changed
+
+- **Toolchain pin `6.7.9` → `6.7.18`.** CI reads it from `cyrius.cyml`, so no workflow edit.
+- **`[deps.taar]` `0.6.0` → `0.6.2`.** `lib/taar.cyr` is byte-identical to taar@0.6.2's
+  `dist/taar.cyr`. The sidecar is still `syscalls` + `fmt`.
+- **`lib/` re-vendored from the 6.7.18 snapshot.** All 65 stdlib `.cyr` files and the 7 files
+  under `lib/unicode/` are byte-identical to `~/.cyrius/versions/6.7.18/lib`. bayan 1.11.1
+  brings in `math.cyr` and `unicode/` transitively.
+- **`cyrius.lock` re-pinned.** Resolving under the old lock kept the taar 0.5.2 and 0.6.0
+  commit lines alongside 0.6.2's ("fail-closed; delete cyrius.lock to re-pin"). The lock was
+  regenerated and now carries only taar 0.6.2 = `d203629`, checked against the tag. That
+  matches yo's and dig's locks. Its 73 file rows are identical to the pre-regeneration lock,
+  `--verify` passes 73/73, and `--locked` passes.
+- `cyrius.cyml`'s taar comment describes 0.6.2's three effects on whirl.
+- **Local re-vendor order.** At a pin move, `cyrius lib sync` refuses while the old `lib/` is
+  still present. It exits 1 and copies nothing, naming 13 transitive files whose bytes differ.
+  Run `cyrius deps` first (or `rm -rf lib`), then `lib sync`. Reproduced here. CI is
+  unaffected, because its checkout starts with no `lib/`.
+
+### From the 6.7.10–6.7.18 stdlib (no whirl change needed)
+
+Every 6.7.10–6.7.18 migration note was checked against the stdlib symbols whirl's `src/` and
+`tests/` reference. Of about 560 notes, about 20 touch something whirl uses, and none required
+a code change. The ones that change behaviour:
+
+- **TLS 1.2 keeps the server's intermediate certificates (6.7.18).** Before, a TLS 1.2 server
+  that sent an intermediate failed verification. This is a real fix on both targets.
+- **nameConstraints are enforced, and a trailing-dot hostname matches with one dot dropped
+  (6.7.18).**
+- **The native TLS client refuses protocol violations** (6.7.12, 6.7.14, 6.7.15): extensions
+  it did not offer, repeated extensions, trailing bytes, an unoffered ALPN. whirl reports
+  these as `TRANSPORT_ERR_TLS`, exit 9.
+- **`tls_native_close` zeroises the ctx's secrets (6.7.18).** whirl never touches a ctx after
+  `tls_close` or the failure-path `tls_native_close`, so this is safe.
+- **The AGNOS TLS shim still matches.** `_agnos_tls_native_connect` hand-builds a 40-byte
+  facade ctx, `[nctx, 0, sock, TLS_BACKEND_NATIVE]`. That was checked against 6.7.18's
+  `lib/tls.cyr`, whose own `_tls_native_alloc_in` builds exactly that layout.
+  `TLS_BACKEND_NATIVE` (1), `TLS_OK` (0) and the `tls_native_*` signatures whirl calls are
+  unchanged.
+- **B4 was answered, and it led to retiring `_agnos_ca_hook`.** See *Changed (AGNOS)* above.
+- `docs/development/roadmap.md`: the `file:line` citations into `cli.cyr`, `main.cyr` and
+  `test.cyr` moved with the added comments, and the cmdit note's tag is `1.5.1`, the cmdit tag
+  pinned to 6.7.18.
+
+### Verified
+
+Baseline: 0.7.0 built CI-style at 6.7.9.
+
+- `cyrius test`: **139/139** on x86_64. `tests/behavior.py`: **26/26** standalone and 26/26
+  against 0.7.0, with the 15 controls skipped because the baseline already has those fixes.
+- **Builds:** x86_64, `--agnos` and `--aarch64` all build with **no warnings**. The sigil
+  frame-budget warning is gone, because sigil 3.13.12's fix arrived with 6.7.10. So is the
+  large-static-data note. The agnos arm is selected. The agnos probe builds for both targets,
+  and its host build reports 0 failures.
+- **aarch64 under qemu-user:** unit suite 139/139, `behavior.py` 26/26, live
+  `https://example.com` (the first HTTPS run on this arch) and a `-C` resume all pass. The
+  `O_NOFOLLOW` negative control (x86_64's value planted in the aarch64 arm) still fails exactly
+  check [13]'s two assertions (24/26).
+- **Live:** `http://example.com` and `https://example.com` are sha-identical to 0.7.0, and
+  `-L https://github.com` completes.
+- **TLS fail-closed:** a local self-signed `openssl s_server` is rejected with exit 9 by 0.7.0
+  and 0.7.1. Every accept was consumed, so the rejection happened at the TLS layer.
+- **`-C` resume** against a local Range server, on 0.7.0, 0.7.1 and aarch64. Each result is
+  byte-identical to the source, and the already-complete case gets 416 and leaves the file
+  intact.
+- **AGNOS on a real kernel (QEMU + KVM):** `tests/agnos-probe.sh` passes **14 checks, 0 failures**
+  at 6.7.18, both before and after the hook was retired. After it, the checks cover:
+  - the trust store: load, the shared root set, whirl's connect verifying a good chain and
+    refusing a self-signed one, and the per-connect cost (656 B);
+  - the `-C` resume append and the >1 MiB guard;
+  - readlink#70 symlink detection against a planted link.
+
+  This is the first QEMU run since 0.6.13, so it also covers 0.6.14 through 0.7.0, which
+  shipped with the AGNOS arm compile-checked only. It also exercises sigil 3.13.14/15's
+  reworked TLS internals on agnos.
+- **AGNOS end to end, hook retired:** agnos's `scripts/smoke/whirl-smoke.sh` was run from a
+  throwaway copy of its tree with this build as `/bin/whirl`, so the agnos repo was not
+  touched. `whirl --help`, `whirl http://example.com` and `whirl https://example.com` all
+  pass. Both fetches returned the complete Example Domain page, HTTPS cert-verified through
+  `tls_native` over taar, each on its first attempt.
+- **Blackholed connect** and **IPv6-only resolv.conf**: see *Changed (user-visible)* above.
+- A CI-faithful run (tracked tree only, no `lib/`, no siblings) wrote an identical lock and
+  sha256-identical host and agnos binaries.
+
+### Binary size: +120 KB, and nearly all of it is dead Unicode data
+
+| | 0.7.0 @ 6.7.9 | 0.7.1 @ 6.7.18 |
+|---|---|---|
+| host `CYRIUS_DCE=1` | 923,576 B | 1,044,064 B (+120,488) |
+| `--agnos` `CYRIUS_DCE=1` | 908,568 B | 1,029,104 B (+120,536; +4,072 of it from the retired hook, below) |
+| `--aarch64` (no compaction) | 2,250,464 B | 2,596,248 B (+345,784) |
+| unreachable fns (host) | 2,725 | 3,101 |
+
+taar 0.6.2's share is **+32 B**, measured by building 0.7.1 at 6.7.18 against taar 0.6.0. The
+rest comes from the stdlib. bayan 1.11 includes all three Unicode tables
+(`lib/unicode/_categories_data.cyr`, `_casefold_data.cyr`, `_normalize_data.cyr`). Together
+they hold **307,252 B** of hex string literals, and the 0.7.1 binary carries 309,644 B of long
+hex runs where 0.7.0 carried 2,560 B. whirl reaches **none** of the 32 `unicode_*` fns: DCE
+lists every one as dead, but it keeps the string literals that only they reference. sigil's
+fix removed its 256 KB static buffer, which offsets most of that. That is why the net is
++120 KB and not +300 KB. This is not whirl's to fix, and it is recorded in `state.md`
+*Carry-forward*.
+
+### Still open
+
+- **The resolve-failure message.** `main` reports every transport error as
+  `whirl: connection failed`, so a DNS failure reads like a connect failure. taar 0.6.2's
+  fail-closed resolv.conf makes that path more likely to be hit. `TRANSPORT_ERR_RESOLVE`
+  already exists to tell them apart. This is recorded in `state.md`, not fixed here, because
+  it is a behaviour change.
+
 ## [0.7.0] - 2026-11-09
 
 **Toolchain `6.6.20` → `6.7.9` (the 6.7 language minor) and taar `0.5.2` → `0.6.0`, the last

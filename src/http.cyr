@@ -21,6 +21,8 @@ var _http_ua = 0;   # User-Agent override (0 = default whirl/<ver>)
 # http_build_request; consulted before returning a length.
 var _http_trunc = 0;
 
+# Override the User-Agent (cstr) for every request built after this; 0 restores
+# the default `whirl/<version>`.
 fn http_set_user_agent(ua): i64 { _http_ua = ua; return 0; }
 
 # Append cstr `s` into buf at pos (bounded by bufmax). Returns the new pos.
@@ -266,6 +268,8 @@ fn _http_chunked_terminated(body, blen): i64 {
 # body that will never arrive. Without it the completeness test below waits for
 # an end-of-body that cannot come.
 var _http_no_body = 0;
+# Mark the response as bodiless (1 for a HEAD request), so http_response_complete
+# treats the end of the headers as the end of the response.
 fn http_set_no_body(v): i64 { _http_no_body = v; return 0; }
 
 # Is `len` bytes at `resp` a COMPLETE HTTP response, judged by its own framing?

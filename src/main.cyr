@@ -415,6 +415,9 @@ fn _crawl(start_url, base_host, base_https, base_port, maxdepth): i64 {
     return 0;
 }
 
+# Entry point: parse argv, fetch (or crawl, with -r), write the result.
+# Exit codes: 0 ok, 2 usage / bad input, 9 transfer, response or write failure,
+# 22 HTTP >= 400 under -f.
 fn main() {
     alloc_init();
     args_init();

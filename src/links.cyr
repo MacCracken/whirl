@@ -70,6 +70,7 @@ fn links_path_normalize(path): i64 {
 # without this a page with more links than capacity looked identical to one that
 # fitted exactly — the crawl reported a complete mirror of a partial page.
 var _links_found = 0;
+# How many links the last links_extract saw, including any it could not store.
 fn links_found(): i64 { return _links_found; }
 
 # Extract href/src URL values from html[0..len) into `out` (array of cstr ptrs,

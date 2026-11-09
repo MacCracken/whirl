@@ -13,6 +13,7 @@ include "src/crawl.cyr"
 
 # === URL ===
 
+# http:// with no port or path: scheme, default port 80, host, default path "/".
 fn test_url_basic() {
     test_group("url-basic");
     var u = url_new();
@@ -23,6 +24,7 @@ fn test_url_basic() {
     assert_eq(streq(url_path(u), "/"), 1, "default path /");
 }
 
+# https:// with an explicit port and a path whose ?query is kept verbatim.
 fn test_url_https_port_path() {
     test_group("url-https");
     var u = url_new();
@@ -33,6 +35,7 @@ fn test_url_https_port_path() {
     assert_eq(streq(url_path(u), "/x/y?z=1"), 1, "path with query preserved");
 }
 
+# https:// with no port takes the default 443.
 fn test_url_https_default_port() {
     test_group("url-https-default");
     var u = url_new();
@@ -41,6 +44,7 @@ fn test_url_https_default_port() {
     assert_eq(streq(url_path(u), "/"), 1, "path /");
 }
 
+# url_parse refuses a non-http(s) scheme, an empty host, a port > 65535 and no scheme.
 fn test_url_rejects() {
     test_group("url-reject");
     var u = url_new();
@@ -50,8 +54,7 @@ fn test_url_rejects() {
     assert_eq(url_parse("notaurl", u),         URL_PARSE_FAIL, "reject missing scheme");
 }
 
-# === HTTP ===
-
+# -O's filename: the last path segment minus ?query, or index.html for a directory.
 fn test_url_filename() {
     test_group("url-filename");
     assert_eq(streq(url_filename("/a/b/file.html"), "file.html"), 1, "last path segment");
@@ -61,6 +64,9 @@ fn test_url_filename() {
     assert_eq(streq(url_filename("/just"), "just"), 1, "single segment");
 }
 
+# === HTTP ===
+
+# A GET request has the right request line and ends at its CRLFCRLF.
 fn test_http_build() {
     test_group("http-build");
     var buf = alloc(256);
@@ -69,6 +75,7 @@ fn test_http_build() {
     assert_eq(http_body_offset(buf, n), n, "request ends with CRLFCRLF");
 }
 
+# The status code is read off HTTP/1.0 and HTTP/1.1 status lines.
 fn test_http_status() {
     test_group("http-status");
     var r1 = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
@@ -79,6 +86,7 @@ fn test_http_status() {
     assert_eq(http_status_code(r3, strlen(r3)), 301, "status 301");
 }
 
+# Content-Length, the body offset, and a header looked up by name case-insensitively.
 fn test_http_headers() {
     test_group("http-headers");
     var r = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 11\r\n\r\nhello world";
@@ -91,6 +99,7 @@ fn test_http_headers() {
     assert_eq(http_content_length(r2, strlen(r2)), 0 - 1, "no content-length -> -1");
 }
 
+# A chunked body is detected and decoded to its payload bytes.
 fn test_http_chunked() {
     test_group("http-chunked");
     var r = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
@@ -104,6 +113,7 @@ fn test_http_chunked() {
     assert_eq(load8(out + 6), 119, "out[6] = w");
 }
 
+# A POST carries its body, a matching Content-Length and the default form Content-Type.
 fn test_http_request_post() {
     test_group("http-request-post");
     var buf = alloc(512);
@@ -117,6 +127,7 @@ fn test_http_request_post() {
     assert_eq(_http_match_ci(buf, ctv, n, "application/x-www-form-urlencoded"), 1, "default content-type");
 }
 
+# -H headers are emitted, and a caller's Content-Type replaces the default.
 fn test_http_custom_headers() {
     test_group("http-headers-custom");
     var buf = alloc(512);
@@ -130,6 +141,7 @@ fn test_http_custom_headers() {
     assert_eq(_http_match_ci(buf, ctv, n, "application/json"), 1, "caller Content-Type wins over default");
 }
 
+# links_extract finds href/src in double, single and no quotes, and skips `mysrc=`.
 fn test_links() {
     test_group("links");
     var html = "<a href=\"/a.html\">x</a> <img src='img/p.png'> <a href=http://x.org/y>z</a> mysrc=skipme";
@@ -141,6 +153,7 @@ fn test_links() {
     assert_eq(streq(load64(out + 16), "http://x.org/y"), 1, "href unquoted");
 }
 
+# links_path_normalize resolves `.` and `..`, collapses `//`, and keeps a trailing slash.
 fn test_path_normalize() {
     test_group("path-normalize");
     assert_eq(streq(links_path_normalize("/a/b/../c"), "/a/c"), 1, "../ pops a segment");
@@ -218,14 +231,18 @@ fn test_authority() {
     assert_eq(streq(_authority("example.com", 0, 443), "example.com:443"), 1, "443 kept on http");
 }
 
+# A redirect Location resolves against the request URL and keeps a non-default port.
 fn test_abs_location() {
     test_group("abs-location");
     # Absolute passes through.
-    assert_eq(streq(_abs_location("http://other.test/x", 0, "a.test", 80, "/p"), "http://other.test/x"), 1, "absolute unchanged");
+    assert_eq(streq(_abs_location("http://other.test/x", 0, "a.test", 80, "/p"), "http://other.test/x"), 1,
+        "absolute unchanged");
     # Root-relative and relative resolve against the base, KEEPING the port.
     assert_eq(streq(_abs_location("/docs/", 0, "a.test", 80, "/p"), "http://a.test/docs/"), 1, "root-relative");
-    assert_eq(streq(_abs_location("/docs/", 0, "a.test", 8080, "/p"), "http://a.test:8080/docs/"), 1, "root-relative keeps port");
-    assert_eq(streq(_abs_location("b.html", 0, "a.test", 8080, "/d/a.html"), "http://a.test:8080/d/b.html"), 1, "relative keeps port");
+    assert_eq(streq(_abs_location("/docs/", 0, "a.test", 8080, "/p"), "http://a.test:8080/docs/"), 1,
+        "root-relative keeps port");
+    assert_eq(streq(_abs_location("b.html", 0, "a.test", 8080, "/d/a.html"), "http://a.test:8080/d/b.html"), 1,
+        "relative keeps port");
     assert_eq(streq(_abs_location("/x", 1, "a.test", 8443, "/p"), "https://a.test:8443/x"), 1, "https keeps port");
     # Protocol-relative inherits the scheme.
     assert_eq(streq(_abs_location("//h.test/x", 1, "a.test", 443, "/p"), "https://h.test/x"), 1, "protocol-relative");
@@ -251,17 +268,22 @@ fn test_same_origin() {
     assert_eq(_same_origin(1, "a.test", 443, v), 0, "https port mismatch");
 }
 
+# Crawl links resolve with the page's port kept; fragments and mailto: are skipped.
 fn test_resolve_link_port() {
     test_group("resolve-link-port");
-    assert_eq(streq(_resolve_link("/a.html", 0, "h.test", 8080, "/i.html"), "http://h.test:8080/a.html"), 1, "root-relative keeps port");
-    assert_eq(streq(_resolve_link("a.html", 0, "h.test", 8080, "/d/i.html"), "http://h.test:8080/d/a.html"), 1, "relative keeps port");
-    assert_eq(streq(_resolve_link("/a.html", 0, "h.test", 80, "/i.html"), "http://h.test/a.html"), 1, "default port omitted");
+    assert_eq(streq(_resolve_link("/a.html", 0, "h.test", 8080, "/i.html"), "http://h.test:8080/a.html"), 1,
+        "root-relative keeps port");
+    assert_eq(streq(_resolve_link("a.html", 0, "h.test", 8080, "/d/i.html"), "http://h.test:8080/d/a.html"), 1,
+        "relative keeps port");
+    assert_eq(streq(_resolve_link("/a.html", 0, "h.test", 80, "/i.html"), "http://h.test/a.html"), 1,
+        "default port omitted");
     assert_eq(_resolve_link("#frag", 0, "h.test", 80, "/i.html"), 0, "fragment skipped");
     assert_eq(_resolve_link("mailto:a@b.c", 0, "h.test", 80, "/i.html"), 0, "mailto skipped");
 }
 
 # === shared helpers (0.6.8: src/util.cyr) ===
 
+# src/util.cyr's prefix, case-insensitive compare, dup and concat helpers.
 fn test_util_helpers() {
     test_group("util");
     assert_eq(util_has_prefix("http://x", "http://"), 1, "prefix match");
@@ -335,6 +357,7 @@ fn test_response_complete() {
     assert_eq(http_response_complete(hd, strlen(hd)), 0, "same bytes incomplete for GET");
 }
 
+# Run every group; the exit status is assert_summary()'s failure count.
 fn main() {
     alloc_init();
     test_links();

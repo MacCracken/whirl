@@ -21,7 +21,7 @@
 
 Own the **HTTP/HTTPS transfer surface** in the AGNOS network-tools family: fetch a URL (GET → stdout or file), follow redirects, POST (`-d`), arbitrary methods (`-X`), recursive fetch (`-r`, the wget side) — one tool, combined curl+wget feature set, smart defaults. Cyrius-native, **no POSIX `socket()` on the AGNOS backend** — consumes the kernel's sovereign `sock_*` (#47-50) + `getrandom` (#45) + UDP-53 (#51-54) primitives and `tls_native` for HTTPS, per the kernel-grows-for-native-workloads rule.
 
-**Strategic position — third `taar` consumer.** After `yo` (ICMP) and `dig` (DNS), whirl is the consumer that adds `taar`'s `tcp` / `tls` / `http` modules. whirl pins taar **0.6.0** (ipv4 + socket + dns); whirl drove its socket/dns growth, and its `tls` / `http` modules remain unwritten.
+**Strategic position — third `taar` consumer.** After `yo` (ICMP) and `dig` (DNS), whirl is the consumer that adds `taar`'s `tcp` / `tls` / `http` modules. whirl pins taar **0.6.2** (ipv4 + socket + dns); whirl drove its socket/dns growth, and its `tls` / `http` modules remain unwritten.
 
 ## Conventions
 
