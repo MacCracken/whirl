@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "whirl — curl + wget unified: HTTP / HTTPS transfer in one verb (sovereign Cyrius)"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.6.2"
+cyrius = "6.6.20"
 
 [build]
 entry = "src/main.cyr"
@@ -16,20 +16,28 @@ output = "whirl"
 # below — sovereign raw-syscall, no stdlib net. HTTPS opts in to the crypto/TLS
 # libs (vendored via `cyrius lib sync`): tls_native is transport-agnostic, wired
 # over taar's socket. ct/keccak/random/bayan are sigil's crypto deps.
-# `dynlib`+`fdlopen` back the `tls` facade's libssl.so.3 bridge — since cyrius
-# v5.6.37 tls.cyr's `fdlopen_*` refs resolve from the explicit include list (no
-# longer auto-pulled), so the Linux build needs them named or it fails
-# reachable-undef. Still true at 6.5.35 (dropping them fails the build with 4
-# reachable undefined fns). On --agnos they compile (the Linux path is
-# `#ifndef CYRIUS_TARGET_AGNOS`-gated) and stay unreachable (the agnos TLS path
-# calls tls_native directly) → DCE'd.
+# `dynlib`+`fdlopen` back the `tls` facade's libssl.so.3 bridge. From v5.6.37
+# to 6.6.8 they HAD to be named here or the Linux build failed reachable-undef.
+# Since 6.6.9 tls.cyr includes lib/fdlopen.cyr itself (which includes dynlib),
+# so at 6.6.20 these two entries are redundant: dropping them still builds
+# (same size, different include order → not byte-identical). Kept in a
+# toolchain-only release so the image layout doesn't churn. On --agnos they
+# compile (the Linux path is `#ifndef CYRIUS_TARGET_AGNOS`-gated) and stay
+# unreachable (the agnos TLS path calls tls_native directly) → DCE'd.
 stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags", "chrono", "ct", "keccak", "random", "bayan", "sigil", "dynlib", "fdlopen", "tls_native", "tls"]
 
 # Network-probe substrate — whirl is the third consumer (after yo + dig). taar's
 # socket (taar_tcp_*) + dns (taar_resolve_ipv4) modules back whirl's transport;
 # unlike yo's, whirl's half is live on both targets, not DCE'd.
-# `path` drives local dev; `git`+`tag` is the published fallback — keep the tag
-# current or CI (which has no ../taar) silently builds an older substrate.
+# `path = "../taar"` is commented out (0.6.15). It wins over `tag` whenever the
+# sibling checkout exists, so local builds vendored the sibling's WORKING TREE:
+# 0.6.14's lock recorded taar 0.5.1 while this file said 0.5.0 (CI built
+# 0.5.0), and today it would pull 0.6.2, pinned to cyrius 6.7.18. With it off,
+# the local build resolves the same `git`+`tag` CI does. Uncomment it only for
+# deliberate co-development against an unreleased taar.
+# 0.5.2 is the last taar tag pinned to cyrius 6.6.20 (toolchain-only release;
+# its bundle now opens with a `# Requires` block and `dist/taar.deps` lists only
+# `syscalls`+`fmt`, both of which whirl declares above).
 # socket+dns shipped at 0.2.0; the AGNOS sovereign backend landed at 0.3.0.
 # 0.5.0 is the current floor: fail-closed DNS query-ID entropy (0.3.1 ignored
 # the /dev/urandom read result), RFC 5452 reply acceptance, TC→TCP-53 fallback
@@ -38,8 +46,8 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # rather than 0 on deadline expiry — whirl's `n <= 0` read loops already absorb it.
 [deps.taar]
 git = "https://github.com/MacCracken/taar.git"
-path = "../taar"
-tag = "0.5.0"
+# path = "../taar"
+tag = "0.5.2"
 modules = ["dist/taar.cyr"]
 
 # --- HTTPS deps land with the TLS bite ---

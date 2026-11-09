@@ -5,6 +5,86 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-11-09
+
+**Maintenance: toolchain `6.6.2` → `6.6.20`, taar moved to its 6.6.20-pinned tag, and the local
+build stops compiling a different taar than CI.** No source change beyond the version string.
+
+### Changed
+
+- **Toolchain pin `6.6.2` → `6.6.20`.** CI reads it from `cyrius.cyml`, so no workflow edit.
+  This also covers the roadmap's "move to 6.6.6" item, since 6.6.20 includes 6.6.6.
+- **`[deps.taar]` `0.5.0` → `0.5.2`.** 0.5.2 is the last taar tag pinned to 6.6.20 (0.6.x is
+  6.7.x-pinned). It is a toolchain-only release with no behaviour change. Two shape changes
+  reach whirl. The bundle now opens with a compile-verified `# Requires` block, and
+  `dist/taar.deps` lists only `syscalls` and `fmt`. whirl declares both itself, so nothing
+  changes here. `lib/taar.cyr` is byte-identical to taar@0.5.2's `dist/taar.cyr`.
+- **`path = "../taar"` is commented out.** `path` wins over `tag` whenever the sibling checkout
+  exists, so local builds vendored the sibling's *working tree*. The 0.6.14 lock recorded taar
+  **0.5.1** while the manifest said 0.5.0 and CI, which has no sibling, built 0.5.0. Today the
+  override would pull taar 0.6.2, pinned to 6.7.18. With it off, the local build resolves the
+  same `git`+`tag` CI does. dig made the same change at its 0.4.2.
+- **`lib/` re-vendored from the 6.6.20 snapshot.** It was cleared and re-synced rather than
+  overlaid, so no 6.6.2 file lingers. Every stdlib file is byte-identical to
+  `~/.cyrius/versions/6.6.20/lib`. Transitively, `alloc_cx`, `poison`, `sys` and `tls_hostid`
+  came in and `fs` / `fs_win` dropped out. 56 of the 61 carried-over rows changed hash.
+  `cyrius.lock` went from 63 to 65 rows and is now commit-pinned (taar 0.5.2 = `74cb83c`,
+  checked against the tag) with the `cyrius 6.6.20` trailer. The 0.6.14 lock had neither.
+  `cyrius deps --verify` passes all 65 rows.
+- **The `dynlib` + `fdlopen` comment in `cyrius.cyml` was stale.** It said both had to be named
+  or the Linux build failed. Since cyrius 6.6.9, `tls.cyr` includes `fdlopen.cyr` itself, which
+  includes `dynlib`. Dropping them now still builds, at the same size, but the include order
+  changes and the binary is not byte-identical. They stay listed for this toolchain-only
+  release, and the comment now says why.
+
+### Verified
+
+Baseline: 0.6.14 built CI-style (tracked tree only, no `lib/`, no siblings) at its declared
+taar 0.5.0.
+
+- `cyrius test`: **139/139** assertions. `tests/behavior.py`: **26/26** standalone and 26/26
+  against the 0.6.14 baseline. The 15 controls are skipped there, because the baseline already
+  has every fix they reproduce. CI's lint gate over `src/*.cyr` is clean.
+- **Builds:** x86_64, `--agnos` and `--aarch64` all build. The only new diagnostic is the sigil
+  warning under *Not changed*. The agnos image differs from the host one, so the `#ifdef` arm
+  is selected. `tests/agnos_probe.cyr` builds for both targets.
+  Its host build reports **0 failures** when run in a writable root (`unshare -r chroot`),
+  including all six resume-append checks. The same 0 holds on 0.6.14. Run from a normal cwd it
+  fails `resume-setup` on both versions, because the probe writes to `/`, the agnos image root.
+- **Live:** `http://example.com` and `https://example.com` return the complete page,
+  sha-identical to 0.6.14. `-L https://github.com` completes (525 KB).
+- **TLS fail-closed:** a local `openssl s_server` with a self-signed cert on 127.0.0.1 is
+  rejected with exit 9 by both 0.6.14 and 0.6.15. The server consumed one accept per client,
+  so each one connected and refused at the TLS layer. It was not an unreachable-host false
+  pass. Positive control: `https://example.com` returns exit 0.
+- **`-C` resume, end to end on Linux** (roadmap verify step 2). A Range-honouring local server
+  was given a 123,457-byte partial of a 300,000-byte file. whirl sent `Range: bytes=123457-`,
+  took the 206, and the result is byte-identical to the source. `-C` on an already-complete
+  file gets 416, reports `already complete`, and leaves the file intact. 0.6.14 behaves
+  identically.
+
+### Binary size: +82 KB on both targets
+
+| | 0.6.14 @ 6.6.2 | 0.6.15 @ 6.6.20 |
+|---|---|---|
+| host `CYRIUS_DCE=1` | 843,408 B | 925,880 B (+82,472) |
+| `--agnos` `CYRIUS_DCE=1` | 828,096 B | 910,864 B (+82,768) |
+| unreachable fns (host) | 2,445 (856,408 B NOPed) | 2,722 (961,898 B NOPed) |
+| static data (host) | 374,784 B | 376,560 B |
+
+The toolchain has no size map, so the growth is measured but not attributed. It survives DCE
+and appears on the agnos image too, so it is not only the Linux-only libssl bridge.
+
+### Not changed
+
+- **New build warning, benign:** `lib/sigil.cyr:28046: array local over the per-fn frame budget
+  gets STATIC storage`. The buffer was static on 6.6.2 as well, because sigil banks it per
+  thread on purpose. cyrius 6.6.5 only promoted the existing `note:` to a `warning` and scoped
+  the name. sigil fixed it upstream in 3.13.12 (cyrius 6.7.10), which is past this pin.
+- `cyrius audit` reports **7 lint warnings** and **55 undocumented public fns** on both pins.
+  The bump did not add them. Both runs exit 1 at the bench step, because the repo ships no
+  benchmarks. CI does not run `audit`.
+
 ## [0.6.14] - 2026-09-11
 
 ### Changed
