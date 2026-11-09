@@ -43,7 +43,7 @@ Full detail in [`state.md`](state.md) § *Open defects*.
 A standing v1.0 criterion: whirl vendors no network primitives locally, and is
 the consumer that grows taar's remaining modules. `tcp` shipped at taar 0.2.0 and
 whirl runs on it; `tls` and `http` are **still unwritten** (verified: zero
-`taar_tls_*` / `taar_http_*` symbols at taar 0.5.2).
+`taar_tls_*` / `taar_http_*` symbols at taar 0.6.0).
 
 - [ ] **C1 — Decide the split.** whirl's HTTP framing (`src/http.cyr`) and TLS
       composition (`src/transport.cyr`) are the candidate donors. Worth settling
@@ -236,7 +236,7 @@ there are zero `flags_*` calls outside `lib/`.
   `_cli_atoi`. Making them strict is a separate change.
 - [ ] URL → `cmdit_require_positionals_exact(h, 1)`. Map both the missing and the too-many case to today's usage
   line, exit 2.
-- [ ] `CMDIT_VERSION` → `cmdit_version(h, WHIRL_VERSION)`, which prints `whirl 0.6.15` on stdout. This is new
+- [ ] `CMDIT_VERSION` → `cmdit_version(h, WHIRL_VERSION)`, which prints `whirl 0.7.0` on stdout. This is new
   surface with no clash (curl's `-V` is also `--version`). Add its row to `_print_help`.
 - [ ] Keep `_print_help` hand-written. `cmdit_help_flags` writes `-X <str>\t…` rows to **stderr** and cannot carry
   whirl's metavars or wrapped lines. Generated help would be a separate, deliberate output change.
@@ -247,13 +247,15 @@ URL; `-LO` is `CMDIT_ERR_BUNDLED`; and `-h` no longer short-circuits, so `whirl 
 0/1/2 (see D3).
 
 **`cyrius.cyml`:** drop the unused `"flags"`. Keep `"args"` (`src/main.cyr:420-423`) and `"io"`. Add the block
-below. `1.2.6` is the last cmdit tag pinned to cyrius 6.6.20, whirl's pin since 0.6.15, and it has the same API.
-`1.3.0` is now tagged, but it is pinned to 6.7.9, so it would wait for whirl's next pin move.
+below. At whirl's 6.7.9 pin (since 0.7.0) the matching tag is `1.4.0`, the last cmdit tag pinned to 6.7.9; 1.4.1 and
+later are pinned to 6.7.18. This note was read against 1.2.6, so re-check the calls it names against 1.4.0 first. dig's
+0.5.0 records two user-visible changes that came in with 1.3.x: `--help=x` is now a usage error, and unknown-flag errors
+now name the token.
 
 ```
 [deps.cmdit]
 git = "https://github.com/MacCracken/cmdit.git"
-tag = "1.2.6"
+tag = "1.4.0"
 modules = ["dist/cmdit.cyr"]
 ```
 

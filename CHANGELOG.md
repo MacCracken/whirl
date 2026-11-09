@@ -5,6 +5,103 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
+**Toolchain `6.6.20` → `6.7.9` (the 6.7 language minor) and taar `0.5.2` → `0.6.0`, the last
+taar tag pinned to 6.7.9.** whirl's own source is unchanged apart from the version string, and
+there is no behaviour change. The aarch64 build is executed for the first time, under
+qemu-user.
+
+### Changed
+
+- **Toolchain pin `6.6.20` → `6.7.9`.** CI reads it from `cyrius.cyml`, so no workflow edit.
+  CI already uses `cyrius test`, not the `cyrius tests` alias that 6.7.12 removes, and it runs
+  no bare `bench` / `fuzz` / `smoke`, which exit 1 when empty from 6.7.9. whirl's `src/` and
+  `tests/` were scanned for every 6.7.x migration hazard, with strings and comments stripped
+  first. The scanner was checked against a planted sample containing each pattern. There were
+  **zero hits**:
+  - no lone `!` (before 6.7.3 the lexer dropped it, so `!x` meant `x`);
+  - no unary `-` / `~` on an operand followed by an operator. 6.7.9 fixed a fold that made
+    `-K + 10` read as 15 on 6.6.10–6.7.8, a range that includes 0.6.15's 6.6.20. **0.6.15's
+    arithmetic was not affected;**
+  - no identifier that 6.7.x reserved (`trait`, `const`, `true`, `false`, `do`, `dyn`,
+    `impl`, `bool`);
+  - none of the other constructs the 6.7.0–6.7.9 migration notes change: no structs, typed
+    pointers, `impl`, `async fn`, `fncall*`, exec-family calls, or writes to the stdlib's
+    now-inert bound vars (`TLS_CA_MAX_ROOTS`, `TLOCAL_MAX_SLOTS`, …).
+- **`[deps.taar]` `0.5.2` → `0.6.0`.** Toolchain only. The bundle differs from 0.5.2 in its
+  version line alone, and `lib/taar.cyr` is byte-identical to taar@0.6.0's `dist/taar.cyr`.
+- **`path = "../taar"` restored.** From cyrius 6.7.6, `path` beside `git` / `tag` is a dev
+  override, read only in local mode (`CYRIUS_LOCAL=1` or `--local`). A default resolve builds
+  the tag and prints `hint: 1 dep has a local checkout not in use (taar)`. That removes the
+  reason 0.6.15 commented the line out. Local mode was checked. It reports
+  `local: taar <- ../taar @d203629, 2 commits past 0.6.0 — CI builds 0.6.0` and resolves into
+  `build/local-deps/`. `lib/` and `cyrius.lock` stayed byte-identical. dig made the same move
+  at its 0.5.0.
+- **`lib/` re-vendored from the 6.7.9 snapshot.** It was cleared and re-synced. All 64 stdlib
+  files are byte-identical to `~/.cyrius/versions/6.7.9/lib`, and the file set is unchanged
+  from 0.6.15. 43 files changed content, taar included. `cyrius deps --verify` passes 65/65,
+  and `cyrius deps --locked` reports "lib/ and cyrius.lock are exactly what the tags resolve".
+  The lock commit-pins taar 0.6.0 = `2c02641`, checked against the tag. It keeps the 0.5.2
+  line too. That is by design since 6.6.20: a re-pointed old tag fails closed.
+- `cyrius.cyml` comments rewritten to match: the taar `path` paragraph, and the
+  `dynlib` / `fdlopen` note, re-checked at 6.7.9 (still redundant, still builds without them at
+  the same size).
+
+### Verified
+
+Baseline: 0.6.15 built CI-style at 6.6.20.
+
+- `cyrius test`: **139/139** on x86_64. `tests/behavior.py`: **26/26** standalone and 26/26
+  against the 0.6.15 baseline, with the 15 controls skipped because the baseline already has
+  those fixes. CI's lint gate over `src/*.cyr` is clean.
+- **Builds:** x86_64, `--agnos` and `--aarch64` all build. The agnos image differs from the
+  host one, so the `#ifdef` arm is selected. The only warning is the sigil one under *Not
+  changed*. `tests/agnos_probe.cyr` builds for both targets. Its host build reports
+  **0 failures** in a writable root.
+- **aarch64, executed for the first time** (qemu-user on an x86_64 host; the binary does not
+  run natively here). The unit suite passes **139/139**. `behavior.py` passes **26/26**
+  through a `qemu-aarch64` wrapper, including check [13], whose two assertions exercise
+  `O_NOFOLLOW`. Negative control: the same build with the x86_64 value (131072, which is
+  `O_LARGEFILE` on aarch64) planted in the aarch64 arm fails exactly those two assertions,
+  24/26. So the suite detects a wrong value, and the shipped 32768 is right. qemu-user maps
+  open flags by their aarch64 meaning, which is what makes this a real test of the constant.
+  A live `-I http://example.com` and a `-C` resume also run correctly under qemu. This is
+  emulation on an x86_64 kernel, not aarch64 hardware.
+- **Live:** `http://example.com` and `https://example.com` return the complete page,
+  sha-identical to 0.6.15. `-L https://github.com` completes (525 KB).
+- **TLS fail-closed:** a local self-signed `openssl s_server` on 127.0.0.1 is rejected with
+  exit 9 by 0.6.15 and 0.7.0. The server consumed every accept, so each client connected and
+  refused at the TLS layer. The `https://example.com` positive control returns exit 0.
+- **`-C` resume, end to end** against a local Range server, on 0.6.15, 0.7.0 and the aarch64
+  build. Each sent `Range: bytes=123457-` and the reassembled file is byte-identical to the
+  source. `-C` on an already-complete file gets 416, reports `already complete`, and leaves
+  the file intact.
+- A CI-faithful run (tracked tree only, no `lib/`, no siblings) wrote an identical lock and
+  sha256-identical host and agnos binaries.
+
+### Binary size: −2.3 KB on every target
+
+| | 0.6.15 @ 6.6.20 | 0.7.0 @ 6.7.9 |
+|---|---|---|
+| host `CYRIUS_DCE=1` | 925,880 B | 923,576 B (−2,304) |
+| `--agnos` `CYRIUS_DCE=1` | 910,864 B | 908,568 B (−2,296) |
+| `--aarch64` (no compaction) | 2,252,784 B | 2,250,464 B (−2,320) |
+| unreachable fns (host) | 2,722 | 2,725 |
+| static data (host) | 376,560 B | 374,256 B |
+
+On host the whole drop is static data: 376,560 → 374,256 B is the same −2,304 B.
+
+### Not changed
+
+- The **sigil frame-budget warning** remains (`lib/sigil.cyr:28103` at this snapshot). It is
+  benign, as at 0.6.15. The sigil fix (3.13.12) ships in cyrius **6.7.10**, one release past
+  this pin.
+- `cyrius audit` reports **7 lint warnings** and **55 undocumented public fns**, the same as
+  0.6.14 and 0.6.15. Its bench stage is now a non-fatal `skip:`, but `audit` still exits 1, as
+  it did on both earlier pins. CI does not run `audit`.
+- `dynlib` / `fdlopen` stay listed in `[deps].stdlib` (see 0.6.15).
+
 ## [0.6.15] - 2026-11-09
 
 **Maintenance: toolchain `6.6.2` → `6.6.20`, taar moved to its 6.6.20-pinned tag, and the local
