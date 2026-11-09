@@ -5,8 +5,8 @@
 # the 0.6.6 security fixes live (path confinement, origin comparison, absolute
 # URL resolution), and while it sat inside main.cyr the only way to exercise it
 # was end-to-end through a real binary and a real server. The I/O halves —
-# _save_tree's mkdir/write, _robots_load's fetch, _crawl itself — stay in
-# main.cyr.
+# the mirror's mkdir/write, the robots.txt fetch, the crawl loop itself — live in
+# mirror.cyr (0.7.2; main.cyr before that).
 #
 # Depends on links.cyr (links_path_normalize); include it first.
 
@@ -35,18 +35,26 @@ fn _path_dir(path): i64 {
     return d;
 }
 
-# 1 if `len` bytes of `path` are safe to mirror under cwd — i.e. no ".."
-# segment. A crawled page controls these bytes, and _save_tree turns them into a
-# filesystem path, so an unchecked "/../../../../home/user/.bashrc" (which
-# _resolve_link passes through verbatim for absolute same-host links) is a
-# remote arbitrary-file-write. Checked here, at the single point that touches
-# the filesystem, rather than trusting any particular caller to normalize.
-fn _path_no_dotdot(path, len): i64 {
+# `path` up to (not including) any '?' — the page a "?query" link is relative to.
+fn _path_noquery(path): i64 {
+    var n = 0;
+    while ((load8(path + n) != 0) && (load8(path + n) != 63)) { n = n + 1; }
+    return util_dup_range(path, n);
+}
+
+# 1 if `len` bytes of `path` are safe to mirror: no segment begins with '.'. That
+# refuses ".." (escape the mirror directory) and "." as before, and since 0.7.2
+# every HIDDEN name too: ".git", ".ssh", ".bashrc", ".htaccess". A crawled page
+# controls these bytes and _mirror_save turns them into a filesystem path, so
+# `<a href="/.git/config">` planted a git config (core.fsmonitor runs a command)
+# and `.ssh/authorized_keys` a login key. Checked at the one point that touches
+# the filesystem, rather than trusting any caller to normalize.
+fn _path_segments_safe(path, len): i64 {
     var i = 0;
     while (i < len) {
         var seg = i;
         while ((i < len) && (load8(path + i) != 47)) { i = i + 1; }
-        if (((i - seg) == 2) && (load8(path + seg) == 46) && (load8(path + seg + 1) == 46)) { return 0; }
+        if (((i - seg) > 0) && (load8(path + seg) == 46)) { return 0; }   # '.'
         i = i + 1;
     }
     return 1;
@@ -73,13 +81,13 @@ fn _authority(host, is_https, port): i64 {
 }
 
 # Resolve a raw link against the base → full URL cstr, or 0 to skip (fragment /
-# non-http scheme). Absolute links pass through (host filtered in _crawl).
+# non-http scheme). Absolute links pass through (origin filtered in mirror_crawl).
 fn _resolve_link(link, base_https, base_host, base_port, base_path): i64 {
     var c0 = load8(link);
     if (c0 == 0) { return 0; }
     if (c0 == 35) { return 0; }                      # '#'
-    if (util_has_prefix(link, "http://") == 1) { return link; }
-    if (util_has_prefix(link, "https://") == 1) { return link; }
+    if (util_has_prefix_ci(link, "http://") == 1) { return link; }
+    if (util_has_prefix_ci(link, "https://") == 1) { return link; }
     if (_has_scheme_colon(link) == 1) { return 0; }  # mailto:/javascript:/...
     if ((c0 == 47) && (load8(link + 1) == 47)) {     # protocol-relative //host/path
         var sch = "http:";
@@ -95,6 +103,9 @@ fn _resolve_link(link, base_https, base_host, base_port, base_path): i64 {
     if (c0 == 47) {                                                      # root-relative
         return util_concat2(util_concat2(pfx, auth), links_path_normalize(link));
     }
+    if (c0 == 63) {                                     # "?q": the page itself, new query
+        return util_concat2(util_concat2(pfx, auth), util_concat2(_path_noquery(base_path), link));
+    }
     var dir = _path_dir(base_path);                                      # relative
     var np = links_path_normalize(util_concat2(dir, link));
     return util_concat2(util_concat2(pfx, auth), np);
@@ -104,11 +115,11 @@ fn _resolve_link(link, base_https, base_host, base_port, base_path): i64 {
 # RFC 9110 permits a relative Location and real sites use one (a bare "/docs/"
 # is common); whirl previously handed it straight to url_parse, which rejects
 # anything without a scheme — so -L silently stopped following and exited 0 with
-# the redirect stub as the "result". Mirrors _resolve_link's shape, but keeps
-# the port, which _resolve_link drops.
+# the redirect stub as the "result". Same shape as _resolve_link, and like it
+# keeps a non-default port (_authority).
 fn _abs_location(loc, is_https, host, port, path): i64 {
-    if (util_has_prefix(loc, "http://") == 1) { return loc; }
-    if (util_has_prefix(loc, "https://") == 1) { return loc; }
+    if (util_has_prefix_ci(loc, "http://") == 1) { return loc; }
+    if (util_has_prefix_ci(loc, "https://") == 1) { return loc; }
     var sch = "http:";
     if (is_https == 1) { sch = "https:"; }
     if ((load8(loc) == 47) && (load8(loc + 1) == 47)) { return util_concat2(sch, loc); }   # //host/path
@@ -117,6 +128,7 @@ fn _abs_location(loc, is_https, host, port, path): i64 {
     if (is_https == 1) { pfx = "https://"; }
     var base = util_concat2(pfx, _authority(host, is_https, port));
     if (load8(loc) == 47) { return util_concat2(base, links_path_normalize(loc)); }        # root-relative
+    if (load8(loc) == 63) { return util_concat2(base, util_concat2(_path_noquery(path), loc)); }   # "?q"
     return util_concat2(base, links_path_normalize(util_concat2(_path_dir(path), loc)));       # relative
 }
 
@@ -127,6 +139,7 @@ fn _same_origin(is_https, host, port, u2): i64 {
     return 1;
 }
 
+# 1 if `url` is one of the first `nvis` entries of `visited`.
 fn _seen(visited, nvis, url): i64 {
     var i = 0;
     while (i < nvis) {
@@ -136,106 +149,181 @@ fn _seen(visited, nvis, url): i64 {
     return 0;
 }
 
-fn _robots_ci(body, p, e, lit): i64 {
-    var k = 0;
-    while (load8(lit + k) != 0) {
-        if (p + k >= e) { return 0; }
-        var c = load8(body + p + k);
-        if ((c >= 65) && (c <= 90)) { c = c + 32; }
-        if (c != load8(lit + k)) { return 0; }
-        k = k + 1;
-    }
-    return 1;
+# --- robots.txt (RFC 9309) ---
+#
+# Rules are stored as pattern cstrs in `rules[]` with bits in `flags[]`:
+#   ROBOTS_ALLOW  an Allow rule (else Disallow)
+#   _ROBOTS_ME    from a group naming whirl's product token, "whirl"
+#   _ROBOTS_STAR  from a group naming "*"
+# After the parse only one kind is kept: the "whirl" groups if any exist, else
+# the "*" groups (RFC 9309 §2.2.1). 0.7.2 rewrote the parser, which failed open in
+# four ways. A `User-agent:` line reset group membership, so in
+# "User-agent: *" / "User-agent: other" / "Disallow: /" the rule was dropped.
+# Only spaces were trimmed, so a tab, trailing whitespace or a `# comment` made a
+# rule match nothing. `*` and `$` were literal characters. And rules past the
+# cap vanished silently (robots_dropped() now counts them).
+var ROBOTS_ALLOW = 1;
+var _ROBOTS_ME   = 2;
+var _ROBOTS_STAR = 4;
+var _robots_dropped = 0;
+# Rules the last _robots_parse could not store (the array was full).
+fn robots_dropped(): i64 { return _robots_dropped; }
+
+fn _robots_ws(c): i64 {
+    if ((c == 32) || (c == 9)) { return 1; }
+    return 0;
 }
 
-fn _robots_value(body, start, e): i64 {
-    var p = start;
-    while ((p < e) && (load8(body + p) == 32)) { p = p + 1; }
+# body[p..e) with any `# comment` cut and whitespace trimmed both ends: returns
+# the start, and the end in _robots_vend.
+var _robots_vend = 0;
+fn _robots_trim(body, p, e): i64 {
+    var k = p;
+    while ((k < e) && (load8(body + k) != 35)) { k = k + 1; }   # cut at '#'
+    e = k;
+    while ((p < e) && (_robots_ws(load8(body + p)) == 1)) { p = p + 1; }
+    while ((e > p) && (_robots_ws(load8(body + e - 1)) == 1)) { e = e - 1; }
+    _robots_vend = e;
     return p;
 }
 
-# Copy body[v..e) into a fresh cstr; returns it (or 0 if empty).
-fn _robots_dup(body, v, e): i64 {
-    var vlen = e - v;
-    if (vlen <= 0) { return 0; }
-    var d = xalloc(vlen + 1);
-    var k = 0;
-    while (k < vlen) { store8(d + k, load8(body + v + k)); k = k + 1; }
-    store8(d + vlen, 0);
-    return d;
-}
-
-# Parse robots body → path-prefix rules for `User-agent: *`. `rules[i]` holds the
-# prefix cstr; `flags[i]` = 1 for Allow, 0 for Disallow. Returns the rule count.
+# Parse a robots.txt body into `rules`/`flags` (capacity `rulesmax`). Returns the
+# number kept for whirl.
 fn _robots_parse(body, len, rules, flags, rulesmax): i64 {
+    _robots_dropped = 0;
     var n = 0;
-    var applies = 0;
+    var in_agents = 0;     # the previous rule-bearing line was a User-agent line
+    var g_me = 0;
+    var g_star = 0;
+    var saw_me = 0;
     var i = 0;
     while (i < len) {
         var s = i;
         while ((i < len) && (load8(body + i) != 10)) { i = i + 1; }
-        var e = i;
-        if ((e > s) && (load8(body + e - 1) == 13)) { e = e - 1; }   # trim \r
-        var p = s;
-        while ((p < e) && (load8(body + p) == 32)) { p = p + 1; }
-        if ((p < e) && (load8(body + p) != 35)) {                    # not '#'
-            if (_robots_ci(body, p, e, "user-agent:") == 1) {
-                var v = _robots_value(body, p + 11, e);
-                applies = 0;
-                if ((v < e) && (load8(body + v) == 42)) { applies = 1; }   # '*'
-            }
-            elif (_robots_ci(body, p, e, "disallow:") == 1) {
-                if ((applies == 1) && (n < rulesmax)) {
-                    var d = _robots_dup(body, _robots_value(body, p + 9, e), e);
-                    if (d != 0) { store64(rules + n * 8, d); store64(flags + n * 8, 0); n = n + 1; }
-                }
-            }
-            elif (_robots_ci(body, p, e, "allow:") == 1) {
-                if ((applies == 1) && (n < rulesmax)) {
-                    var a = _robots_dup(body, _robots_value(body, p + 6, e), e);
-                    if (a != 0) { store64(rules + n * 8, a); store64(flags + n * 8, 1); n = n + 1; }
+        var p = _robots_trim(body, s, i);
+        var e = _robots_vend;
+        if (p < e) {
+            if (util_match_ci(body, p, e, "user-agent:") == 1) {
+                if (in_agents == 0) { g_me = 0; g_star = 0; }   # a new group starts
+                in_agents = 1;
+                var v = _robots_trim(body, p + 11, e);
+                var ve = _robots_vend;
+                if (((ve - v) == 1) && (load8(body + v) == 42)) { g_star = 1; }
+                if (((ve - v) == 5) && (util_match_ci(body, v, ve, "whirl") == 1)) { g_me = 1; saw_me = 1; }
+            } else {
+                var kind = 0 - 1;
+                var vs = 0;
+                if (util_match_ci(body, p, e, "disallow:") == 1) { kind = 0; vs = p + 9; }
+                elif (util_match_ci(body, p, e, "allow:") == 1) { kind = ROBOTS_ALLOW; vs = p + 6; }
+                if (kind >= 0) {
+                    in_agents = 0;
+                    var rv = _robots_trim(body, vs, e);
+                    var rve = _robots_vend;
+                    var who = 0;
+                    if (g_me == 1) { who = who | _ROBOTS_ME; }
+                    if (g_star == 1) { who = who | _ROBOTS_STAR; }
+                    # An empty value is no rule ("Disallow:" alone allows all).
+                    if ((rve > rv) && (who != 0)) {
+                        if (n < rulesmax) {
+                            store64(rules + n * 8, util_dup_range(body + rv, rve - rv));
+                            store64(flags + n * 8, kind | who);
+                            n = n + 1;
+                        } else { _robots_dropped = _robots_dropped + 1; }
+                    }
                 }
             }
         }
         i = i + 1;
     }
-    return n;
+    # Keep only the groups that apply: whirl's own if it has any, else "*".
+    var want = _ROBOTS_STAR;
+    if (saw_me == 1) { want = _ROBOTS_ME; }
+    var k = 0;
+    var j = 0;
+    while (j < n) {
+        var f = load64(flags + j * 8);
+        if ((f & want) != 0) {
+            store64(rules + k * 8, load64(rules + j * 8));
+            store64(flags + k * 8, f & ROBOTS_ALLOW);
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    return k;
 }
 
-# Is `path` blocked? Longest-matching prefix wins (RFC 9309 specificity); a tie
-# resolves to Allow. No match → allowed.
+# Does robots pattern `pat` match `path` (RFC 9309 §2.2.3)? A pattern matches a
+# path PREFIX. `*` matches any run of bytes, and a trailing `$` anchors the end.
+fn _robots_match(path, pat): i64 {
+    var pl = strlen(pat);
+    var anchored = 0;
+    if ((pl > 0) && (load8(pat + pl - 1) == 36)) { anchored = 1; pl = pl - 1; }   # '$'
+    var n = strlen(path);
+    var pi = 0;
+    var si = 0;
+    var star = 0 - 1;
+    var mark = 0;
+    while (1 == 1) {
+        if (pi == pl) {
+            if (anchored == 0) { return 1; }
+            if (si == n) { return 1; }
+        } elif (load8(pat + pi) == 42) {                    # '*'
+            star = pi;
+            mark = si;
+            pi = pi + 1;
+            continue;
+        } elif ((si < n) && (load8(path + si) == load8(pat + pi))) {
+            pi = pi + 1;
+            si = si + 1;
+            continue;
+        }
+        # Mismatch, or an anchored pattern ended early: let the last '*' take one
+        # more byte and retry from there.
+        if (star < 0) { return 0; }
+        if (mark >= n) { return 0; }
+        mark = mark + 1;
+        si = mark;
+        pi = star + 1;
+    }
+    return 0;
+}
+
+# Is `path` blocked? The longest matching pattern wins (RFC 9309 specificity); a
+# tie resolves to Allow. No match → allowed.
 fn _robots_blocked(path, rules, flags, nrules): i64 {
-    var best_len = -1;
+    var best_len = 0 - 1;
     var best_allow = 0;
     var i = 0;
     while (i < nrules) {
         var r = load64(rules + i * 8);
-        if (util_has_prefix(path, r) == 1) {
+        if (_robots_match(path, r) == 1) {
             var rl = strlen(r);
-            if (rl > best_len) { best_len = rl; best_allow = load64(flags + i * 8); }
-            elif (rl == best_len) {
-                if (load64(flags + i * 8) == 1) { best_allow = 1; }   # tie → Allow wins
-            }
+            var al = load64(flags + i * 8) & ROBOTS_ALLOW;
+            if (rl > best_len) { best_len = rl; best_allow = al; }
+            elif ((rl == best_len) && (al == ROBOTS_ALLOW)) { best_allow = al; }   # tie → Allow
         }
         i = i + 1;
     }
     if (best_len < 0) { return 0; }      # nothing matched → allowed
-    if (best_allow == 1) { return 0; }   # most-specific rule is Allow
-    return 1;                            # most-specific rule is Disallow
+    if (best_allow == ROBOTS_ALLOW) { return 0; }
+    return 1;
 }
 
+# --- where a crawled resource is written ---
+
 # Map a URL path to the relative on-disk path -r mirrors it to, or 0 if the path
-# is not safe to write. This is the confinement boundary from 0.6.6, split out
-# of _save_tree so it can be tested directly:
-#   - any ".." segment is refused outright (0), and
+# is not safe to write. The confinement boundary (0.6.6, widened 0.7.2):
+#   - any segment that begins with '.' is refused outright (0): "..", ".", and
+#     hidden names (_path_segments_safe);
 #   - EVERY leading '/' is stripped, so "//tmp/x" cannot survive as the absolute
 #     path "/tmp/x" the way it did when only one slash was removed.
-# "/docs/g.html" -> "docs/g.html"; "/" or "/d/" gain "index.html"; "?query" is cut.
+# "/docs/g.html" -> "docs/g.html"; "/" or "/d/" gain "index.html"; "?query" is
+# cut. The result is relative to the per-host directory (tree_host_dir).
 fn tree_relpath(path): i64 {
     var n = strlen(path);
     var end = 0;
-    while ((end < n) && (load8(path + end) != 63)) { end = end + 1; }   # strip ?query
-    if (_path_no_dotdot(path, end) == 0) { return 0; }
+    while ((end < n) && (load8(path + end) != 63) && (load8(path + end) != 35)) { end = end + 1; }
+    if (_path_segments_safe(path, end) == 0) { return 0; }
     var rp = xalloc(end + 12);
     var w = 0;
     var i = 0;
@@ -251,4 +339,19 @@ fn tree_relpath(path): i64 {
     }
     store8(rp + w, 0);
     return rp;
+}
+
+# The directory a crawl of this origin is mirrored into, relative to the cwd:
+# "host", or "host:port" off the scheme default — wget's layout. Returns 0 if the
+# host cannot name a safe directory (empty, or beginning with '.', which covers
+# "." and "..").
+#
+# Since 0.7.2. Before it, -r wrote straight into the cwd, so a crawled page could
+# overwrite ANY file under it that its name reached: ./Makefile, ./.bashrc,
+# ./.git/config. Run from $HOME or a source tree, that is a path to code
+# execution. Under its own directory, a mirror can only replace its own files.
+fn tree_host_dir(host, is_https, port): i64 {
+    if (load8(host) == 0) { return 0; }
+    if (load8(host) == 46) { return 0; }
+    return _authority(host, is_https, port);
 }

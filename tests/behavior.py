@@ -189,6 +189,20 @@ def h_redirect_to(port, path="/steal"):
     return h
 
 
+def mirror_dir(d, port):
+    """Where -r mirrors 127.0.0.1:<port> from cwd `d`: ./127.0.0.1:PORT/ (0.7.2+)."""
+    return os.path.join(d, "127.0.0.1:%d" % port)
+
+
+def mirrored(d, port, name):
+    """Bytes of a crawled file: the per-host directory first (0.7.2+), else the
+    cwd, where binaries before 0.7.2 wrote it. b"" when neither exists."""
+    for f in (os.path.join(mirror_dir(d, port), name), os.path.join(d, name)):
+        if os.path.exists(f):
+            return open(f, "rb").read()
+    return b""
+
+
 # ---------------------------------------------------------------- the checks
 
 def check_path_traversal(run, rep, new, old, marker, marker2):
@@ -346,20 +360,18 @@ def check_crawl_dechunk(run, rep, new, old):
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
                      b"5\r\nHELLO\r\n5\r\nWORLD\r\n0\r\n\r\n")
 
-    def saved(d):
-        f = os.path.join(d, "p.html")
-        return open(f, "rb").read() if os.path.exists(f) else b""
-
     if old:
         p = newport()
         serve(p, h)
         _rc, _o, _e, d = run(old, ["-r", "-l", "0", "http://127.0.0.1:%d/p.html" % p], "chunk_baseline")
-        rep.control("baseline writes raw chunk framing", b"5\r\n" in saved(d), (0, 6, 6), repr(saved(d)[:28]))
+        got = mirrored(d, p, "p.html")
+        rep.control("baseline writes raw chunk framing", b"5\r\n" in got, (0, 6, 6), repr(got[:28]))
 
     p = newport()
     serve(p, h)
     _rc, _o, _e, d = run(new, ["-r", "-l", "0", "http://127.0.0.1:%d/p.html" % p], "chunk")
-    rep.check("decoded body written", saved(d) == b"HELLOWORLD", repr(saved(d)[:28]))
+    got = mirrored(d, p, "p.html")
+    rep.check("decoded body written", got == b"HELLOWORLD", repr(got[:28]))
 
 
 def check_body_file(run, rep, new, old):
@@ -417,6 +429,327 @@ def check_regressions(run, rep, new):
     rep.check("-o writes the body", rc == 0 and got == b"filebody", repr(got[:30]))
 
 
+# ---------------------------------------------------------------- 0.7.2 (P(-1) audit)
+
+def read_full_request(conn, first):
+    """`first` plus whatever else the request still owes, by its Content-Length."""
+    data = first.encode("latin1")
+    head, sep, body = data.partition(b"\r\n\r\n")
+    want = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            want = int(line.split(b":", 1)[1].strip() or b"0")
+    conn.settimeout(5)
+    while sep and len(body) < want:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return head.decode("latin1"), body
+
+
+def check_mirror_dir(run, rep, new, old):
+    """0.7.2 (audit A): -r writes under ./HOST:PORT/, never over the cwd's own
+    files, and refuses any path segment that begins with '.'."""
+    print("\n[16] -r mirrors into its own directory; hidden paths refused")
+
+    def h(conn, req):
+        if "robots.txt" in req:
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            return
+        if req.startswith("GET / "):
+            body = b'<a href="/keep.txt">k</a> <a href="/.hidden/x.txt">h</a>'
+        else:
+            body = b"SERVED"
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+
+    def attempt(binary, tag):
+        d = os.path.join(run.workdir, tag)
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+        with open(os.path.join(d, "keep.txt"), "w") as f:
+            f.write("MINE")                      # a file the user already had
+        p = newport()
+        serve(p, h, n=8)
+        subprocess.run([binary, "-r", "-l", "1", "http://127.0.0.1:%d/" % p],
+                       cwd=d, capture_output=True, timeout=25)
+        cwd_file = open(os.path.join(d, "keep.txt")).read()
+        hidden = any(os.path.exists(os.path.join(x, ".hidden"))
+                     for x in (d, mirror_dir(d, p)))
+        return cwd_file, mirrored(d, p, "keep.txt"), hidden
+
+    if old:
+        cwd_file, _m, _h = attempt(old, "mdir_baseline")
+        rep.control("baseline overwrites a file in the cwd", cwd_file == "SERVED", (0, 7, 2))
+    cwd_file, mirror_file, hidden = attempt(new, "mdir")
+    rep.check("the cwd's own file is untouched", cwd_file == "MINE", cwd_file)
+    rep.check("the page is mirrored under ./127.0.0.1:PORT/", mirror_file == b"SERVED", repr(mirror_file))
+    rep.check("a hidden path segment is not written", not hidden)
+
+
+def check_crawl_exit_and_dedupe(run, rep, new, old):
+    """0.7.2 (audit F, G): -r reports failure in its exit status, and a link
+    repeated on a page is fetched once."""
+    print("\n[17] -r exit status and duplicate links")
+
+    def h404(conn, req):
+        conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+
+    if old:
+        p = newport()
+        serve(p, h404)
+        rc, _o, _e, _d = run(old, ["-r", "http://127.0.0.1:%d/" % p], "rexit_baseline")
+        rep.control("baseline exits 0 when the start URL fails", rc == 0, (0, 7, 2), "rc=%d" % rc)
+    p = newport()
+    serve(p, h404)
+    rc, _o, _e, _d = run(new, ["-r", "http://127.0.0.1:%d/" % p], "rexit")
+    rep.check("start URL 404 -> exit 9", rc == 9, "rc=%d" % rc)
+
+    fetched = []
+
+    def hdup(conn, req):
+        fetched.append(req.split("\r\n", 1)[0])
+        if "robots.txt" in req:
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            return
+        if req.startswith("GET / "):
+            body = b'<a href="/same.html">x</a>' * 40
+        else:
+            body = b"ok"
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+
+    p = newport()
+    serve(p, hdup, n=20)
+    rc, _o, err, _d = run(new, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p], "rdedupe")
+    n_same = sum(1 for l in fetched if "/same.html" in l)
+    rep.check("a repeated link is fetched once", n_same == 1, "fetched %d times" % n_same)
+    rep.check("no cap message for one distinct link", "crawl cap" not in err, err.strip()[:80])
+    rep.check("a clean crawl exits 0", rc == 0, "rc=%d" % rc)
+
+
+def check_stdin_body(run, rep, new, old):
+    """0.7.2 (audit D): -d @- sends a large stdin body whole, and refuses one
+    over the 1 MiB cap, like @file."""
+    print("\n[18] -d @- body size")
+    got = []
+
+    def h(conn, req):
+        head, body = read_full_request(conn, req)
+        got.append(len(body))
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+
+    def send(binary, data, tag):
+        d = os.path.join(run.workdir, tag)
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+        p = newport()
+        serve(p, h)
+        r = subprocess.run([binary, "-d", "@-", "http://127.0.0.1:%d/" % p], cwd=d,
+                           input=data, capture_output=True, timeout=25)
+        return r.returncode
+
+    payload = b"a" * 300000
+    if old:
+        del got[:]
+        send(old, payload, "stdin_baseline")
+        rep.control("baseline cuts a 300,000-byte stdin body", bool(got) and got[0] < 300000,
+                    (0, 7, 2), str(got))
+    del got[:]
+    rc = send(new, payload, "stdin")
+    rep.check("300,000-byte stdin body arrives whole", rc == 0 and got == [300000], "rc=%d %s" % (rc, got))
+    del got[:]
+    rc = send(new, b"a" * (1048576 + 1), "stdin_big")
+    rep.check("stdin body over 1 MiB refused (exit 2), nothing sent", rc == 2 and got == [],
+              "rc=%d %s" % (rc, got))
+
+
+def check_resume_validation(run, rep, new, old):
+    """0.7.2 (audit C): -C appends only a 206 that starts where the file ends,
+    decodes a chunked one, and refuses a short one."""
+    print("\n[19] -C checks the 206 before appending")
+
+    def make(resp):
+        def h(conn, req):
+            conn.sendall(resp)
+        return h
+
+    def attempt(binary, resp, tag):
+        d = os.path.join(run.workdir, tag)
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+        with open(os.path.join(d, "f"), "wb") as f:
+            f.write(b"HELLO")
+        p = newport()
+        serve(p, make(resp))
+        r = subprocess.run([binary, "-C", "-o", "f", "http://127.0.0.1:%d/" % p],
+                           cwd=d, capture_output=True, timeout=25)
+        return r.returncode, open(os.path.join(d, "f"), "rb").read()
+
+    wrong_start = (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/10\r\n"
+                   b"Content-Length: 10\r\n\r\nHELLOWORLD")
+    chunked = (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\n"
+               b"Transfer-Encoding: chunked\r\n\r\n5\r\nWORLD\r\n0\r\n\r\n")
+    short = (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-104/105\r\n"
+             b"Content-Length: 100\r\n\r\nWOR")
+    good = (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\n"
+            b"Content-Length: 5\r\n\r\nWORLD")
+    if old:
+        _rc, data = attempt(old, wrong_start, "res_baseline")
+        rep.control("baseline appends a range that starts at 0", data == b"HELLOHELLOWORLD", (0, 7, 2))
+    rc, data = attempt(new, wrong_start, "res_wrong")
+    rep.check("a 206 starting at the wrong byte is refused", rc == 9 and data == b"HELLO", "rc=%d %r" % (rc, data))
+    rc, data = attempt(new, chunked, "res_chunked")
+    rep.check("a chunked 206 is decoded before appending", rc == 0 and data == b"HELLOWORLD", "rc=%d %r" % (rc, data))
+    rc, data = attempt(new, short, "res_short")
+    rep.check("a short 206 is refused, file unchanged", rc == 9 and data == b"HELLO", "rc=%d %r" % (rc, data))
+    rc, data = attempt(new, good, "res_good")
+    rep.check("a correct 206 is appended", rc == 0 and data == b"HELLOWORLD", "rc=%d %r" % (rc, data))
+
+
+def check_redirect_methods(run, rep, new, old):
+    """0.7.2 (audit I, J): 307 keeps the method and body, 303 becomes GET, -I -L
+    stays HEAD, and -L that runs out of hops exits 9."""
+    print("\n[20] redirect methods and the hop limit")
+    seen = []
+
+    def make(final_port, code):
+        def h(conn, req):
+            conn.sendall(("HTTP/1.1 %d Moved\r\nLocation: http://127.0.0.1:%d/final\r\n"
+                          "Content-Length: 0\r\n\r\n" % (code, final_port)).encode())
+        return h
+
+    def hfinal(conn, req):
+        head, body = read_full_request(conn, req)
+        seen.append((head.split(" ", 1)[0], body))
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+
+    def via(binary, code, args, tag):
+        del seen[:]
+        a, b = newport(), newport()
+        serve(a, make(b, code))
+        serve(b, hfinal)
+        rc, out, _e, _d = run(binary, args + ["-L", "http://127.0.0.1:%d/start" % a], tag)
+        return rc, out, list(seen)
+
+    if old:
+        _rc, _o, s307 = via(old, 307, ["-d", "x=1"], "r307_baseline")
+        rep.control("baseline turns a 307 POST into a GET", bool(s307) and s307[0][0] == "GET", (0, 7, 2), str(s307))
+    rc, _o, s307 = via(new, 307, ["-d", "x=1"], "r307")
+    rep.check("307 keeps POST and its body", s307 == [("POST", b"x=1")], str(s307))
+    rc, _o, s303 = via(new, 303, ["-d", "x=1"], "r303")
+    rep.check("303 turns POST into a bodyless GET", s303 == [("GET", b"")], str(s303))
+    rc, out, shead = via(new, 302, ["-I"], "rhead")
+    rep.check("-I -L stays HEAD on the next hop", shead and shead[0][0] == "HEAD", str(shead))
+
+    def hloop(port):
+        def h(conn, req):
+            conn.sendall(("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:%d/again\r\n"
+                          "Content-Length: 0\r\n\r\n" % port).encode())
+        return h
+
+    if old:
+        p = newport()
+        serve(p, hloop(p), n=16)
+        rc, _o, _e, _d = run(old, ["-L", "http://127.0.0.1:%d/" % p], "rloop_baseline")
+        rep.control("baseline exits 0 after running out of hops", rc == 0, (0, 7, 2), "rc=%d" % rc)
+    p = newport()
+    serve(p, hloop(p), n=16)
+    rc, _o, err, _d = run(new, ["-L", "http://127.0.0.1:%d/" % p], "rloop")
+    rep.check("too many redirects -> exit 9", rc == 9 and "too many redirects" in err,
+              "rc=%d %s" % (rc, err.strip()[:60]))
+
+
+def check_robots_rules(run, rep, new, old):
+    """0.7.2 (audit M): RFC 9309 grouping, and a failing robots.txt disallows."""
+    print("\n[21] robots.txt groups and failures")
+    fetched = []
+
+    def make(robots_resp):
+        def h(conn, req):
+            line = req.split("\r\n", 1)[0]
+            fetched.append(line)
+            if "robots.txt" in req:
+                conn.sendall(robots_resp)
+                return
+            if line.startswith("GET / "):
+                body = b'<a href="/secret.html">s</a> <a href="/open.html">o</a>'
+            else:
+                body = b"page"
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        return h
+
+    grouped = b"User-agent: *\nUser-agent: other\nDisallow: /secret.html\n"
+    resp = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(grouped) + grouped
+
+    def crawl(binary, robots_resp, tag):
+        del fetched[:]
+        p = newport()
+        serve(p, make(robots_resp), n=12)
+        rc, _o, _e, _d = run(binary, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p], tag)
+        return rc, [l for l in fetched if "robots" not in l]
+
+    if old:
+        _rc, f = crawl(old, resp, "robots_baseline")
+        rep.control("baseline ignores a rule after two User-agent lines",
+                    any("secret" in l for l in f), (0, 7, 2), str(f))
+    rc, f = crawl(new, resp, "robots_group")
+    rep.check("a rule shared by two User-agent lines is honoured",
+              not any("secret" in l for l in f) and any("open" in l for l in f), str(f))
+    rc, f = crawl(new, b"HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\n", "robots_5xx")
+    rep.check("robots.txt 5xx -> nothing crawled, exit 9", rc == 9 and f == [], "rc=%d %s" % (rc, f))
+
+
+def check_misc_072(run, rep, new, old):
+    """0.7.2: POST is not resent by --retry once sent; a 204 without a length
+    completes at once; the fragment stays client-side; a stdout write failure
+    is an error."""
+    print("\n[22] retry of a sent POST, 204, fragment, stdout errors")
+    seen = []
+
+    def hclose(conn, req):
+        seen.append(req.split("\r\n", 1)[0])
+        # consume the request, answer nothing
+
+    if old:
+        del seen[:]
+        p = newport()
+        serve(p, hclose)
+        run(old, ["--retry", "2", "-d", "x=1", "http://127.0.0.1:%d/" % p], "post_baseline")
+        rep.control("baseline resends a POST the server received", len(seen) > 1, (0, 7, 2), str(len(seen)))
+    del seen[:]
+    p = newport()
+    serve(p, hclose)
+    rc, _o, _e, _d = run(new, ["--retry", "2", "-d", "x=1", "http://127.0.0.1:%d/" % p], "post")
+    rep.check("a sent POST is not resent", len(seen) == 1 and rc == 9, "sent %d, rc=%d" % (len(seen), rc))
+
+    def h204(conn, req):
+        conn.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+        time.sleep(12)                      # hold the connection open
+
+    p = newport()
+    serve(p, h204)
+    t0 = time.time()
+    rc, _o, _e, _d = run(new, ["http://127.0.0.1:%d/" % p], "r204")
+    took = time.time() - t0
+    rep.check("a 204 without a length completes without waiting", rc == 0 and took < 5,
+              "rc=%d %.1fs" % (rc, took))
+
+    lines = []
+    p = newport()
+    serve(p, lambda conn, req: (lines.append(req.split("\r\n", 1)[0]),
+                                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")))
+    run(new, ["http://127.0.0.1:%d/page.html#section" % p], "frag")
+    rep.check("the #fragment is not sent", lines == ["GET /page.html HTTP/1.1"], str(lines))
+
+    if os.path.exists("/dev/full"):
+        p = newport()
+        serve(p, h_ok(body=b"hello"))
+        with open("/dev/full", "wb") as full:
+            r = subprocess.run([new, "http://127.0.0.1:%d/" % p], stdout=full,
+                               capture_output=False, stderr=subprocess.PIPE, timeout=25)
+        rep.check("a failed write to stdout -> exit 9", r.returncode == 9, "rc=%d" % r.returncode)
+
+
 # ---------------------------------------------------------------- entry point
 
 def check_origin_confinement(run, rep, new, old):
@@ -462,13 +795,12 @@ def check_crawl_nondefault_port(run, rep, new, old):
         serve(p, h, n=12)
         _rc, _o, _e, d = run(old, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p], "port_baseline")
         rep.control("baseline cannot crawl off the default port",
-                    not os.path.exists(os.path.join(d, "child.html")), (0, 6, 7))
+                    mirrored(d, p, "child.html") == b"", (0, 6, 7))
 
     p = newport()
     serve(p, h, n=12)
     _rc, _o, _e, d = run(new, ["-r", "-l", "1", "http://127.0.0.1:%d/" % p], "port")
-    f = os.path.join(d, "child.html")
-    got = open(f, "rb").read() if os.path.exists(f) else b""
+    got = mirrored(d, p, "child.html")
     rep.check("relative link fetched on odd port", got == b"CHILD", repr(got[:20]))
 
 
@@ -569,8 +901,13 @@ def check_symlink_write(run, rep, new, old):
         outside = os.path.join(run.workdir, "%s-outside.txt" % tag)
         with open(outside, "w") as f:
             f.write("ORIGINAL")
-        os.symlink(outside, os.path.join(d, "target.html"))
         p = newport()
+        # Planted where every version writes: the cwd (before 0.7.2) and the
+        # per-host directory (0.7.2+). Without the second, this check would pass
+        # trivially on 0.7.2 and stop exercising O_NOFOLLOW at all.
+        os.symlink(outside, os.path.join(d, "target.html"))
+        os.makedirs(mirror_dir(d, p), exist_ok=True)
+        os.symlink(outside, os.path.join(mirror_dir(d, p), "target.html"))
         serve(p, h, n=8)
         subprocess.run([binary, "-r", "-l", "0", "http://127.0.0.1:%d/target.html" % p],
                        cwd=d, capture_output=True, timeout=25)
@@ -592,8 +929,10 @@ def check_symlink_write(run, rep, new, old):
         victim = os.path.join(run.workdir, "%s-victim.txt" % tag)
         if os.path.exists(victim):
             os.remove(victim)
-        os.symlink(victim, os.path.join(d, "target.html"))   # points at nothing yet
         p = newport()
+        os.symlink(victim, os.path.join(d, "target.html"))   # points at nothing yet
+        os.makedirs(mirror_dir(d, p), exist_ok=True)
+        os.symlink(victim, os.path.join(mirror_dir(d, p), "target.html"))
         serve(p, h, n=8)
         subprocess.run([binary, "-r", "-l", "0", "http://127.0.0.1:%d/target.html" % p],
                        cwd=d, capture_output=True, timeout=25)
@@ -748,6 +1087,13 @@ def main():
         check_symlink_write(run, rep, binary, baseline)
         check_crawl_cap_reported(run, rep, binary, baseline)
         check_complete_without_close(run, rep, binary, baseline)
+        check_mirror_dir(run, rep, binary, baseline)
+        check_crawl_exit_and_dedupe(run, rep, binary, baseline)
+        check_stdin_body(run, rep, binary, baseline)
+        check_resume_validation(run, rep, binary, baseline)
+        check_redirect_methods(run, rep, binary, baseline)
+        check_robots_rules(run, rep, binary, baseline)
+        check_misc_072(run, rep, binary, baseline)
     finally:
         for f in (marker, marker2):
             if os.path.exists(f):

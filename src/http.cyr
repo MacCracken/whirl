@@ -98,7 +98,9 @@ fn http_build_request(method, host, path, hdrs, nhdrs, body, bodylen, buf, bufma
         i = i + 1;
     }
 
-    if (bodylen > 0) {
+    # `body != 0`, not `bodylen > 0`: `-d ''` is an empty body, and a POST without
+    # a Content-Length leaves a server to guess (0.7.2).
+    if ((body != 0) || (bodylen > 0)) {
         p = _http_puts(buf, p, bufmax, "Content-Length: ");
         p = _http_put_int(buf, p, bufmax, bodylen);
         p = _http_puts(buf, p, bufmax, "\r\n");
@@ -164,22 +166,6 @@ fn http_body_offset(resp, len): i64 {
     return 0 - 1;
 }
 
-fn _http_lc(c): i64 {
-    if ((c >= 65) && (c <= 90)) { return c + 32; }
-    return c;
-}
-
-# Case-insensitive: does lowercase literal `lit` match resp at `off` (bounded)?
-fn _http_match_ci(resp, off, len, lit): i64 {
-    var j = 0;
-    while (load8(lit + j) != 0) {
-        if (off + j >= len) { return 0; }
-        if (_http_lc(load8(resp + off + j)) != load8(lit + j)) { return 0; }
-        j = j + 1;
-    }
-    return 1;
-}
-
 # Advance `off` past the current line's CRLF. Returns the next-line offset.
 fn _http_next_line(resp, off, end): i64 {
     var found = 0;
@@ -191,26 +177,39 @@ fn _http_next_line(resp, off, end): i64 {
 }
 
 # Find header `name` (lowercase, no colon). Returns the offset of its value
-# (after ':' + spaces), bounded to the header block, or -1.
+# (after ':' and any spaces or tabs), bounded to the header block, or -1.
 fn http_header_value(resp, len, name): i64 {
     var hdr_end = http_body_offset(resp, len);
     if (hdr_end < 0) { hdr_end = len; }
 
     var off = _http_next_line(resp, 0, hdr_end);   # skip the status line
     while (off < hdr_end) {
-        if (_http_match_ci(resp, off, hdr_end, name) == 1) {
+        if (util_match_ci(resp, off, hdr_end, name) == 1) {
             var nl = 0;
             while (load8(name + nl) != 0) { nl = nl + 1; }
             var k = off + nl;
             if ((k < hdr_end) && (load8(resp + k) == 58)) {   # ':'
                 k = k + 1;
-                while ((k < hdr_end) && (load8(resp + k) == 32)) { k = k + 1; }
+                while ((k < hdr_end) && ((load8(resp + k) == 32) || (load8(resp + k) == 9))) { k = k + 1; }
                 return k;
             }
         }
         off = _http_next_line(resp, off, hdr_end);
     }
     return 0 - 1;
+}
+
+# Copy header `name`'s value into a fresh cstr: from after the colon's whitespace
+# to the CR, with trailing spaces and tabs dropped. 0 when absent. 0.7.2: a
+# Location with trailing whitespace was copied with it, and url_parse refuses
+# whitespace, so the redirect silently stopped being followed.
+fn http_header_dup(resp, len, name): i64 {
+    var v = http_header_value(resp, len, name);
+    if (v < 0) { return 0; }
+    var e = v;
+    while ((e < len) && (load8(resp + e) != 13) && (load8(resp + e) != 10)) { e = e + 1; }
+    while ((e > v) && ((load8(resp + e - 1) == 32) || (load8(resp + e - 1) == 9))) { e = e - 1; }
+    return util_dup_range(resp + v, e - v);
 }
 
 # Content-Length value, or -1 if absent/malformed.
@@ -237,79 +236,64 @@ fn http_content_length(resp, len): i64 {
     return n;
 }
 
-# Walk the chunk-size headers of `body` without copying. Returns 1 once the
-# terminating zero-size chunk is reached, 0 if the stream runs out first.
-# Mirrors http_dechunk's parse exactly — same hex scan, same skip-to-LF — so the
-# two cannot disagree about where a chunked body ends.
-fn _http_chunked_terminated(body, blen): i64 {
-    var i = 0;
+# --- chunked framing ---
+
+# Parse the chunk-size line at body[i..): hex digits, then skip to the LF that
+# ends the line (past any `;ext` and the CR). One parser for every chunked walker,
+# so they cannot disagree about where a body ends. Returns the size, or
+#   HTTP_CHUNK_BAD    no hex digit, or more than 15 of them;
+#   HTTP_CHUNK_SHORT  the line's LF has not arrived yet.
+# On success _http_chunk_next is the offset just past that LF.
+#
+# 0.7.2: the digit count was unbounded. 16 hex digits overflow i64 into a NEGATIVE
+# size, and the completeness walk then moved its cursor backwards: an endless
+# loop at 100% CPU (FFFFFFFFFFFFFFEC) or a read before the buffer and a SIGSEGV
+# (8000000000000000), from any server, on every fetch. 15 digits is 2^60 bytes,
+# far past any body whirl can hold.
+var HTTP_CHUNK_BAD   = 0 - 1;
+var HTTP_CHUNK_SHORT = 0 - 2;
+var _HTTP_CHUNK_HEXMAX = 15;
+var _http_chunk_next = 0;
+fn _http_chunk_size(body, i, blen): i64 {
+    var sz = 0;
+    var nd = 0;
     while (i < blen) {
-        var sz = 0;
-        var got = 0;
-        while (i < blen) {
-            var h = _http_hexval(load8(body + i));
-            if (h < 0) { break; }
-            sz = sz * 16 + h;
-            got = 1;
-            i = i + 1;
-        }
-        if (got == 0) { return 0; }
-        while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
-        i = i + 1;
-        if (sz == 0) { return 1; }          # terminating chunk — body is complete
-        i = i + sz;
-        while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
+        var h = _http_hexval(load8(body + i));
+        if (h < 0) { break; }
+        nd = nd + 1;
+        if (nd > _HTTP_CHUNK_HEXMAX) { return HTTP_CHUNK_BAD; }
+        sz = sz * 16 + h;
         i = i + 1;
     }
-    return 0;
+    if (nd == 0) {
+        if (i >= blen) { return HTTP_CHUNK_SHORT; }
+        return HTTP_CHUNK_BAD;
+    }
+    while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
+    if (i >= blen) { return HTTP_CHUNK_SHORT; }
+    _http_chunk_next = i + 1;
+    return sz;
 }
 
-# Set for a HEAD request, whose response carries a Content-Length describing a
-# body that will never arrive. Without it the completeness test below waits for
-# an end-of-body that cannot come.
-var _http_no_body = 0;
-# Mark the response as bodiless (1 for a HEAD request), so http_response_complete
-# treats the end of the headers as the end of the response.
-fn http_set_no_body(v): i64 { _http_no_body = v; return 0; }
-
-# Is `len` bytes at `resp` a COMPLETE HTTP response, judged by its own framing?
-#
-# This is the authority on "the response has arrived" — not the socket. A
-# chunked body ends at its terminating chunk and a Content-Length body ends at
-# its length; in neither case does the transport need to see the peer close.
-# Only a close-delimited body (no Content-Length, no chunking) genuinely ends at
-# EOF, and that case returns 0 here so the caller keeps reading.
-#
-# whirl used to read every response to EOF regardless. On Linux that is
-# invisible — read(2) returns 0 the moment the peer closes. On AGNOS the peer
-# close is not surfaced promptly, so a complete chunked response then burned
-# taar's full 10 s receive deadline and came back as _TAAR_ERR_TIMEOUT, which
-# 0.6.6's truncation check correctly reported as an incomplete response. The
-# response was never incomplete; whirl was asking the wrong question.
-fn http_response_complete(resp, len): i64 {
-    var bo = http_body_offset(resp, len);
-    if (bo < 0) { return 0; }               # headers not finished yet
-    if (_http_no_body == 1) { return 1; }   # HEAD: headers are the whole response
-    if (http_is_chunked(resp, len) == 1) {
-        return _http_chunked_terminated(resp + bo, len - bo);
-    }
-    var cl = http_content_length(resp, len);
-    if (cl >= 0) {
-        if ((len - bo) >= cl) { return 1; }
-        return 0;
-    }
-    return 0;                               # close-delimited — only EOF ends it
-}
-
-# 1 if Transfer-Encoding contains "chunked", else 0.
-fn http_is_chunked(resp, len): i64 {
-    var v = http_header_value(resp, len, "transfer-encoding");
-    if (v < 0) { return 0; }
-    var i = v;
-    while (i < len) {
-        if (load8(resp + i) == 13) { break; }
-        if (_http_match_ci(resp, i, len, "chunked") == 1) { return 1; }
-        i = i + 1;
+# Walk the chunks of body[0..blen) from offset `i` without copying. Returns 1 once
+# the terminating zero-size chunk is reached, else 0: the stream ran out, or it is
+# malformed, which never completes and is reported by the truncation check.
+# _http_walk_pos is left at the first chunk still incomplete, so the next
+# call resumes there. The cursor only ever moves forward: each step lands past
+# the chunk's data and its line end.
+var _http_walk_pos = 0;
+fn _http_chunk_walk(body, i, blen): i64 {
+    while (1 == 1) {
+        _http_walk_pos = i;
+        var sz = _http_chunk_size(body, i, blen);
+        if (sz < 0) { return 0; }
+        if (sz == 0) { return 1; }                # terminating chunk: body complete
+        var d = _http_chunk_next;
+        if (sz > blen - d) { return 0; }          # the chunk's data is not all here
+        var k = d + sz;
+        while ((k < blen) && (load8(body + k) != 10)) { k = k + 1; }
+        if (k >= blen) { return 0; }              # nor the CRLF after it
+        i = k + 1;
     }
     return 0;
 }
@@ -322,35 +306,251 @@ fn _http_hexval(c): i64 {
 }
 
 # Decode chunked transfer-encoding from `body` into `out`. Returns the decoded
-# length, or -1 on malformed input / output overflow.
+# length, or -1 on malformed input, a chunk cut short, or output overflow.
 fn http_dechunk(body, blen, out, outmax): i64 {
     var i = 0;
     var o = 0;
     while (i < blen) {
-        var sz = 0;
-        var got = 0;
-        while (i < blen) {
-            var h = _http_hexval(load8(body + i));
-            if (h < 0) { break; }
-            sz = sz * 16 + h;
-            got = 1;
-            i = i + 1;
-        }
-        if (got == 0) { return 0 - 1; }
-        # skip to LF (past any chunk extensions + CR)
-        while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
-        i = i + 1;
-        if (sz == 0) { return o; }   # terminating chunk
+        var sz = _http_chunk_size(body, i, blen);
+        if (sz < 0) { return 0 - 1; }
+        i = _http_chunk_next;
+        if (sz == 0) { return o; }                # terminating chunk
+        if (sz > blen - i) { return 0 - 1; }      # chunk data cut short
+        if (sz > outmax - o) { return 0 - 1; }    # would overflow `out`
         var k = 0;
-        while (k < sz) {
-            if (i >= blen)   { return 0 - 1; }
-            if (o >= outmax) { return 0 - 1; }
-            store8(out + o, load8(body + i));
-            o = o + 1; i = i + 1; k = k + 1;
-        }
-        # skip the trailing CRLF after chunk data
+        while (k < sz) { store8(out + o + k, load8(body + i + k)); k = k + 1; }
+        o = o + sz;
+        i = i + sz;
+        # skip the CRLF after the chunk data
         while ((i < blen) && (load8(body + i) != 10)) { i = i + 1; }
         i = i + 1;
     }
     return o;
 }
+
+# 1 if Transfer-Encoding contains "chunked", else 0.
+fn http_is_chunked(resp, len): i64 {
+    var v = http_header_value(resp, len, "transfer-encoding");
+    if (v < 0) { return 0; }
+    var i = v;
+    while (i < len) {
+        if (load8(resp + i) == 13) { break; }
+        if (util_match_ci(resp, i, len, "chunked") == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- has the whole response arrived? ---
+#
+# The response's own framing is the authority on "it has all arrived", not the
+# socket. A chunked body ends at its terminating chunk, a Content-Length body at
+# its length; only a close-delimited body (neither) genuinely ends at EOF, and for
+# that one the answer stays 0 so the caller keeps reading. (Before 0.6.9 whirl
+# read every response to EOF. On AGNOS the peer close is not surfaced promptly,
+# so a complete chunked response burned the full 10 s receive deadline and was
+# then reported incomplete.)
+#
+# INCREMENTAL since 0.7.2. The read loop asks after every recv, and the old check
+# started from offset 0 each time, both the header-terminator scan and the whole
+# chunk walk. A server trickling small chunks made that quadratic: 40,000
+# one-byte chunks cost 5.9 s of CPU. The state below remembers how far each scan
+# got. http_complete_reset() starts a response; http_complete_feed() is then
+# called with the whole buffer so far.
+#
+# Interim 1xx responses (100 Continue, 103 Early Hints) are skipped. Before 0.7.2
+# a 103 was taken as the final response, and the real response's status line and
+# headers were emitted as its body. http_complete_base() is where the final
+# response starts; the transport moves it to offset 0 before anything else
+# parses the buffer. 101 counts as final (whirl never asks to upgrade).
+#
+# A HEAD response (http_set_no_body), a 204 and a 304 carry no body, so each is
+# complete at the end of its headers. Before 0.7.2 a 204 or 304 without a length
+# header was read as close-delimited and waited out the receive deadline.
+var _http_no_body = 0;
+# Mark the next response as bodiless (1 for a HEAD request), so it is complete at
+# the end of its headers. Set per request: 0.7.2 stopped it leaking from `-I`
+# into the GETs a redirect or a crawl sends.
+fn http_set_no_body(v): i64 { _http_no_body = v; return 0; }
+
+var _HC_UNKNOWN = 0;
+var _HC_NOBODY  = 1;
+var _HC_CHUNKED = 2;
+var _HC_LENGTH  = 3;
+var _HC_CLOSE   = 4;
+var _hc_base = 0;          # start of the final (non-1xx) response
+var _hc_scan = 0;          # where the header-terminator scan resumes
+var _hc_bo = 0 - 1;        # body offset of the final response; -1 until found
+var _hc_kind = 0;
+var _hc_cl = 0;
+var _hc_ck = 0;            # chunk walk cursor
+
+# Start judging a new response.
+fn http_complete_reset(): i64 {
+    _hc_base = 0;
+    _hc_scan = 0;
+    _hc_bo = 0 - 1;
+    _hc_kind = _HC_UNKNOWN;
+    _hc_cl = 0;
+    _hc_ck = 0;
+    return 0;
+}
+
+# Offset of the final response in the buffer last fed (after any 1xx).
+fn http_complete_base(): i64 { return _hc_base; }
+
+# Is resp[0..len) a COMPLETE response yet? `resp` must be the same buffer, grown,
+# since the last http_complete_reset().
+fn http_complete_feed(resp, len): i64 {
+    while (_hc_bo < 0) {
+        var i = _hc_scan;
+        if (i < _hc_base) { i = _hc_base; }
+        var found = 0 - 1;
+        while ((i + 3 < len) && (found < 0)) {
+            if ((load8(resp + i) == 13) && (load8(resp + i + 1) == 10)
+                && (load8(resp + i + 2) == 13) && (load8(resp + i + 3) == 10)) { found = i; }
+            else { i = i + 1; }
+        }
+        if (found < 0) { _hc_scan = i; return 0; }   # headers not finished; resume at i
+        var head_end = found + 4;
+        var h = resp + _hc_base;
+        var hlen = head_end - _hc_base;
+        var st = http_status_code(h, hlen);
+        if ((st >= 100) && (st < 200) && (st != 101)) {
+            _hc_base = head_end;                  # interim response: skip it
+            _hc_scan = head_end;
+        } else {
+            _hc_bo = head_end;
+            if ((_http_no_body == 1) || (st == 204) || (st == 304) || (st == 101)) { _hc_kind = _HC_NOBODY; }
+            elif (http_is_chunked(h, hlen) == 1) { _hc_kind = _HC_CHUNKED; _hc_ck = head_end; }
+            else {
+                _hc_cl = http_content_length(h, hlen);
+                if (_hc_cl >= 0) { _hc_kind = _HC_LENGTH; } else { _hc_kind = _HC_CLOSE; }
+            }
+        }
+    }
+    if (_hc_kind == _HC_NOBODY) { return 1; }
+    if (_hc_kind == _HC_LENGTH) {
+        if ((len - _hc_bo) >= _hc_cl) { return 1; }
+        return 0;
+    }
+    if (_hc_kind == _HC_CHUNKED) {
+        var done = _http_chunk_walk(resp, _hc_ck, len);
+        _hc_ck = _http_walk_pos;
+        return done;
+    }
+    return 0;                                     # close-delimited: only EOF ends it
+}
+
+# Stateless form: is resp[0..len) a complete response?
+fn http_response_complete(resp, len): i64 {
+    http_complete_reset();
+    return http_complete_feed(resp, len);
+}
+
+# Is this response short of what it promised? 1 = the transfer must be treated as
+# failed. `incomplete` is transport_incomplete(): the read ended on an error or a
+# full buffer, not a clean close. Asked of EVERY response: a server that sends
+# fewer bytes than its Content-Length and then closes cleanly looks like an
+# ordinary EOF to the read loop.
+#
+# 0.7.2: a header block that never ended counts as truncated. It counted as
+# complete, so `-i` and `-I` wrote a half header block and exited 0.
+fn http_response_truncated(resp, len, incomplete): i64 {
+    if (http_response_complete(resp, len) == 1) { return 0; }
+    if (_hc_bo < 0) { return 1; }                 # the header block never ended
+    if (_hc_kind == _HC_CHUNKED) { return 1; }    # chunk stream never terminated
+    if (_hc_kind == _HC_LENGTH) { return 1; }     # short of the promised length
+    return incomplete;                            # close-delimited
+}
+
+# Decode the body of a complete response. Returns its length and stores a pointer
+# to the bytes at `outp`: resp itself for a Content-Length or close-delimited body
+# (clamped to the length), `scratch` for a chunked one. Returns -1 for a chunked
+# body that does not decode, -2 when the header block never ended. The one decode
+# path: before 0.7.2 three copies existed, and the -C 206 append and the
+# robots.txt fetch had none, so they consumed raw chunk framing.
+fn http_decode_body(resp, len, scratch, scratchmax, outp): i64 {
+    var bo = http_body_offset(resp, len);
+    if (bo < 0) { return 0 - 2; }
+    var blen = len - bo;
+    if (http_is_chunked(resp, len) == 1) {
+        var dn = http_dechunk(resp + bo, blen, scratch, scratchmax);
+        if (dn < 0) { return 0 - 1; }
+        store64(outp, scratch);
+        return dn;
+    }
+    var cl = http_content_length(resp, len);
+    if ((cl >= 0) && (cl < blen)) { blen = cl; }
+    store64(outp, resp + bo);
+    return blen;
+}
+
+# Parse "Content-Range: bytes FIRST-LAST/TOTAL" (TOTAL may be '*'), or the 416
+# form "bytes */TOTAL". Returns 1 and sets http_cr_first / http_cr_total (-1 for
+# '*'), or 0 when the header is absent or malformed.
+var _http_cr_first = 0 - 1;
+var _http_cr_total = 0 - 1;
+# First byte of the last parsed Content-Range, or -1 ("*/N" form).
+fn http_cr_first(): i64 { return _http_cr_first; }
+# Complete length of the last parsed Content-Range, or -1 ("/*").
+fn http_cr_total(): i64 { return _http_cr_total; }
+
+# Decimal at resp[i..len), at most 18 digits. Returns the value, with the end in
+# _http_num_end; -1 when there is no digit.
+var _http_num_end = 0;
+fn _http_num(resp, i, len): i64 {
+    var n = 0;
+    var d = 0;
+    while ((i < len) && (load8(resp + i) >= 48) && (load8(resp + i) <= 57)) {
+        d = d + 1;
+        if (d > 18) { return 0 - 1; }
+        n = n * 10 + (load8(resp + i) - 48);
+        i = i + 1;
+    }
+    _http_num_end = i;
+    if (d == 0) { return 0 - 1; }
+    return n;
+}
+
+# Parse the response's Content-Range into http_cr_first / http_cr_total (see above).
+fn http_content_range(resp, len): i64 {
+    _http_cr_first = 0 - 1;
+    _http_cr_total = 0 - 1;
+    var v = http_header_value(resp, len, "content-range");
+    if (v < 0) { return 0; }
+    if (util_match_ci(resp, v, len, "bytes ") == 0) { return 0; }
+    var i = v + 6;
+    if ((i < len) && (load8(resp + i) == 42)) {           # "*/TOTAL" (416)
+        i = i + 1;
+    } else {
+        var first = _http_num(resp, i, len);
+        if (first < 0) { return 0; }
+        i = _http_num_end;
+        if ((i >= len) || (load8(resp + i) != 45)) { return 0; }   # '-'
+        var last = _http_num(resp, i + 1, len);
+        if (last < first) { return 0; }
+        i = _http_num_end;
+        _http_cr_first = first;
+    }
+    if ((i >= len) || (load8(resp + i) != 47)) { return 0; }       # '/'
+    i = i + 1;
+    if ((i < len) && (load8(resp + i) == 42)) { return 1; }        # unknown total
+    var total = _http_num(resp, i, len);
+    if (total < 0) { return 0; }
+    _http_cr_total = total;
+    return 1;
+}
+
+# 1 for a method RFC 9110 §9.2.2 calls idempotent: sending it twice has the effect
+# of sending it once, so it is safe to retry after the request went out.
+fn http_method_idempotent(m): i64 {
+    if (util_streq_ci(m, "GET") == 1) { return 1; }
+    if (util_streq_ci(m, "HEAD") == 1) { return 1; }
+    if (util_streq_ci(m, "OPTIONS") == 1) { return 1; }
+    if (util_streq_ci(m, "TRACE") == 1) { return 1; }
+    if (util_streq_ci(m, "PUT") == 1) { return 1; }
+    if (util_streq_ci(m, "DELETE") == 1) { return 1; }
+    return 0;
+}
+

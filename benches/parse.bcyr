@@ -1,0 +1,172 @@
+# whirl parse benchmarks — the pure, per-response CPU paths.
+#
+# Everything a fetch does that is not waiting on the network: URL parse, request
+# build, header lookup, the "has the whole response arrived" check, chunked
+# decode, link extraction, path normalization and robots.txt. Network latency
+# (milliseconds) dwarfs all of these (nanoseconds to microseconds), so these
+# rows exist to catch a parser turning pathological, not to chase nanoseconds.
+# The completeness check matters most: the read loop calls it after EVERY recv.
+#
+#   cyrius bench benches/
+
+# bench is a [test] stdlib leaf; included by name as well so an editor that
+# compiles this file standalone resolves bench_* (includes are once-only).
+include "lib/bench.cyr"
+include "src/version.cyr"
+include "src/util.cyr"
+include "src/url.cyr"
+include "src/http.cyr"
+include "src/links.cyr"
+include "src/crawl.cyr"
+
+var _b_u = 0;          # URL struct
+var _b_req = 0;        # request buffer
+var _b_hdrs = 0;       # two -H headers
+var _b_cl = 0;         # 64 KiB Content-Length response
+var _b_cll = 0;
+var _b_ck = 0;         # chunked response: 4096 one-byte chunks
+var _b_ckl = 0;
+var _b_ckbo = 0;
+var _b_out = 0;        # dechunk output
+var _b_html = 0;       # ~64 KiB page with 64 links
+var _b_htmll = 0;
+var _b_links = 0;
+var _b_robots = 0;
+var _b_robotsl = 0;
+var _b_rules = 0;
+var _b_rflags = 0;
+var _b_nrules = 0;
+
+# Append cstr `s` at buf+pos. Returns the new pos.
+fn _b_cat(buf, pos, s): i64 {
+    var i = 0;
+    while (load8(s + i) != 0) { store8(buf + pos, load8(s + i)); pos = pos + 1; i = i + 1; }
+    return pos;
+}
+
+# Build a 64 KiB Content-Length response into a fresh buffer. Returns it.
+fn _b_mk_cl(): i64 {
+    var buf = alloc(70000);
+    var p = _b_cat(buf, 0, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 65536\r\n\r\n");
+    var i = 0;
+    while (i < 65536) { store8(buf + p + i, 97); i = i + 1; }
+    _b_cll = p + 65536;
+    return buf;
+}
+
+# Build a chunked response of 4096 one-byte chunks: the shape that makes the
+# completeness walk do the most work per byte. Returns it.
+fn _b_mk_chunked(): i64 {
+    var buf = alloc(4096 * 6 + 256);
+    var p = _b_cat(buf, 0, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+    _b_ckbo = p;
+    var i = 0;
+    while (i < 4096) { p = _b_cat(buf, p, "1\r\nx\r\n"); i = i + 1; }
+    p = _b_cat(buf, p, "0\r\n\r\n");
+    _b_ckl = p;
+    return buf;
+}
+
+# Build a ~64 KiB page carrying 64 links among filler. Returns it.
+fn _b_mk_html(): i64 {
+    var buf = alloc(70000);
+    var p = _b_cat(buf, 0, "<html><body>");
+    var i = 0;
+    while (i < 64) {
+        var k = 0;
+        while (k < 1000) { store8(buf + p, 120); p = p + 1; k = k + 1; }
+        p = _b_cat(buf, p, "<a href=\"/docs/page.html\">p</a>");
+        i = i + 1;
+    }
+    p = _b_cat(buf, p, "</body></html>");
+    _b_htmll = p;
+    return buf;
+}
+
+fn _bench_url_parse() { url_parse("https://example.com:8443/a/b/c.html?x=1", _b_u); return 0; }
+fn _bench_build_request() {
+    http_build_request("GET", "example.com", "/a/b/c.html", _b_hdrs, 2, 0, 0, _b_req, 4096);
+    return 0;
+}
+fn _bench_content_length() { http_content_length(_b_cl, _b_cll); return 0; }
+fn _bench_complete_cl() { http_response_complete(_b_cl, _b_cll); return 0; }
+fn _bench_complete_chunked() { http_response_complete(_b_ck, _b_ckl); return 0; }
+# The read loop's shape: one completeness call per arriving chunk, over 4096
+# one-byte chunks. Incremental is the 0.7.2 loop; stateless re-judges the whole
+# buffer each time, which is what the loop did before 0.7.2 (quadratic).
+fn _bench_feed_incremental() {
+    http_complete_reset();
+    var k = _b_ckbo + 6;
+    while (k < _b_ckl) { http_complete_feed(_b_ck, k); k = k + 6; }
+    http_complete_feed(_b_ck, _b_ckl);
+    return 0;
+}
+fn _bench_feed_stateless() {
+    var k = _b_ckbo + 6;
+    while (k < _b_ckl) { http_response_complete(_b_ck, k); k = k + 6; }
+    http_response_complete(_b_ck, _b_ckl);
+    return 0;
+}
+fn _bench_dechunk() { http_dechunk(_b_ck + _b_ckbo, _b_ckl - _b_ckbo, _b_out, 65536); return 0; }
+fn _bench_links_extract() { links_extract(_b_html, _b_htmll, _b_links, 64); return 0; }
+fn _bench_path_normalize() { links_path_normalize("/a/b/../c/./d/e/../f.html"); return 0; }
+fn _bench_tree_relpath() { tree_relpath("/docs/guide/intro.html?v=2"); return 0; }
+fn _bench_robots_parse() { _robots_parse(_b_robots, _b_robotsl, _b_rules, _b_rflags, 64); return 0; }
+fn _bench_robots_blocked() { _robots_blocked("/private/x/y.html", _b_rules, _b_rflags, _b_nrules); return 0; }
+
+# Runs every row and prints the report. Exits 0, or 1 if a fixture does not parse.
+fn main() {
+    alloc_init();
+    _b_u = url_new();
+    _b_req = alloc(4096);
+    _b_hdrs = alloc(16);
+    store64(_b_hdrs, "Accept-Language: en");
+    store64(_b_hdrs + 8, "X-Trace: 1");
+    _b_cl = _b_mk_cl();
+    _b_ck = _b_mk_chunked();
+    _b_out = alloc(65536);
+    _b_html = _b_mk_html();
+    _b_links = alloc(64 * 8);
+    _b_robots = util_concat2("User-agent: *\nDisallow: /private/\nAllow: /private/pub/\nDisallow: /tmp\n",
+      "\nUser-agent: other\nDisallow: /\n");
+    _b_robotsl = strlen(_b_robots);
+    _b_rules = alloc(64 * 8);
+    _b_rflags = alloc(64 * 8);
+    _b_nrules = _robots_parse(_b_robots, _b_robotsl, _b_rules, _b_rflags, 64);
+
+    if (http_response_complete(_b_cl, _b_cll) != 1) { println("bench setup: CL fixture incomplete"); return 1; }
+    if (http_response_complete(_b_ck, _b_ckl) != 1) { println("bench setup: chunked fixture incomplete"); return 1; }
+    if (links_extract(_b_html, _b_htmll, _b_links, 64) != 64) { println("bench setup: html fixture"); return 1; }
+    if (_b_nrules != 3) { println("bench setup: robots fixture"); return 1; }
+
+    var b = bench_new("url_parse");
+    bench_run(b, &_bench_url_parse, 20000); bench_report(b);
+    b = bench_new("http_build_request (GET, 2 headers)");
+    bench_run(b, &_bench_build_request, 20000); bench_report(b);
+    b = bench_new("http_content_length");
+    bench_run(b, &_bench_content_length, 20000); bench_report(b);
+    b = bench_new("http_response_complete (64 KiB, Content-Length)");
+    bench_run(b, &_bench_complete_cl, 20000); bench_report(b);
+    b = bench_new("http_response_complete (4096 one-byte chunks)");
+    bench_run(b, &_bench_complete_chunked, 2000); bench_report(b);
+    b = bench_new("read loop: incremental check, 4096 calls (0.7.2)");
+    bench_run(b, &_bench_feed_incremental, 20); bench_report(b);
+    b = bench_new("read loop: stateless check, 4096 calls (pre-0.7.2 shape)");
+    bench_run(b, &_bench_feed_stateless, 3); bench_report(b);
+    b = bench_new("http_dechunk (4096 one-byte chunks)");
+    bench_run(b, &_bench_dechunk, 2000); bench_report(b);
+    b = bench_new("links_extract (64 KiB page, 64 links)");
+    bench_run(b, &_bench_links_extract, 200); bench_report(b);
+    b = bench_new("links_path_normalize");
+    bench_run(b, &_bench_path_normalize, 20000); bench_report(b);
+    b = bench_new("tree_relpath");
+    bench_run(b, &_bench_tree_relpath, 20000); bench_report(b);
+    b = bench_new("robots_parse (2 groups, 4 rules)");
+    bench_run(b, &_bench_robots_parse, 20000); bench_report(b);
+    b = bench_new("robots_blocked");
+    bench_run(b, &_bench_robots_blocked, 20000); bench_report(b);
+    return 0;
+}
+
+var exit_code = main();
+syscall(SYS_EXIT, exit_code);

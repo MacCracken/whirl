@@ -28,13 +28,25 @@ var O_NOFOLLOW = 32768;
 var O_NOFOLLOW = 131072;
 #endif
 
-# Write `len` bytes to stdout (outfile == 0) or to `outfile` (created/truncated).
-# Returns 0 on success, < 0 on a file error.
-fn output_write(buf, len, outfile): i64 {
-    if (outfile == 0) {
-        sys_write(1, buf, len);
-        return 0;
+# Write all `len` bytes of buf to fd, looping over short writes. Returns 0, or < 0
+# when a write fails or makes no progress.
+fn _output_write_fd(fd, buf, len): i64 {
+    var off = 0;
+    while (off < len) {
+        var w = sys_write(fd, buf + off, len - off);
+        if (w < 0) { return w; }
+        if (w == 0) { return 0 - 5; }        # no progress: -EIO, as io.cyr's loop
+        off = off + w;
     }
+    return 0;
+}
+
+# Write `len` bytes to stdout (outfile == 0) or to `outfile` (created/truncated).
+# Returns 0 on success, < 0 on a write error. 0.7.2: stdout was one unchecked
+# write, so `whirl URL > /dev/full` (or a full disk) exited 0 having written
+# nothing; it now fails like `-o` does.
+fn output_write(buf, len, outfile): i64 {
+    if (outfile == 0) { return _output_write_fd(1, buf, len); }
     var r = file_write_all(outfile, buf, len);
     if (r < 0) { return r; }
     return 0;
@@ -46,12 +58,12 @@ fn output_write(buf, len, outfile): i64 {
 # (≤1 MB resume cap there — fine for the MVP).
 fn output_append(buf, len, outfile): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
+    # Looped since 0.7.2: one write, and a short one counted as success.
     var fd = sys_open(outfile, O_WRONLY | O_APPEND | O_CREAT, 420);   # 0644
     if (fd < 0) { return fd; }
-    var w = sys_write(fd, buf, len);
+    var w = _output_write_fd(fd, buf, len);
     sys_close(fd);
-    if (w < 0) { return w; }
-    return 0;
+    return w;
     #endif
     #ifdef CYRIUS_TARGET_AGNOS
     # Read-modify-write, because the frozen agnos FS surface has no O_APPEND.
@@ -161,10 +173,10 @@ fn fs_write_no_follow(path, buf, len): i64 {
 # wrong: it was true only of stat#33, and the kernel had already shipped the
 # no-follow primitive that answers it.
 #
-# A pre-write lstat is also TOCTOU-racy against an attacker who can create the
-# link between the check and the open. Closing that needs O_NOFOLLOW on the
-# write itself, which means bypassing file_write_all — out of scope here. This
-# still removes the whole class of pre-planted-symlink cases.
+# A pre-write check is TOCTOU-racy against an attacker who can create the link
+# between the check and the open. On Linux fs_write_no_follow closes that with
+# O_NOFOLLOW and never calls this; the Linux arm remains for tests/agnos_probe.cyr's
+# host build. On agnos it is the best available (roadmap B2).
 fn fs_is_symlink(path): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     var sb = xalloc(STAT_BUFSZ);

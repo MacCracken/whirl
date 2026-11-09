@@ -1,0 +1,287 @@
+# whirl — `-r`: the I/O half of the recursive fetch.
+#
+# crawl.cyr holds the pure half (link resolution, path confinement, robots.txt
+# parsing), where tests/whirl.tcyr can reach it. This module fetches, loads
+# robots.txt, and writes the mirror. Carved out of main.cyr at 0.7.2.
+#
+# Include after transport.cyr and output.cyr.
+
+var MIRROR_MAX = 64;            # resources FETCHED per crawl
+var MIRROR_LINKS_MAX = 64;      # links taken from one page
+var MIRROR_REQ_MAX = 4096;      # request buffer (path + headers)
+var ROBOTS_RULES_MAX = 256;
+var ROBOTS_BODY_MAX = 524288;   # RFC 9309 §2.5: parse at least 500 KiB
+var ROBOTS_MAX_HOPS = 5;        # RFC 9309 §2.3.1.2: follow at least five redirects
+var ROBOTS_DISALLOW_ALL = 0 - 1;
+
+# mkdir; EEXIST ignored by the caller. The two targets' sys_mkdir signatures
+# differ (Linux (path, mode) vs agnos (path, pathlen)), so branch on the target.
+fn _mkdir(path): i64 {
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_mkdir(path, 493);   # 0755
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_mkdir(path, strlen(path));
+    #endif
+}
+
+# The file the last successful _mirror_save wrote ("host/docs/g.html").
+var _mirror_last = 0;
+
+# Save buf[0..len) under `dir`, mirroring URL `path`: "/docs/g.html" ->
+# dir/docs/g.html, creating dir and dir/docs. Returns 0, or < 0 when the path is
+# unsafe (tree_relpath) or the write failed.
+fn _mirror_save(dir, path, buf, len): i64 {
+    var rp = tree_relpath(path);
+    if (rp == 0) { return 0 - 1; }
+    var full = util_concat2(util_concat2(dir, "/"), rp);
+    var w = strlen(full);
+    var j = 0;
+    while (j < w) {
+        if (load8(full + j) == 47) {
+            store8(full + j, 0);
+            _mkdir(full);
+            store8(full + j, 47);
+        }
+        j = j + 1;
+    }
+    # The symlink refusal is inside the write (O_NOFOLLOW on Linux), not a
+    # separate pre-check: that ordering was the TOCTOU window.
+    var wr = fs_write_no_follow(full, buf, len);
+    if (wr < 0) { return wr; }
+    _mirror_last = full;
+    return 0;
+}
+
+# Print "whirl: <what><url>\n", the URL escaped (util_eputs_safe).
+fn _mirror_note(what, url): i64 {
+    _eputs("whirl: ");
+    _eputs(what);
+    util_eputs_safe(url);
+    _eputs("\n");
+    return 0;
+}
+
+# Fetch the origin's robots.txt and parse it into rules/flags. Returns the rule
+# count, or ROBOTS_DISALLOW_ALL. RFC 9309 §2.3.1: a 2xx is parsed; a 4xx means
+# no robots.txt, so no restrictions; a 5xx, or no answer at all, means COMPLETE
+# disallow; a redirect is followed for up to five hops, then treated as absent.
+#
+# 0.7.2: every failure used to mean "no rules", which fails open. A chunked
+# robots.txt was parsed together with its chunk framing, so a chunk boundary
+# could split a Disallow line. A redirect ended the lookup with no rules. And the
+# fetch stopped at 64 KiB.
+fn _robots_load(host, is_https, port, rules, flags, rulesmax): i64 {
+    var rbuf = xalloc(ROBOTS_BODY_MAX);
+    var req = xalloc(MIRROR_REQ_MAX);
+    var bodyp = xalloc(8);
+    var h = host;
+    var https = is_https;
+    var pt = port;
+    var path = "/robots.txt";
+    var hops = 0;
+    http_set_no_body(0);
+    while (1 == 1) {
+        var reqlen = http_build_get(_authority(h, https, pt), path, req, MIRROR_REQ_MAX);
+        if (reqlen < 0) { return ROBOTS_DISALLOW_ALL; }
+        var total = transport_fetch_retry(https, h, pt, req, reqlen, rbuf, ROBOTS_BODY_MAX, cli_retries(), 1);
+        if (total <= 0) { return ROBOTS_DISALLOW_ALL; }           # unreachable
+        var st = http_status_code(rbuf, total);
+        if ((st >= 300) && (st < 400) && (st != 304)) {
+            hops = hops + 1;
+            if (hops > ROBOTS_MAX_HOPS) { return 0; }
+            var loc = http_header_dup(rbuf, total, "location");
+            if (loc == 0) { return 0; }
+            var target = _abs_location(loc, https, h, pt, path);
+            var u = url_new();
+            if (target == 0) { return 0; }
+            if (url_parse(target, u) != URL_PARSE_OK) { return 0; }
+            h = url_host(u);
+            https = url_is_https(u);
+            pt = url_port(u);
+            path = url_path(u);
+            continue;
+        }
+        if ((st >= 400) && (st < 500)) { return 0; }              # absent: no rules
+        if ((st < 200) || (st >= 300)) { return ROBOTS_DISALLOW_ALL; }
+        # Cut short by the connection: rules may be missing, so fail closed. Cut
+        # at the buffer (a robots.txt over 512 KiB): RFC 9309 lets a crawler
+        # parse the first 500 KiB and ignore the rest.
+        if (http_response_truncated(rbuf, total, transport_incomplete()) == 1) {
+            if (total < ROBOTS_BODY_MAX) { return ROBOTS_DISALLOW_ALL; }
+        }
+        var n = http_decode_body(rbuf, total, util_scratch(), WHIRL_RBUF_SZ, bodyp);
+        if (n < 0) { return ROBOTS_DISALLOW_ALL; }
+        return _robots_parse(load64(bodyp), n, rules, flags, rulesmax);
+    }
+    return 0;
+}
+
+# Recursive same-origin fetch from `start_url`, mirrored under ./<host>[:port]/
+# (tree_host_dir). BFS, depth-bounded, capped at MIRROR_MAX fetches. Returns the
+# exit code: 0 when every fetched resource was saved, 9 when anything failed or
+# nothing was saved, 2 when the host cannot name a safe directory.
+#
+# 0.7.2 changes, beyond the per-host directory:
+#   - links are filtered (origin, robots.txt, unsafe or hidden path) and
+#     de-duplicated BEFORE they are queued, so the cap counts fetches. It counted
+#     queue entries: duplicates and off-origin links used up slots, and one run
+#     reported "crawl cap reached (64 resources)" after saving 5 files;
+#   - the exit code reflects the crawl (it was always 0, even when the start URL
+#     was refused);
+#   - -H headers are sent (every request is same-origin, so credentials only go
+#     where the caller sent them) and --retry applies;
+#   - one decode buffer and one request buffer serve the whole crawl.
+fn mirror_crawl(start_url, base_host, base_https, base_port, maxdepth): i64 {
+    var dir = tree_host_dir(base_host, base_https, base_port);
+    if (dir == 0) {
+        _mirror_note("cannot mirror into a directory named after host ", base_host);
+        return 2;
+    }
+    var pfx = "http://";
+    if (base_https == 1) { pfx = "https://"; }
+    var origin = util_concat2(pfx, _authority(base_host, base_https, base_port));
+
+    var queue  = xalloc(MIRROR_MAX * 8);   # every URL ever queued (the de-dup set)
+    var qdepth = xalloc(MIRROR_MAX * 8);
+    var qhead = 0;
+    var qtail = 0;
+    var rbuf = xalloc(WHIRL_RBUF_SZ);
+    var req = xalloc(MIRROR_REQ_MAX);
+    var links = xalloc(MIRROR_LINKS_MAX * 8);
+    var bodyp = xalloc(8);
+    var rules = xalloc(ROBOTS_RULES_MAX * 8);
+    var rflags = xalloc(ROBOTS_RULES_MAX * 8);
+    var nrules = _robots_load(base_host, base_https, base_port, rules, rflags, ROBOTS_RULES_MAX);
+    if (nrules == ROBOTS_DISALLOW_ALL) {
+        _eputs("whirl: robots.txt is unreachable or failing; RFC 9309 treats the site as disallowed\n");
+        return 9;
+    }
+    if (robots_dropped() > 0) {
+        _eputs("whirl: robots.txt has more rules than whirl keeps (");
+        _eput_int(ROBOTS_RULES_MAX);
+        _eputs("); ");
+        _eput_int(robots_dropped());
+        _eputs(" ignored\n");
+    }
+    http_set_no_body(0);                 # -r always GETs, whatever -I said
+
+    var su = url_new();
+    if (url_parse(start_url, su) != URL_PARSE_OK) { return 2; }
+    store64(queue, util_concat2(origin, url_path(su)));
+    store64(qdepth, 0);
+    qtail = 1;
+
+    var saved = 0;
+    var failed = 0;
+    var capped = 0;      # links dropped because the fetch cap was reached
+    var uncrawled = 0;   # links past the per-page extractor limit
+    while (qhead < qtail) {
+        var url = load64(queue + qhead * 8);
+        var depth = load64(qdepth + qhead * 8);
+        qhead = qhead + 1;
+        var u = url_new();
+        if (url_parse(url, u) != URL_PARSE_OK) { failed = failed + 1; continue; }
+        var path = url_path(u);
+        # Only the start URL can still be refused here: links were filtered
+        # before they were queued.
+        if (_robots_blocked(path, rules, rflags, nrules) == 1) { _mirror_note("robots blocked ", url); continue; }
+        if (tree_relpath(path) == 0) { _mirror_note("unsafe or hidden path, skipped ", url); continue; }
+
+        var reqlen = http_build_request("GET", _authority(base_host, base_https, base_port), path,
+          cli_hdrs(), cli_nhdrs(), 0, 0, req, MIRROR_REQ_MAX);
+        if (reqlen < 0) { _mirror_note("request too large, skipped ", url); failed = failed + 1; continue; }
+        var total = transport_fetch_retry(base_https, base_host, base_port, req, reqlen,
+          rbuf, WHIRL_RBUF_SZ, cli_retries(), 1);
+        if (total <= 0) {
+            _eputs("whirl: ");
+            _eputs(transport_strerror(total));
+            _mirror_note(": ", url);
+            failed = failed + 1;
+            continue;
+        }
+        if (http_response_truncated(rbuf, total, transport_incomplete()) == 1) {
+            _mirror_note("incomplete, skipped ", url);
+            failed = failed + 1;
+            continue;
+        }
+        # Only mirror what was actually served. A redirect is not followed by -r
+        # (roadmap) and is not a failure; any other non-2xx is.
+        var st = http_status_code(rbuf, total);
+        if ((st >= 300) && (st < 400)) {
+            _eputs("whirl: HTTP "); _eput_int(st);
+            _mirror_note(" redirect not followed by -r: ", url);
+            continue;
+        }
+        if ((st < 200) || (st >= 300)) {
+            _eputs("whirl: HTTP "); _eput_int(st);
+            _mirror_note(", skipped ", url);
+            failed = failed + 1;
+            continue;
+        }
+        var n = http_decode_body(rbuf, total, util_scratch(), WHIRL_RBUF_SZ, bodyp);
+        if (n < 0) { _mirror_note("malformed chunked body, skipped ", url); failed = failed + 1; continue; }
+        var body = load64(bodyp);
+        if (_mirror_save(dir, path, body, n) < 0) {
+            _mirror_note("unwritable path (or a symlink in the way), skipped ", url);
+            failed = failed + 1;
+            continue;
+        }
+        saved = saved + 1;
+        _mirror_note("saved ", _mirror_last);
+
+        if (depth < maxdepth) {
+            var nl = links_extract(body, n, links, MIRROR_LINKS_MAX);
+            if (links_found() > nl) { uncrawled = uncrawled + (links_found() - nl); }
+            var k = 0;
+            while (k < nl) {
+                var resolved = _resolve_link(load64(links + k * 8), base_https, base_host, base_port, path);
+                k = k + 1;
+                if (resolved == 0) { continue; }
+                var u2 = url_new();
+                if (url_parse(resolved, u2) != URL_PARSE_OK) { continue; }
+                # Confined to the starting ORIGIN (scheme, host and port), not the
+                # host alone: a same-host http:// link would downgrade an https
+                # crawl, and :8443 must not wander onto :80.
+                if (_same_origin(base_https, base_host, base_port, u2) == 0) {
+                    if (util_streq_ci(url_host(u2), base_host) == 1) {
+                        if (url_is_https(u2) != base_https) { _mirror_note("cross-scheme link, skipped ", resolved); }
+                        else { _mirror_note("cross-port link, skipped ", resolved); }
+                    }
+                    continue;
+                }
+                var p2 = url_path(u2);
+                if (_robots_blocked(p2, rules, rflags, nrules) == 1) {
+                    _mirror_note("robots blocked ", resolved);
+                    continue;
+                }
+                if (tree_relpath(p2) == 0) { _mirror_note("unsafe or hidden path, skipped ", resolved); continue; }
+                var canon = util_concat2(origin, p2);   # one spelling per resource
+                if (_seen(queue, qtail, canon) == 1) { continue; }
+                if (qtail < MIRROR_MAX) {
+                    store64(queue + qtail * 8, canon);
+                    store64(qdepth + qtail * 8, depth + 1);
+                    qtail = qtail + 1;
+                } else {
+                    capped = capped + 1;
+                }
+            }
+        }
+    }
+    if (capped > 0) {
+        _eputs("whirl: crawl cap reached (");
+        _eput_int(MIRROR_MAX);
+        _eputs(" resources) — ");
+        _eput_int(capped);
+        _eputs(" link(s) not followed\n");
+    }
+    if (uncrawled > 0) {
+        _eputs("whirl: ");
+        _eput_int(uncrawled);
+        _eputs(" link(s) past the ");
+        _eput_int(MIRROR_LINKS_MAX);
+        _eputs("-per-page extractor limit were not seen\n");
+    }
+    if ((saved == 0) || (failed > 0)) { return 9; }
+    return 0;
+}

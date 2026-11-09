@@ -26,6 +26,24 @@ fn xalloc(n): i64 {
     return p;
 }
 
+# --- shared limits ---
+
+# Response cap: the receive buffer, and the most a chunked body may decode to.
+# 256 KB truncated real pages silently (github.com's 575 KB chunked body was the
+# reported case). A body that still exceeds 1 MiB is reported, never silently cut
+# (http_response_truncated).
+var WHIRL_RBUF_SZ = 1048576;
+
+# The one buffer a chunked body is decoded into (WHIRL_RBUF_SZ bytes), allocated
+# on first use. Before 0.7.2, `-r` allocated a fresh 1 MiB for EVERY chunked page
+# on an allocator that never frees: 68.5 MB of heap for a 61-page crawl.
+var _util_scratch = 0;
+# The shared decode buffer, allocated on first call.
+fn util_scratch(): i64 {
+    if (_util_scratch == 0) { _util_scratch = xalloc(WHIRL_RBUF_SZ); }
+    return _util_scratch;
+}
+
 # --- string helpers ---
 
 # Does cstr `s` start with cstr `pfx`?
@@ -50,6 +68,57 @@ fn util_has_prefix_ci(s, pfx): i64 {
         i = i + 1;
     }
     return 1;
+}
+
+# Does lowercase literal `lit` match buf[off..), ASCII-case-insensitively, without
+# reading at or past `len`? The one bounded case-insensitive matcher: http, links
+# and robots each carried their own copy until 0.7.2.
+fn util_match_ci(buf, off, len, lit): i64 {
+    var j = 0;
+    while (load8(lit + j) != 0) {
+        if (off + j >= len) { return 0; }
+        var c = load8(buf + off + j);
+        if ((c >= 65) && (c <= 90)) { c = c + 32; }
+        if (c != load8(lit + j)) { return 0; }
+        j = j + 1;
+    }
+    return 1;
+}
+
+# --- output to a terminal ---
+
+# Plain writes to stdout / stderr through the portable sys_write wrapper (raw
+# syscall numbers differ on agnos). Moved here from main.cyr at 0.7.2 so every
+# module can report without depending on main.
+fn _puts(s): i64  { sys_write(1, s, strlen(s)); return 0; }
+fn _eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
+# Write `n` in decimal to stderr.
+fn _eput_int(n): i64 {
+    var b[24];
+    var len = fmt_int_buf(n, &b);
+    sys_write(2, &b, len);
+    return 0;
+}
+
+# Write cstr `s` to stderr with every C0 control byte and DEL shown as '?'.
+# For anything a SERVER controls (a Location value, a crawled URL): unescaped,
+# an ESC sequence in a redirect target could retitle the window, clear the
+# screen or forge lines of output. Bytes >= 0x80 pass through, so UTF-8 survives
+# (a UTF-8 terminal does not act on a lone C1 byte). Same rule as dig and cmdit.
+fn util_eputs_safe(s): i64 {
+    var start = 0;
+    var i = 0;
+    while (load8(s + i) != 0) {
+        var c = load8(s + i);
+        if ((c < 32) || (c == 127)) {
+            if (i > start) { sys_write(2, s + start, i - start); }
+            sys_write(2, "?", 1);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (i > start) { sys_write(2, s + start, i - start); }
+    return 0;
 }
 
 # Whole-string ASCII-case-insensitive equality.

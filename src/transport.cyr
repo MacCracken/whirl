@@ -1,9 +1,10 @@
-# whirl — transport: resolve + TCP connect + send + recv (plain HTTP).
+# whirl — transport: resolve + TCP connect + send + recv, plain or over TLS.
 #
 # Composes the taar substrate: taar_resolve_ipv4 (DNS over UDP-53) + taar's TCP
 # socket primitives (taar_tcp_open / connect / send / recv / close). Sovereign,
-# raw-syscall — no lib/net.cyr. HTTPS (the tls_native wrap over this socket) is
-# the next bite.
+# raw-syscall — no lib/net.cyr. HTTPS wraps the same socket in TLS: the lib/tls.cyr
+# facade on Linux, tls_native directly on AGNOS (static binaries cannot use the
+# libssl bridge).
 #
 # taar is included via lib/taar.cyr (the [deps.taar] dist bundle).
 
@@ -64,6 +65,7 @@ var _TRANSPORT_READ_TLS  = 1;
 fn _transport_read_all(mode, handle, rbuf, rbufmax): i64 {
     var total = 0;
     var go = 1;
+    http_complete_reset();
     while (go == 1) {
         if (total >= rbufmax) { _transport_incomplete = 1; go = 0; }   # rbuf full — more may follow
         else {
@@ -78,11 +80,36 @@ fn _transport_read_all(mode, handle, rbuf, rbufmax): i64 {
                 # Reading on for a peer close we do not need cost a full receive
                 # deadline per fetch on AGNOS (where the close is not surfaced
                 # promptly) and one wasted syscall per fetch on Linux.
-                if (http_response_complete(rbuf, total) == 1) { go = 0; }
+                # Incremental (0.7.2): each call resumes where the last stopped.
+                if (http_complete_feed(rbuf, total) == 1) { go = 0; }
             }
         }
     }
+    # Drop any interim 1xx responses (103 Early Hints) ahead of the final one, so
+    # every parser after this sees the final response at offset 0.
+    var base = http_complete_base();
+    if ((base > 0) && (base <= total)) {
+        var k = 0;
+        while (k < total - base) { store8(rbuf + k, load8(rbuf + base + k)); k = k + 1; }
+        total = total - base;
+    }
     return total;
+}
+
+# Open a TCP socket to ip:port with whirl's 10 s deadline, which since taar 0.6.2
+# bounds the connect and every send as well as every recv. Returns the fd, or a
+# TRANSPORT_ERR_*. 0.7.2 checks that the deadline was SET: without it a stalled
+# peer blocks forever, so a socket that will not take one is refused.
+var TRANSPORT_TIMEOUT_MS = 10000;
+fn _transport_connect(ip, port): i64 {
+    var fd = taar_tcp_open();
+    if (fd < 0) { return TRANSPORT_ERR_SOCKET; }
+    if (taar_tcp_set_timeout_ms(fd, TRANSPORT_TIMEOUT_MS) < 0) {
+        taar_sock_close(fd);
+        return TRANSPORT_ERR_SOCKET;
+    }
+    if (taar_tcp_connect(fd, ip, port) < 0) { taar_sock_close(fd); return TRANSPORT_ERR_CONNECT; }
+    return fd;
 }
 
 # Resolve `host` (cstr), open a TCP connection to host:port, send `req`, and read
@@ -93,12 +120,8 @@ fn transport_fetch(host, port, req, reqlen, rbuf, rbufmax): i64 {
     var ip = taar_resolve_ipv4(host);
     if (ip < 0) { return TRANSPORT_ERR_RESOLVE; }
 
-    var fd = taar_tcp_open();
-    if (fd < 0) { return TRANSPORT_ERR_SOCKET; }
-    taar_tcp_set_timeout_ms(fd, 10000);   # bound a stalled/keep-alive recv
-
-    var cr = taar_tcp_connect(fd, ip, port);
-    if (cr < 0) { taar_sock_close(fd); return TRANSPORT_ERR_CONNECT; }
+    var fd = _transport_connect(ip, port);
+    if (fd < 0) { return fd; }
 
     if (_transport_send_all(fd, req, reqlen) < 0) {
         taar_sock_close(fd);
@@ -142,8 +165,9 @@ fn _agnos_ca_install(nctx): i64 {
 # directly instead: new_client (defaults to TLS_VERIFY_PEER) → system CA roots →
 # handshake over taar's socket (transport installed by caller).
 # Returns a facade-shaped native shim ctx [nctx@0, 0@8, sock@16, NATIVE@24] so the
-# shared tls_read/tls_write/tls_close below route to the native backend (they
-# dispatch on _tls_backend==1 and never touch fdlopen). 0 on any failure.
+# shared tls_read/tls_write/tls_close below route to the native backend. They
+# dispatch per ctx (a 0 at +8 marks a native shim, lib/tls.cyr _tls_shim_native)
+# and never touch fdlopen. 0 on any failure.
 fn _agnos_tls_native_connect(fd, host): i64 {
     var hl = 0;
     while (load8(host + hl) != 0) { hl = hl + 1; }
@@ -174,12 +198,8 @@ fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
     var ip = taar_resolve_ipv4(host);
     if (ip < 0) { return TRANSPORT_ERR_RESOLVE; }
 
-    var fd = taar_tcp_open();
-    if (fd < 0) { return TRANSPORT_ERR_SOCKET; }
-    taar_tcp_set_timeout_ms(fd, 10000);
-
-    var cr = taar_tcp_connect(fd, ip, port);
-    if (cr < 0) { taar_sock_close(fd); return TRANSPORT_ERR_CONNECT; }
+    var fd = _transport_connect(ip, port);
+    if (fd < 0) { return fd; }
 
     #ifdef CYRIUS_TARGET_AGNOS
     # taar's agnos TCP "fd" is a sentinel — the real conn_id lives in a taar
@@ -211,3 +231,50 @@ fn transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax): i64 {
     taar_sock_close(fd);
     return total;
 }
+
+# Fetch over TLS when `is_https` is 1, else plain. The single dispatch point: the
+# fetch loop, the crawl and the robots.txt fetch each carried a copy before 0.7.2.
+fn transport_fetch_url(is_https, host, port, req, reqlen, rbuf, rbufmax): i64 {
+    if (is_https == 1) { return transport_fetch_tls(host, port, req, reqlen, rbuf, rbufmax); }
+    return transport_fetch(host, port, req, reqlen, rbuf, rbufmax);
+}
+
+# Fetch, retrying up to `retries` times with linear backoff (200 ms × attempt).
+# Retried: a failure before the request was fully sent (resolve, socket, connect,
+# send), and, for an idempotent method, an empty response. NOT retried (0.7.2):
+#   - a TLS failure: a certificate that failed verification fails the same way
+#     every time (curl does not retry it either); each refusal under
+#     `--retry 3` took ~1.2 s;
+#   - a non-idempotent request (POST) once it was sent: the server may have acted
+#     on it, and a consumed POST was sent 4 times under `--retry 3`.
+# Returns transport_fetch_url's result for the last attempt.
+var TRANSPORT_RETRY_BACKOFF_MS = 200;
+# Fetch with the retry policy above. Returns the last attempt's result.
+fn transport_fetch_retry(is_https, host, port, req, reqlen, rbuf, rbufmax, retries, idempotent): i64 {
+    var attempt = 0;
+    var total = 0 - 1;
+    while (attempt <= retries) {
+        total = transport_fetch_url(is_https, host, port, req, reqlen, rbuf, rbufmax);
+        if (total > 0) { return total; }
+        var again = 0;
+        if ((total == TRANSPORT_ERR_RESOLVE) || (total == TRANSPORT_ERR_SOCKET)
+            || (total == TRANSPORT_ERR_CONNECT) || (total == TRANSPORT_ERR_SEND)) { again = 1; }
+        elif ((total == 0) && (idempotent == 1)) { again = 1; }
+        if (again == 0) { return total; }
+        attempt = attempt + 1;
+        if (attempt <= retries) { sleep_ms(TRANSPORT_RETRY_BACKOFF_MS * attempt); }
+    }
+    return total;
+}
+
+# A one-line reason for a failed fetch (`total` <= 0), for the error message.
+# 0.7.2: every failure read "connection failed", so a DNS failure (more likely
+# since taar 0.6.2's fail-closed resolv.conf) looked like a refused connection.
+fn transport_strerror(total): i64 {
+    if (total == TRANSPORT_ERR_RESOLVE) { return "could not resolve host"; }
+    if (total == TRANSPORT_ERR_TLS) { return "TLS failed (handshake or certificate verification)"; }
+    if (total == TRANSPORT_ERR_SEND) { return "connection failed while sending"; }
+    if (total == 0) { return "empty response"; }
+    return "connection failed";
+}
+

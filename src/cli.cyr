@@ -1,6 +1,8 @@
 # whirl — CLI argument parsing.
 #
-#   whirl [-X METHOD] [-d DATA] [-H 'Header: val']... [-o FILE] [-L] [-h] <url>
+#   whirl [-X M] [-d DATA|@file|@-] [--data-binary D] [-H 'H: v']... [-A UA]
+#         [-i] [-I] [-f] [-L] [--retry N] [-o FILE | -O] [-C] [-r [-l N]] <url>
+#   (`whirl -h` prints the full list)
 #
 # Module globals hold the parsed result (single-shot CLI). Stdlib auto-included.
 
@@ -46,33 +48,11 @@ fn _cli_atoi(s): i64 {
     return v;
 }
 
-# Read all of stdin (fd) into a fresh buffer (≤256 KB). Returns buf, sets
-# _cli_bodylen. `sys_read` is the portable wrapper (correct on Linux + agnos).
-fn _cli_read_fd(fd): i64 {
-    var cap = 262144;
-    var buf = xalloc(cap);
-    var total = 0;
-    var go = 1;
-    while (go == 1) {
-        var n = sys_read(fd, buf + total, cap - total);
-        if (n <= 0) { go = 0; }
-        else {
-            total = total + n;
-            if (total >= cap) { go = 0; }
-        }
-    }
-    _cli_bodylen = total;
-    return buf;
-}
-
-# Resolve a -d value: "@file" reads the file, "@-" reads stdin, else literal.
-# Returns the body cstr/buffer and sets _cli_bodylen. `file_read_all` (io) is
-# portable open+read+close across Linux / agnos.
-# Set when a -d/--data-binary body could not be loaded: 1 = file unreadable,
-# 2 = file larger than the cap. Both used to be silent — a missing @file
-# downgraded the request to a bodyless GET, and an oversized one was truncated
-# and sent under a Content-Length that matched the TRUNCATED length, so the
-# server stored a short body and everyone reported success.
+# Set when a -d/--data-binary body could not be loaded: 1 = unreadable (a missing
+# @file, or a read error), 2 = larger than the cap. Both used to be silent — a
+# missing @file downgraded the request to a bodyless GET, and an oversized one was
+# truncated and sent under a Content-Length that matched the TRUNCATED length, so
+# the server stored a short body and everyone reported success.
 var CLI_BODY_OK      = 0;
 var CLI_BODY_ENOENT  = 1;
 var CLI_BODY_TOOBIG  = 2;
@@ -80,7 +60,38 @@ var _cli_bodyerr = 0;
 # Why the last -d/--data-binary body failed to load: a CLI_BODY_* value.
 fn cli_bodyerr(): i64 { return _cli_bodyerr; }
 
-var _CLI_BODY_MAX = 1048576;   # 1 MiB request-body cap
+var CLI_BODY_MAX = 1048576;   # 1 MiB request-body cap, for @file and @- alike
+
+# Read all of stdin (fd) for `-d @-`. Returns the buffer and sets _cli_bodylen, or
+# returns 0 with _cli_bodyerr set. `sys_read` is the portable wrapper.
+#
+# 0.7.2: the same cap and the same refusal as @file. This path read at most
+# 256 KiB and stopped there with no error, so a larger stdin body went out cut
+# short under a Content-Length matching the cut: the defect 0.6.6 fixed for
+# @file, left open on this path. A read error also ended the body as if it were
+# EOF.
+fn _cli_read_fd(fd): i64 {
+    var cap = CLI_BODY_MAX + 1;   # one byte of headroom: filling it means "too big"
+    var buf = xalloc(cap);
+    var total = 0;
+    var go = 1;
+    while (go == 1) {
+        var n = sys_read(fd, buf + total, cap - total);
+        if (n < 0) { _cli_bodyerr = CLI_BODY_ENOENT; _cli_bodylen = 0; return 0; }
+        if (n == 0) { go = 0; }
+        else {
+            total = total + n;
+            if (total >= cap) { go = 0; }
+        }
+    }
+    if (total > CLI_BODY_MAX) { _cli_bodyerr = CLI_BODY_TOOBIG; _cli_bodylen = 0; return 0; }
+    _cli_bodylen = total;
+    return buf;
+}
+
+# Resolve a -d value: "@file" reads the file, "@-" reads stdin, else literal.
+# Returns the body cstr/buffer and sets _cli_bodylen. `file_read_all` (io) is
+# portable open+read+close across Linux / agnos.
 
 fn _cli_load_data(arg): i64 {
     if (load8(arg) == 64) {   # '@'
@@ -88,10 +99,10 @@ fn _cli_load_data(arg): i64 {
         if ((load8(src) == 45) && (load8(src + 1) == 0)) { return _cli_read_fd(0); }   # @-
         # One byte of headroom: a read that fills MAX+1 means the file is larger
         # than the cap, which is an error rather than something to silently cut.
-        var buf = xalloc(_CLI_BODY_MAX + 1);
-        var n = file_read_all(src, buf, _CLI_BODY_MAX + 1);
+        var buf = xalloc(CLI_BODY_MAX + 1);
+        var n = file_read_all(src, buf, CLI_BODY_MAX + 1);
         if (n < 0) { _cli_bodyerr = CLI_BODY_ENOENT; _cli_bodylen = 0; return 0; }
-        if (n > _CLI_BODY_MAX) { _cli_bodyerr = CLI_BODY_TOOBIG; _cli_bodylen = 0; return 0; }
+        if (n > CLI_BODY_MAX) { _cli_bodyerr = CLI_BODY_TOOBIG; _cli_bodylen = 0; return 0; }
         _cli_bodylen = n;
         return buf;
     }

@@ -71,7 +71,7 @@ fn test_http_build() {
     test_group("http-build");
     var buf = alloc(256);
     var n = http_build_get("example.com", "/", buf, 256);
-    assert_eq(_http_match_ci(buf, 0, n, "get / http/1.1"), 1, "request line");
+    assert_eq(util_match_ci(buf, 0, n, "get / http/1.1"), 1, "request line");
     assert_eq(http_body_offset(buf, n), n, "request ends with CRLFCRLF");
 }
 
@@ -95,7 +95,7 @@ fn test_http_headers() {
     assert_eq(load8(r + bo), 104, "body starts at 'h'");
     var r2 = "HTTP/1.1 301 X\r\nLocation: http://dst/path\r\n\r\n";
     var lv = http_header_value(r2, strlen(r2), "location");
-    assert_eq(_http_match_ci(r2, lv, strlen(r2), "http://dst/path"), 1, "case-insensitive header name");
+    assert_eq(util_match_ci(r2, lv, strlen(r2), "http://dst/path"), 1, "case-insensitive header name");
     assert_eq(http_content_length(r2, strlen(r2)), 0 - 1, "no content-length -> -1");
 }
 
@@ -119,12 +119,12 @@ fn test_http_request_post() {
     var buf = alloc(512);
     var body = "a=1&b=2";
     var n = http_build_request("POST", "x.org", "/p", 0, 0, body, 7, buf, 512);
-    assert_eq(_http_match_ci(buf, 0, n, "post /p http/1.1"), 1, "request line = POST /p");
+    assert_eq(util_match_ci(buf, 0, n, "post /p http/1.1"), 1, "request line = POST /p");
     assert_eq(http_content_length(buf, n), 7, "content-length 7");
     var bo = http_body_offset(buf, n);
-    assert_eq(_http_match_ci(buf, bo, n, "a=1&b=2"), 1, "body follows the blank line");
+    assert_eq(util_match_ci(buf, bo, n, "a=1&b=2"), 1, "body follows the blank line");
     var ctv = http_header_value(buf, n, "content-type");
-    assert_eq(_http_match_ci(buf, ctv, n, "application/x-www-form-urlencoded"), 1, "default content-type");
+    assert_eq(util_match_ci(buf, ctv, n, "application/x-www-form-urlencoded"), 1, "default content-type");
 }
 
 # -H headers are emitted, and a caller's Content-Type replaces the default.
@@ -136,9 +136,9 @@ fn test_http_custom_headers() {
     store64(hdrs + 8, "Content-Type: application/json");
     var n = http_build_request("POST", "x.org", "/", hdrs, 2, "{}", 2, buf, 512);
     var xv = http_header_value(buf, n, "x-foo");
-    assert_eq(_http_match_ci(buf, xv, n, "bar"), 1, "custom header X-Foo present");
+    assert_eq(util_match_ci(buf, xv, n, "bar"), 1, "custom header X-Foo present");
     var ctv = http_header_value(buf, n, "content-type");
-    assert_eq(_http_match_ci(buf, ctv, n, "application/json"), 1, "caller Content-Type wins over default");
+    assert_eq(util_match_ci(buf, ctv, n, "application/json"), 1, "caller Content-Type wins over default");
 }
 
 # links_extract finds href/src in double, single and no quotes, and skips `mysrc=`.
@@ -216,8 +216,8 @@ fn test_tree_relpath() {
     # The variant that survived a single leading-slash strip as an absolute path.
     assert_eq(streq(tree_relpath("//tmp/x"), "tmp/x"), 1, "all leading slashes stripped");
     assert_eq(streq(tree_relpath("////tmp/x"), "tmp/x"), 1, "many leading slashes stripped");
-    # "..text" is a normal name, not a traversal segment.
-    assert_eq(streq(tree_relpath("/..hidden"), "..hidden"), 1, "dotdot prefix is not a segment");
+    # "..text" is not a traversal segment, but it is a hidden name, and -r refuses those.
+    assert_eq(tree_relpath("/..hidden"), 0, "a dot-leading segment is hidden: refused (0.7.2)");
 }
 
 # A non-default port must survive into the authority, or Host and every

@@ -25,7 +25,7 @@ Own the **HTTP/HTTPS transfer surface** in the AGNOS network-tools family: fetch
 
 ## Conventions
 
-- **Per-backend sovereignty**: unlike yo / dig there is **no `src/platform.cyr` split** — the dispatch is inline `#ifdef CYRIUS_TARGET_AGNOS` in `src/transport.cyr`, `src/output.cyr` and `src/main.cyr`. Sovereign syscalls on AGNOS, POSIX-via-taar on Linux.
+- **Per-backend sovereignty**: unlike yo / dig there is **no `src/platform.cyr` split** — the dispatch is inline `#ifdef CYRIUS_TARGET_AGNOS` in `src/transport.cyr`, `src/output.cyr` and `src/mirror.cyr`. Sovereign syscalls on AGNOS, POSIX-via-taar on Linux.
 - **No POSIX `socket()` on the AGNOS backend** — the v1.0 gate enforces this.
 - **`tls_native` is transport-agnostic**: wire `tls_native_set_transport(read, write, now)` over `sock_send`#48 / `sock_recv`#49 / `uptime_ms`#40 on agnos; over POSIX read/write on Linux.
 - **CI/Release toolchain install MUST use the upstream `install.sh`** (reads the `cyrius.cyml [package].cyrius` pin) — never a hand-rolled curl+cp, which fails the `cyrius deps` pin-check (it lays files in a flat `~/.cyrius/lib` instead of `~/.cyrius/versions/<v>/`). patra is the reference.

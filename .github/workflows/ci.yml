@@ -65,7 +65,7 @@ jobs:
       - name: Build (AGNOS target)
         # NOT redundant with the Build step above. whirl has no src/platform.cyr
         # split — the AGNOS backend is inline `#ifdef CYRIUS_TARGET_AGNOS` blocks
-        # in src/transport.cyr, src/main.cyr and src/output.cyr — so the host
+        # in src/transport.cyr, src/mirror.cyr and src/output.cyr — so the host
         # build compiles the `#ifndef` arm and NEVER touches the agnos one.
         # Until this step existed nothing in CI compiled the AGNOS backend at
         # all: a hard break inside an agnos-only block landed green while lint,
@@ -88,9 +88,25 @@ jobs:
           fi
           echo "AGNOS arm compiled and selected"
 
+      - name: Build (aarch64)
+        # Compile-only (a runner cannot execute it), but not a formality: the
+        # aarch64 arm of src/output.cyr carries its own O_NOFOLLOW (32768; on
+        # x86_64 it is 131072, which on aarch64 means O_LARGEFILE). A wrong value
+        # would silently drop the -r symlink refusal there. Since cyrius 6.7.12 it
+        # draws "duplicate symbol ... redefined with conflicting value" against the
+        # stdlib's own per-arch value, so any warning pointing into src/ fails the
+        # step (0.7.2). Executed coverage is local, under qemu-aarch64.
+        run: |
+          out=$(CYRIUS_DCE=1 cyrius build --aarch64 src/main.cyr build/whirl-aarch64 2>&1)
+          echo "$out"
+          if echo "$out" | grep -qE 'warning:src/'; then
+            echo "aarch64 build warns in whirl's own source"; exit 1
+          fi
+
       - name: Test
         # bare `cyrius test` runs the [build].test entry AND auto-discovers
-        # tests/*.tcyr (the unit suite lands with the transport bite).
+        # tests/*.tcyr. It also brings in the [test] stdlib leaves (assert):
+        # a plain `cyrius build` of a .tcyr does not, since 0.7.2.
         run: cyrius test
 
       - name: Behavioral suite

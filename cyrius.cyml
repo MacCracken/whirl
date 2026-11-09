@@ -15,16 +15,20 @@ output = "whirl"
 # `io` carries file_write_all for `-o`. Transport (TCP + DNS) comes from taar
 # below — sovereign raw-syscall, no stdlib net. HTTPS opts in to the crypto/TLS
 # libs (vendored via `cyrius lib sync`): tls_native is transport-agnostic, wired
-# over taar's socket. ct/keccak/random/bayan are sigil's crypto deps.
-# `dynlib`+`fdlopen` back the `tls` facade's libssl.so.3 bridge. From v5.6.37
-# to 6.6.8 they HAD to be named here or the Linux build failed reachable-undef.
-# Since 6.6.9 tls.cyr includes lib/fdlopen.cyr itself (which includes dynlib),
-# so from 6.6.9 on these two entries are redundant: dropping them still builds
-# (same size, different include order → not byte-identical). Kept in a
-# toolchain-only release so the image layout doesn't churn. On --agnos they
-# compile (the Linux path is `#ifndef CYRIUS_TARGET_AGNOS`-gated) and stay
-# unreachable (the agnos TLS path calls tls_native directly) → DCE'd.
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags", "chrono", "ct", "keccak", "random", "bayan", "sigil", "dynlib", "fdlopen", "tls_native", "tls"]
+# over taar's socket. ct/keccak/random/bayan are sigil's crypto deps. `vec` and
+# `str` are not called by src/, but bayan includes them, so they stay vendored.
+#
+# 0.7.2 removed three entries and moved two:
+# - `flags` was never called;
+# - `dynlib` and `fdlopen` back the tls facade's libssl bridge, but since cyrius
+#   6.6.9 tls.cyr includes fdlopen.cyr (which includes dynlib) itself;
+# - `assert` and `bench` moved to [test] below: only the tests and benches use
+#   them, so the shipping build no longer names them.
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "args", "chrono", "ct", "keccak", "random", "bayan", "sigil", "tls_native", "tls"]
+
+[test]
+# Test / bench compiles only — never the shipping build (cyrius >= 6.7.6).
+stdlib = ["assert", "bench"]
 
 # Network-probe substrate — whirl is the third consumer (after yo + dig). taar's
 # socket (taar_tcp_*) + dns (taar_resolve_ipv4) modules back whirl's transport;

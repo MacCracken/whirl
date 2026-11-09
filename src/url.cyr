@@ -37,14 +37,13 @@ fn url_host(u): i64     { return load64(u + URL_OFF_HOST); }
 fn url_path(u): i64     { return load64(u + URL_OFF_PATH); }
 
 # Derive a download filename from a path (cstr): the last '/'-segment with any
-# `?query` stripped, or "index.html" when the path is "/" or ends in "/". Returns
-# a fresh cstr.
+# `?query` or `#fragment` stripped, or "index.html" when the path is "/" or ends
+# in "/". Returns a fresh cstr.
 fn url_filename(path): i64 {
-    var n = 0;
-    while (load8(path + n) != 0) { n = n + 1; }
-    # cut at the first '?' (63)
+    var n = strlen(path);
+    # cut at the first '?' (63) or '#' (35)
     var end = 0;
-    while ((end < n) && (load8(path + end) != 63)) { end = end + 1; }
+    while ((end < n) && (load8(path + end) != 63) && (load8(path + end) != 35)) { end = end + 1; }
     # last '/' (47) within [0, end)
     var lastslash = 0 - 1;
     var i = 0;
@@ -61,7 +60,7 @@ fn url_filename(path): i64 {
 # 1 if the `len` bytes at `s` are safe to place in a request line or a Host
 # header: no controls, no space, no DEL. RFC 9110 forbids all of them in a
 # request target, and whirl writes host/path into the request UNESCAPED — so a
-# bare LF in a redirect `Location:` (which _dup_location stops only on CR) would
+# bare LF in a redirect `Location:` (copied up to the CR or LF) would
 # otherwise splice attacker-chosen header lines, or a whole second request, into
 # the request sent to the redirect TARGET. Validating here covers every source
 # of a URL at once: the command line, `Location:`, and crawled hrefs.
@@ -95,25 +94,38 @@ fn _url_parse_uint(s, len): i64 {
     return v;
 }
 
+# 1 if `c` ends the authority: '/', '?', '#' or the terminating NUL (RFC 3986 §3.2).
+fn _url_authority_end(c): i64 {
+    if ((c == 0) || (c == 47) || (c == 63) || (c == 35)) { return 1; }
+    return 0;
+}
+
 # Parse `url` (cstr) into the struct `u` (from url_new).
 # Returns URL_PARSE_OK / URL_PARSE_FAIL.
+#
+# The scheme is matched case-insensitively (RFC 3986 §3.1), so a redirect to
+# `HTTPS://…` is followed. The authority ends at '/', '?' or '#'. Before 0.7.2
+# only '/' ended it, so `http://h?x=1` parsed with the host "h?x=1". A
+# `#fragment` is dropped: RFC 9110 §7.1 keeps it client-side. Before 0.7.2 it
+# went out in the request line, and `-r` saved `p.html#a` and `p.html#b` as two
+# files, each fetched separately against the 64-resource cap. A path that starts
+# with '?' gains a leading '/'.
 fn url_parse(url, u): i64 {
     var p = url;
     var is_https = 0;
     var defport = 80;
-    if (util_has_prefix(p, "https://") == 1) {
+    if (util_has_prefix_ci(p, "https://") == 1) {
         is_https = 1; defport = 443; p = p + 8;
     } else {
-        if (util_has_prefix(p, "http://") == 1) {
+        if (util_has_prefix_ci(p, "http://") == 1) {
             is_https = 0; defport = 80; p = p + 7;
         } else {
             return URL_PARSE_FAIL;
         }
     }
 
-    # host[:port] runs until the first '/' (47) or end-of-string.
     var hostlen = 0;
-    while ((load8(p + hostlen) != 0) && (load8(p + hostlen) != 47)) { hostlen = hostlen + 1; }
+    while (_url_authority_end(load8(p + hostlen)) == 0) { hostlen = hostlen + 1; }
     if (hostlen == 0) { return URL_PARSE_FAIL; }
 
     # find ':' (58) within the authority
@@ -137,16 +149,15 @@ fn url_parse(url, u): i64 {
 
     var host = util_dup_range(p, host_end);
 
+    # Path (and query) run to the '#' or the end; the fragment is not kept.
+    var q = p + hostlen;
+    var pl = 0;
+    while ((load8(q + pl) != 0) && (load8(q + pl) != 35)) { pl = pl + 1; }
+    if (_url_bytes_clean(q, pl) == 0) { return URL_PARSE_FAIL; }
     var path = 0;
-    if (load8(p + hostlen) == 0) {
-        path = util_dup_range("/", 1);
-    } else {
-        var q = p + hostlen;
-        var pl = 0;
-        while (load8(q + pl) != 0) { pl = pl + 1; }
-        if (_url_bytes_clean(q, pl) == 0) { return URL_PARSE_FAIL; }
-        path = util_dup_range(q, pl);
-    }
+    if (pl == 0) { path = util_dup_range("/", 1); }
+    elif (load8(q) == 63) { path = util_concat2("/", util_dup_range(q, pl)); }   # "?x" -> "/?x"
+    else { path = util_dup_range(q, pl); }
 
     store64(u + URL_OFF_HTTPS, is_https);
     store64(u + URL_OFF_PORT, port);

@@ -5,6 +5,160 @@ All notable changes to whirl are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-11-09
+
+**A P(-1) audit of everything whirl ships: 23 findings (1 high, 10 medium, 8 low, 4 info),
+all repaired.** The report, with method, evidence and the deferred items, is
+[`docs/audit/2026-11-09-audit.md`](docs/audit/2026-11-09-audit.md). Two independent reviews ran
+alongside the line-by-line one, and each confirmed its findings against a built binary before any
+repair. Several behaviours change; they are listed first.
+
+### Changed (user-visible)
+
+- **`-r` mirrors into `./HOST[:PORT]/`, as wget does, and refuses hidden paths.** Before, it wrote
+  straight into the cwd, so a crawled page could overwrite any file its links named there:
+  `./Makefile`, `./.bashrc`, `./.ssh/authorized_keys`, `./.git/config`. Run from `$HOME` or a
+  source tree, that is a path to code execution (audit A, **high**). A path segment that begins
+  with `.` is now refused anywhere in the URL path. That covers `..` as before, and also `.git`,
+  `.ssh` and `.well-known`.
+- **`-r` exits 9** when the start URL fails, anything fails during the crawl, or nothing is saved.
+  It always exited 0. A redirect inside a crawl is reported and skipped, but does not count as a
+  failure.
+- **robots.txt follows RFC 9309** (audit M). A 5xx, or no answer at all, means the site is
+  disallowed, so the crawl stops with exit 9. Before, every failure meant "no rules". Grouping
+  follows the RFC, and a `whirl` group takes precedence over `*`. Comments, tabs and trailing
+  whitespace are handled, `*` and `$` wildcards work, the body is decoded, up to five redirects are
+  followed, and up to 512 KiB is read.
+- **Redirects keep the method the RFC says to keep** (audit I). 307 and 308 keep the method and
+  body. 303 becomes GET, except for HEAD. 301 and 302 turn only a POST into GET. Before, every
+  redirect became a bodyless GET, and `-I -L` sent a GET on the second hop.
+- **`-L` that cannot finish is a failure.** Running out of hops ("too many redirects (10)") or
+  reaching a `Location` it cannot follow exits 9. Before, the 3xx stub was written out with exit 0
+  and "(use -L to follow)".
+- **`--retry` no longer retries a TLS failure, or resends a POST once it was sent** (audit H). A
+  failed certificate fails the same way every time. A consumed POST was sent four times under
+  `--retry 3`. Retried: failures before the request went out, and an empty response to an
+  idempotent method.
+- **`-C` checks the 206 before appending** (audit C). The `Content-Range` must start at the file's
+  end. A chunked 206 is decoded, and a short one is refused, leaving the file untouched. Before,
+  all three were appended with exit 0. A 416 whose stated length differs from the local file is
+  now an error, not "already complete". Range is sent on every redirect hop.
+- **`-d @-` takes up to 1 MiB, as `@file` does, and refuses more** (audit D). It stopped at
+  256 KiB without a word and sent the truncated body.
+- **Write failures to stdout exit 9** (audit E): `whirl URL > /dev/full` exited 0.
+- **Error messages name the cause**: `could not resolve host <name>`, `TLS failed (handshake or
+  certificate verification)`, or `empty response`. Before, every one read "connection failed".
+- **`#fragment` stays client-side** (RFC 9110 §7.1). It was sent in the request line, and `-r`
+  saved `p.html#a` and `p.html#b` as two files.
+- `-r` sends the `-H` headers, which is safe because every crawl request stays same-origin, and
+  applies `--retry`.
+- `whirl -h` lists the exit codes.
+
+### Security and robustness (no behaviour change intended)
+
+- **Chunk-size overflow** (audit B, medium). A chunk size of 16 or more hex digits wrapped i64
+  negative. The completeness walk, which runs after every recv, then moved its cursor backwards. Any
+  server could cause an endless loop at 100% CPU or a SIGSEGV. One bounded parser now serves both
+  walkers: at most 15 digits, a chunk larger than the bytes present means "not yet", and the
+  cursor only moves forward.
+- **Server-controlled text on stderr is escaped** (audit N): `Location` values and crawled URLs.
+  C0 controls and DEL print as `?`, the rule dig and cmdit use.
+- **The crawl cap counts fetches** (audit G). Links are filtered and de-duplicated before they are
+  queued. The cap counted queue entries, so one run reported "crawl cap reached (64 resources)"
+  after saving 5 files.
+- **Memory** (audit K). One 1 MiB decode buffer now serves the whole run. Before, `-r` allocated
+  a fresh one for every chunked page on an allocator that never frees: 68.5 MB for 61 pages.
+  `links_path_normalize` sizes its table from the path instead of 2 KiB per call, and the
+  receive buffer is no longer allocated for `-r`, which has its own.
+- **The completeness check is incremental** (audit L). It rescanned from offset 0 after every
+  recv, which is quadratic when a server sends small pieces: 40,000 one-byte chunks cost 5.9 s
+  of CPU.
+- **Interim 1xx responses are skipped** (103 Early Hints was taken as the final response). A 204
+  or 304 without a length completes at its headers instead of waiting out the 10 s deadline
+  (audit P).
+- **A half header block is truncation** (audit O). `-i` and `-I` wrote one and exited 0.
+- URL parsing (audit Q):
+  - the scheme is case-insensitive, so `HTTPS://` in a `Location` is followed;
+  - the authority ends at `/`, `?` or `#`, so `http://h?x` no longer has the host `h?x`;
+  - a `?query`-only link resolves against the page, not its directory.
+- Smaller fixes (audit R, S, T):
+  - trailing whitespace in `Location` is trimmed; it stopped the redirect;
+  - the crawl compares hosts case-insensitively;
+  - a socket that will not take the 10 s deadline is refused;
+  - `-d ''` sends `Content-Length: 0`.
+- The `-C` append and stdout writes loop over short writes.
+
+### Refactor and dependencies
+
+- **`src/mirror.cyr`** now holds the crawl's I/O half (fetch loop, robots.txt load, writes),
+  moved out of `main.cyr`. `crawl.cyr` stays pure.
+- **One copy of each shared path**: body decode (`http_decode_body`), the plain-or-TLS dispatch
+  (`transport_fetch_url`), the case-insensitive matcher (`util_match_ci`), and the retry policy
+  (`transport_fetch_retry`). Each existed two or three times. The two copies of the body decode
+  that were missing it (the 206 append and robots.txt) are where audit findings C and M came
+  from.
+- **Named limits** replace magic numbers: `WHIRL_MAX_HOPS`, `MIRROR_MAX`,
+  `MIRROR_LINKS_MAX`, `ROBOTS_*`, `TRANSPORT_TIMEOUT_MS`, `TRANSPORT_RETRY_BACKOFF_MS`,
+  `CLI_BODY_MAX`.
+- **`cyrius.cyml`**: `flags` (never called) was removed. `dynlib` and `fdlopen` were removed too:
+  `tls.cyr` has included them itself since cyrius 6.6.9. `assert` and `bench` moved to a
+  `[test]` section, so the shipping build no longer names them. The binary is 1,184 B smaller
+  for it. A plain `cyrius build` of a `.tcyr` now lacks `assert`; use `cyrius test`, which CI
+  already does.
+- **CI builds aarch64** and fails on any warning in `src/`. A wrong per-arch `O_NOFOLLOW` now
+  draws one, and before this step nothing in CI would have seen it.
+- **Comments the code had outgrown** were corrected. "HTTPS … next bite" and "flat file" were
+  still there. One claimed the TLS dispatch keyed on a global, when it keys on each ctx. One said
+  O_NOFOLLOW was "out of scope", though `fs_write_no_follow` does it. The usage strings listed
+  only a few flags. The README claimed binary/text auto-detection and redirect-following by
+  default (neither exists) and taar `tls` / `http` modules (unwritten).
+
+### Tests
+
+- **`tests/behavior.py`: 26 → 49 checks**, 57 with a 0.7.1 baseline. Seven new groups ([16]–[22])
+  cover the mirror directory and hidden paths, the crawl exit status and de-duplication, the
+  stdin body cap, the `-C` 206 checks, redirect methods and the hop limit, robots.txt groups and
+  failures, a sent POST under `--retry`, a 204 without a length, the fragment, and a stdout write
+  failure. Each new check has a control that reproduces the defect on 0.7.1. Checks [6], [9] and
+  [13] now read from, and plant into, the per-host directory. Without that change, [13] would have
+  passed trivially and stopped exercising `O_NOFOLLOW`. The aarch64 negative control shows it
+  still does.
+- **`benches/parse.bcyr`** is new: thirteen rows over the per-response CPU paths, with a baseline
+  taken before any repair. Two rows model the read loop, one completeness call per arriving
+  chunk over 4096 chunks. The 0.7.2 incremental check takes ~141 µs; the pre-0.7.2 shape takes
+  ~194 ms. Single-call rows moved by tens to hundreds of nanoseconds, the cost of the bounds and
+  the RFC robots.txt handling (table in the audit report).
+
+### Verified
+
+- `cyrius audit` passes. `cyrius test` is 139/139 on x86_64 and on aarch64. `behavior.py` is
+  49/49 standalone, 57/57 against 0.7.1, and 49/49 for the aarch64 build under qemu-user. The
+  `O_NOFOLLOW` negative control fails exactly check [13].
+- **AGNOS on a real kernel (QEMU + KVM).** The probe passes 14/14. agnos's `whirl-smoke.sh`, run
+  from a throwaway tree, passes `--help`, HTTP and HTTPS. An added step ran `-r` on AGNOS for the
+  first time, and it saved `example.com/index.html` under the per-host directory.
+- **Memory:** peak RSS for a 61-page chunked crawl fell from 67,772 KB to 11,480 KB.
+- **Live:** example.com over HTTP and HTTPS is byte-identical to 0.7.1, and
+  `-L https://github.com` completes. A blackholed host fails in 10.2 s, and an unknown host
+  reports `could not resolve host`. A local self-signed server is refused in 16 ms under
+  `--retry 3`, so there was no retry.
+- A CI-faithful build (tracked and new files only, no `lib/`, no siblings) wrote an identical
+  lock and sha256-identical host and agnos binaries.
+
+### Binary size
+
+| | 0.7.1 | 0.7.2 |
+|---|---|---|
+| host `CYRIUS_DCE=1` | 1,044,064 B | 1,056,272 B (+12,208) |
+| `--agnos` `CYRIUS_DCE=1` | 1,029,104 B | 1,037,200 B (+8,096) |
+| `--aarch64` (no compaction) | 2,596,248 B | 2,596,160 B (−88) |
+
+The growth is the new code: `mirror.cyr`'s checks, the RFC 9309 parser, redirect and resume
+validation, and the incremental completeness state. It is net of the 1,184 B saved by dropping
+the unused stdlib leaves.
+- Not every repair has a test that fails without it. The audit report lists the gaps, and the
+  roadmap carries them into 0.8.x.
+
 ## [0.7.1] - 2026-11-09
 
 **Toolchain `6.7.9` → `6.7.18` and taar `0.6.0` → `0.6.2`, the latest of each, which puts whirl
